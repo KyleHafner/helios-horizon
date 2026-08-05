@@ -1,0 +1,34 @@
+id = "pz-rising"
+display_name = "Project Zomboid"
+adapter = "systemd"
+systemd_unit = "pz-rising.service"
+ports = [
+  { protocol = "udp", port = 16261, required = true },
+  { protocol = "udp", port = 16262, required = true },
+]
+start_timeout_seconds = 180
+stop_timeout_seconds = 180
+health_timeout_seconds = 180
+min_available_memory_bytes = 7516192768
+min_free_disk_bytes = 8589934592
+public_endpoint = { host = "pz.example.com", port = 16261, protocol = "udp", relay_unit = "wg-quick@wg-pz.service" }
+operations = ["start", "stop", "restart", "force_stop", "command", "backup", "restore", "update_check", "update_apply"]
+notification_events = ["start", "stop", "failed_start", "crash", "forced_stop", "slot_conflict", "low_disk", "backup_failure", "update_complete", "update_failure", "idle_stop"]
+
+[process]
+executable = "/opt/pzserver/start-server.sh"
+argv_contains = ["-servername", "servertest"]
+ready_log_pattern = "server is listening"
+
+[paths]
+data_roots = ["/opt/pzserver", "/home/pzuser/Zomboid"]
+mutable_root = "/home/pzuser/Zomboid"
+log_files = ["/home/pzuser/Zomboid/Logs/Logs.txt"]
+backup_root = "/var/backups/game-servers/pz-rising"
+install_root = "/opt/pzserver"
+version_file = "/opt/pzserver/version.txt"
+
+[update]
+kind = "steamcmd_in_place"
+app_id = 380870
+beta = "unstable"

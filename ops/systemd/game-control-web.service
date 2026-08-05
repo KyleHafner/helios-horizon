@@ -1,0 +1,23 @@
+[Unit]
+Description=Helios game control web frontend
+After=game-slotd.service
+Requires=game-slotd.service
+
+[Service]
+Type=simple
+User=gamecontrol
+Group=gamecontrol
+WorkingDirectory=/opt/game-control
+ExecStart=/opt/game-control/.venv/bin/uvicorn --factory game_control.web_main:create_app --host 127.0.0.1 --port 8444 --timeout-graceful-shutdown 5
+LoadCredential=proxy-token:/etc/game-control/secrets.d/proxy-token
+Restart=on-failure
+RestartSec=2s
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=yes
+NoNewPrivileges=yes
+RestrictSUIDSGID=yes
+ReadOnlyPaths=/opt/game-control/web
+ReadOnlyPaths=/run/game-control
+ReadWritePaths=/var/lib/game-control-web
+UMask=0077

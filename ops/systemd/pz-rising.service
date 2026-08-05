@@ -1,0 +1,22 @@
+[Unit]
+Description=Project Zomboid Build 42 Rising dedicated server
+After=network-online.target wg-quick@wg-pz.service
+Wants=network-online.target wg-quick@wg-pz.service
+ConditionPathExists=/opt/pzserver/start-server.sh
+
+[Service]
+Type=simple
+User=pzuser
+Group=pzuser
+WorkingDirectory=/opt/pzserver
+ExecStartPre=/usr/local/sbin/pz-rising-guard
+ExecStart=/usr/local/libexec/game-slot-run pz-rising
+KillSignal=SIGINT
+TimeoutStopSec=180
+Restart=on-failure
+RestartSec=10
+SuccessExitStatus=130 143
+LimitNOFILE=65535
+
+[Install]
+WantedBy=multi-user.target

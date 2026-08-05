@@ -1,0 +1,12 @@
+{
+  "user": "terraria-vanilla",
+  "group": "terraria-vanilla",
+  "cwd": "/srv/game-servers/terraria-vanilla",
+  "console_fifo": "/run/game-slot/terraria-vanilla.console",
+  "argv": [
+    "/opt/game-servers/terraria-vanilla/current/TerrariaServer.bin.x86_64",
+    "-config",
+    "/srv/game-servers/terraria-vanilla/config/serverconfig.txt"
+  ],
+  "environment": {}
+}

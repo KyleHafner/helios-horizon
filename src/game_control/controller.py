@@ -1,0 +1,1499 @@
+"""Serialized root-side RPC controller.
+
+Only the narrow typed protocol reaches this module.  Heavy work is performed
+after the short reservation/state transaction and never while the operation
+lock is held.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import hashlib
+import inspect
+import json
+import logging
+import os
+import sqlite3
+import time
+from contextlib import nullcontext
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
+from typing import Any, Awaitable, Callable, Mapping
+from uuid import UUID, uuid4
+
+from .adapters.base import Adapter, AdapterError
+from .idle_stop import IdleStopTracker
+from .models import NotificationEvent, OperationName, Profile, ProfileId
+from .schedule import ScheduleBook, ScheduleEntry
+from .stats_queries import stats_heatmap, stats_summary, stats_tps
+from .profile_config import ConfigValidationError, get_profile_config, set_profile_config
+from .protocol import (
+    AuditPage,
+    BackupPage,
+    CheckUpdate,
+    Command,
+    ConfirmForceStop,
+    ConfirmRestore,
+    ConfirmSwitch,
+    ConfirmUpdate,
+    ConfirmWorldClone,
+    ConfirmationSummary,
+    CreateBackup,
+    ErrorCode,
+    EventPage,
+    GetPerf,
+    GetLogs,
+    GetNotificationConfig,
+    GetProfiles,
+    GetStatus,
+    GetStatsHeatmap,
+    GetStatsSummary,
+    GetStatsTps,
+    GetProfileConfig,
+    SetProfileConfig,
+    JobAccepted,
+    ListAudit,
+    ListBackups,
+    ListEvents,
+    LogPage,
+    NotificationConfig,
+    PrepareForceStop,
+    PrepareRestore,
+    PrepareSwitch,
+    PrepareUpdate,
+    PrepareWorldClone,
+    ProfileStatus,
+    PerfSnapshot,
+    PublicProfile,
+    PublicEndpoint,
+    Restart,
+    RpcAction,
+    RpcFailure,
+    RpcRequest,
+    RpcResponse,
+    RpcSuccess,
+    SafeDetails,
+    Start,
+    StatusSnapshot,
+    ProfileConfigEntry,
+    ProfileConfigResponse,
+    Stop,
+    SetIdleStop,
+    SwitchOptions,
+    SwitchConfirmation,
+    ForceStopConfirmation,
+    RestoreConfirmation,
+    UpdateConfirmation,
+    UpdateStatus,
+    WorldCloneConfirmation,
+    response_from_json,
+    response_json,
+    success,
+    failure,
+)
+from .slot import ReservationStore, SlotInspector, OperationLock
+from .perf import PerformanceTracker
+
+_LOG = logging.getLogger(__name__)
+
+
+DISPATCH: dict[type, str] = {
+    GetStatus: "_get_status",
+    GetPerf: "_get_perf",
+    GetProfiles: "_get_profiles",
+    GetLogs: "_get_logs",
+    ListBackups: "_list_backups",
+    ListEvents: "_list_events",
+    GetStatsSummary: "_get_stats_summary",
+    GetStatsHeatmap: "_get_stats_heatmap",
+    GetStatsTps: "_get_stats_tps",
+    GetProfileConfig: "_get_profile_config",
+    SetProfileConfig: "_set_profile_config",
+    ListAudit: "_list_audit",
+    Start: "_start",
+    Stop: "_stop",
+    Restart: "_restart",
+    PrepareSwitch: "_prepare_switch",
+    ConfirmSwitch: "_confirm_switch",
+    PrepareForceStop: "_prepare_force_stop",
+    ConfirmForceStop: "_confirm_force_stop",
+    CreateBackup: "_create_backup",
+    PrepareRestore: "_prepare_restore",
+    ConfirmRestore: "_confirm_restore",
+    PrepareWorldClone: "_prepare_world_clone",
+    ConfirmWorldClone: "_confirm_world_clone",
+    CheckUpdate: "_check_update",
+    PrepareUpdate: "_prepare_update",
+    ConfirmUpdate: "_confirm_update",
+    GetNotificationConfig: "_get_notification_config",
+    Command: "_command",
+    # Notification implementations belong to later tasks; these are typed
+    # seams and deliberately have no arbitrary service dispatch.
+    # The concrete action classes are still present in this total map.
+}
+# Keep the complete map explicit, including later-task service seams.
+from .protocol import SetNotificationRule, TestNotification
+
+DISPATCH.update({
+    SetNotificationRule: "_set_notification_rule",
+    TestNotification: "_test_notification",
+    SetIdleStop: "_set_idle_stop",
+})
+
+
+def _action_types() -> set[type]:
+    from typing import Annotated, get_args, get_origin, Union
+
+    args = get_args(RpcAction)
+    union = args[0] if args and get_origin(RpcAction) is Annotated else RpcAction
+    return set(get_args(union))
+
+
+def dispatch_is_exhaustive() -> bool:
+    return _action_types() == set(DISPATCH)
+
+
+class _MemoryLock:
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *_):
+        return False
+
+
+class _MemoryDb:
+    def __init__(self, path: Path):
+        self.path = path
+        self.connection = sqlite3.connect(":memory:", check_same_thread=False)
+        self.connection.executescript(
+            """
+            CREATE TABLE rpc_idempotency(request_id TEXT PRIMARY KEY, canonical_request TEXT NOT NULL, response TEXT, status TEXT NOT NULL DEFAULT 'completed', created_at TEXT NOT NULL);
+            CREATE TABLE jobs(id TEXT PRIMARY KEY, profile_id TEXT, operation TEXT NOT NULL, state TEXT NOT NULL, created_at TEXT NOT NULL, finished_at TEXT, completion_seq INTEGER, detail TEXT);
+            CREATE TABLE audit(id TEXT PRIMARY KEY, timestamp TEXT NOT NULL, actor TEXT NOT NULL, action TEXT NOT NULL, profile_id TEXT, result TEXT NOT NULL, error_code TEXT, detail TEXT NOT NULL);
+            CREATE TABLE events(id TEXT PRIMARY KEY, timestamp TEXT NOT NULL, profile_id TEXT, code TEXT NOT NULL, message TEXT NOT NULL);
+            CREATE TABLE confirmations(id TEXT PRIMARY KEY, actor TEXT NOT NULL, action TEXT NOT NULL, profile_id TEXT, payload TEXT NOT NULL, expires_at TEXT NOT NULL, consumed_at TEXT, state_generation INTEGER NOT NULL DEFAULT 0);
+            """
+        )
+
+
+def _utcnow() -> datetime:
+    return datetime.now(timezone.utc)
+
+
+def _iso(value: datetime) -> str:
+    return value.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
+
+
+class _PendingReplay:
+    pass
+
+
+_PENDING = _PendingReplay()
+
+
+class Controller:
+    def __init__(
+        self,
+        profiles: Any | None = None,
+        state_db: Any | None = None,
+        reservation_store: Any | None = None,
+        adapters: Mapping[ProfileId | str, Adapter] | None = None,
+        *,
+        await_ready: Callable[[Profile], Awaitable[Any] | Any] | None = None,
+        await_free_slot: Callable[[], Awaitable[Any] | Any] | None = None,
+        services: Any | None = None,
+        slot_inspector: SlotInspector | None = None,
+        operation_lock_factory: Callable[[], Any] | None = None,
+        clock: Callable[[], datetime] = _utcnow,
+        performance: PerformanceTracker | None = None,
+        boot_profile: str | None = None,
+        boot_autostart: bool = False,
+        schedules: tuple[ScheduleEntry, ...] = (),
+    ):
+        if state_db is None and profiles is not None and operation_lock_factory is None:
+            raise ValueError("production Controller requires a root StateDatabase")
+        self.profiles = profiles
+        self.state_db = state_db or _MemoryDb(Path(":memory:"))
+        self.reservation_store = reservation_store
+        self.adapters = adapters or {}
+        self.await_ready = await_ready or (lambda _profile: False)
+        self.await_free_slot = await_free_slot or (lambda: True)
+        self.services = services
+        self.slot_inspector = slot_inspector
+        self._operation_lock_factory = operation_lock_factory or (lambda: OperationLock())
+        self._clock = clock
+        self._idle_stop = IdleStopTracker(clock=self._clock)
+        self._schedule = ScheduleBook(schedules)
+        self.performance = performance or PerformanceTracker()
+        self.boot_profile = boot_profile
+        self.boot_autostart = boot_autostart
+        self._boot_autostart_attempted = False
+        self._transition_lock = asyncio.Lock()
+        self.initializing = True
+
+    @classmethod
+    def for_testing(cls, tmp_path: Path) -> "Controller":
+        return cls(
+            profiles={},
+            state_db=_MemoryDb(tmp_path / "state.db"),
+            reservation_store=None,
+            operation_lock_factory=_MemoryLock,
+        )
+
+    async def execute(self, request: RpcRequest) -> RpcResponse:
+        started = time.monotonic()
+        try:
+            return await self._execute(request)
+        finally:
+            self.performance.record_rpc((time.monotonic() - started) * 1000.0)
+            if not isinstance(request.action, GetPerf):
+                try:
+                    self.performance.flush_if_due(self._db(), now=self._clock())
+                except Exception:
+                    _LOG.exception("performance aggregate flush skipped")
+
+    async def _execute(self, request: RpcRequest) -> RpcResponse:
+        canonical = self._canonical(request)
+        claim = await self._claim_request(request.request_id, canonical)
+        if claim is not None:
+            if claim is not _PENDING:
+                return claim
+            return await self._wait_for_replay(request.request_id, canonical)
+        try:
+            handler_name = DISPATCH[type(request.action)]
+        except KeyError:
+            response = failure(request.request_id, ErrorCode.INVALID_REQUEST, "invalid request")
+            await self._store_replay(request.request_id, canonical, response)
+            return response
+        try:
+            result = getattr(self, handler_name)(request.action, request.actor, request.request_id)
+            result = await result if inspect.isawaitable(result) else result
+            response: RpcResponse = result if isinstance(result, (RpcSuccess, RpcFailure)) else success(request.request_id, result)
+        except _ControllerFailure as exc:
+            response = failure(request.request_id, exc.code, exc.message, retryable=exc.retryable, details=exc.details)
+        except Exception:
+            incident = hashlib.sha256(f"{request.request_id}:{self._clock().timestamp()}".encode()).hexdigest()[:16]
+            _LOG.exception("controller incident %s", incident)
+            response = failure(
+                request.request_id,
+                ErrorCode.INTERNAL_ERROR,
+                "internal controller error",
+                details=SafeDetails(incident_id=incident),
+            )
+        await self._store_replay(request.request_id, canonical, response)
+        return response
+
+    def execute_sync(self, request: RpcRequest) -> RpcResponse:
+        return asyncio.run(self.execute(request))
+
+    # Public typed handlers are the only callable mutation surface used by
+    # fixed dispatch; each takes its concrete action, actor, and request UUID.
+    async def start(self, action: Start, actor: str, request_id: UUID) -> JobAccepted:
+        return await self._start(action, actor, request_id)
+
+    async def stop(self, action: Stop, actor: str, request_id: UUID) -> JobAccepted:
+        return await self._stop(action, actor, request_id)
+
+    async def restart(self, action: Restart, actor: str, request_id: UUID) -> JobAccepted:
+        return await self._restart(action, actor, request_id)
+
+    async def prepare_switch(self, action: PrepareSwitch, actor: str, request_id: UUID) -> ConfirmationSummary:
+        return await self._prepare_switch(action, actor, request_id)
+
+    async def confirm_switch(self, action: ConfirmSwitch, actor: str, request_id: UUID) -> JobAccepted:
+        return await self._confirm_switch(action, actor, request_id)
+
+    async def prepare_force_stop(self, action: PrepareForceStop, actor: str, request_id: UUID) -> ConfirmationSummary:
+        return await self._prepare_force_stop(action, actor, request_id)
+
+    async def confirm_force_stop(self, action: ConfirmForceStop, actor: str, request_id: UUID) -> JobAccepted:
+        return await self._confirm_force_stop(action, actor, request_id)
+
+    async def reconcile_startup(self) -> None:
+        """Fail jobs interrupted by a daemon restart and reconcile reservations."""
+
+        def mark_incomplete() -> int:
+            cursor = self._db().execute(
+                "UPDATE jobs SET state='failed', finished_at=?, detail=? "
+                "WHERE state IN ('accepted','running')",
+                (_iso(self._clock()), "controller restarted"),
+            )
+            pending = self._db().execute(
+                "SELECT request_id FROM rpc_idempotency WHERE status='pending'"
+            ).fetchall()
+            for (request_id,) in pending:
+                stored = failure(
+                    UUID(request_id),
+                    ErrorCode.INTERNAL_ERROR,
+                    "request was interrupted by controller restart",
+                    retryable=True,
+                )
+                self._db().execute(
+                    "UPDATE rpc_idempotency SET status='completed',response=? WHERE request_id=? AND status='pending'",
+                    (response_json(stored).decode().rstrip("\n"), request_id),
+                )
+            if cursor.rowcount:
+                self._bump_generation()
+            self._db().commit()
+            return cursor.rowcount
+
+        changed = await self._transaction(mark_incomplete)
+        reconcile = getattr(self.reservation_store, "reconcile", None)
+        if reconcile is not None:
+            result = reconcile()
+            if inspect.isawaitable(result):
+                result = await result
+            changed = changed or bool(result)
+        if self.slot_inspector is not None:
+            self.slot_inspector.observe()
+        running_profiles: set[str] = set()
+        for profile in getattr(self.profiles, "profiles", ()):
+            adapter = self.adapters.get(profile.id)
+            if adapter is not None:
+                try:
+                    observed = adapter.observe(profile)
+                    if inspect.isawaitable(observed):
+                        observed = await observed
+                    if bool(getattr(observed, "running", False)):
+                        running_profiles.add(getattr(profile.id, "value", profile.id))
+                except Exception:
+                    changed = True
+        if self.boot_autostart and not self._boot_autostart_attempted:
+            self._boot_autostart_attempted = True
+            profile_id = self._resume_profile_id()
+            if profile_id is not None and getattr(profile_id, "value", profile_id) not in running_profiles:
+                try:
+                    await self._start(Start(kind="start", profile_id=profile_id), "boot", uuid4())
+                except Exception:
+                    _LOG.exception("boot profile autostart failed for %s", profile_id)
+        # A successful daemon restart is itself a state transition: every
+        # pre-restart confirmation must be invalidated even when observations
+        # happen to match the previous process.
+        await self._transaction(lambda: (self._bump_generation(), self._db().commit()))
+        self.initializing = False
+
+    def _resume_profile_id(self) -> ProfileId | None:
+        if self.boot_profile and self.boot_profile not in {"resume", "resume-last-active"}:
+            try:
+                candidate = ProfileId(self.boot_profile)
+            except ValueError:
+                return None
+            return candidate
+        row = self._db().execute(
+            "SELECT 1 FROM jobs "
+            "WHERE operation IN ('start','switch','stop','force_stop') "
+            "AND state='succeeded' AND completion_seq IS NULL LIMIT 1"
+        ).fetchone()
+        if row:
+            return None
+        row = self._db().execute(
+            "SELECT operation, profile_id FROM jobs "
+            "WHERE operation IN ('start','switch','stop','force_stop') "
+            "AND state='succeeded' AND profile_id IS NOT NULL "
+            "ORDER BY completion_seq DESC LIMIT 1"
+        ).fetchone()
+        if not row or row[0] not in {"start", "switch"}:
+            return None
+        try:
+            return ProfileId(row[1])
+        except ValueError:
+            return None
+
+    @staticmethod
+    def _canonical(request: RpcRequest) -> str:
+        payload = request.model_dump(mode="json")
+        action = payload.get("action")
+        if isinstance(action, dict) and action.get("kind") == "get_status" and action.get("refresh") is False:
+            # Keep the idempotency key stable for requests written before the
+            # optional internal refresh flag was added.
+            action.pop("refresh", None)
+        if isinstance(action, dict) and action.get("kind") == "command":
+            command = action.pop("command", "")
+            action["command_digest"] = hashlib.sha256(command.encode("utf-8")).hexdigest()
+        return json.dumps(payload, sort_keys=True, separators=(",", ":"))
+
+    async def _claim_request(self, request_id: UUID, canonical: str) -> RpcResponse | _PendingReplay | None:
+        """Claim an idempotency key before running any side effect."""
+        def claim() -> RpcResponse | _PendingReplay | None:
+            db = self._db()
+            row = db.execute(
+                "SELECT canonical_request,response,status FROM rpc_idempotency WHERE request_id=?",
+                (str(request_id),),
+            ).fetchone()
+            if row is None:
+                db.execute(
+                    "INSERT INTO rpc_idempotency(request_id,canonical_request,response,status,created_at) VALUES (?,?,'','pending',?)",
+                    (str(request_id), canonical, _iso(self._clock())),
+                )
+                db.commit()
+                return None
+            if row[0] != canonical:
+                return failure(request_id, ErrorCode.REQUEST_ID_CONFLICT, "request id was already used")
+            if row[2] == "pending":
+                return _PENDING
+            if not row[1]:
+                return failure(request_id, ErrorCode.INTERNAL_ERROR, "stored response unavailable")
+            try:
+                return response_from_json(row[1].encode())
+            except Exception:
+                return failure(request_id, ErrorCode.INTERNAL_ERROR, "stored response unavailable")
+
+        return await self._transaction(claim)
+
+    async def _wait_for_replay(self, request_id: UUID, canonical: str) -> RpcResponse:
+        # The first claimant may be in another process, so waiting is a DB
+        # poll rather than an in-memory event.
+        for _ in range(1000):
+            result = await self._claim_request(request_id, canonical)
+            if result is _PENDING:
+                await asyncio.sleep(0.01)
+                continue
+            if result is None:
+                # A crashed claimant left a pending row.  Never execute a
+                # second side effect; report a safe transient failure.
+                return failure(request_id, ErrorCode.INTERNAL_ERROR, "request is still in progress", retryable=True)
+            return result
+        return failure(request_id, ErrorCode.INTERNAL_ERROR, "request is still in progress", retryable=True)
+
+    async def _store_replay(self, request_id: UUID, canonical: str, response: RpcResponse) -> None:
+        def write_replay() -> None:
+            db = self._db()
+            db.execute(
+                "UPDATE rpc_idempotency SET response=?,status='completed' WHERE request_id=? AND canonical_request=? AND status='pending'",
+                (response_json(response).decode().rstrip("\n"), str(request_id), canonical),
+            )
+            db.commit()
+
+        await self._transaction(write_replay)
+
+    def _db(self) -> sqlite3.Connection:
+        return self.state_db.connection
+
+    def _current_generation(self) -> int:
+        row = self._db().execute("PRAGMA application_id").fetchone()
+        return max(0, int(row[0])) if row else 0
+
+    def _bump_generation(self) -> int:
+        db = self._db()
+        generation = self._current_generation() + 1
+        db.execute(f"PRAGMA application_id = {generation}")
+        return generation
+
+    def _profile(self, profile_id: ProfileId) -> Profile:
+        try:
+            if hasattr(self.profiles, "require"):
+                return self.profiles.require(profile_id)
+            return self.profiles[profile_id] if profile_id in self.profiles else self.profiles[profile_id.value]
+        except (KeyError, TypeError, AttributeError):
+            raise _ControllerFailure(ErrorCode.INVALID_REQUEST, "unknown profile")
+
+    def _adapter(self, profile: Profile) -> Adapter:
+        adapter = self.adapters.get(profile.id) or self.adapters.get(profile.id.value)
+        if adapter is None:
+            raise _ControllerFailure(ErrorCode.INTERNAL_ERROR, "adapter unavailable")
+        return adapter
+
+    def _require_operation(self, profile: Profile, operation: OperationName, actor: str = "system") -> None:
+        if operation not in profile.operations:
+            self._audit_rejection_sync(
+                actor,
+                operation.value,
+                profile.id,
+                ErrorCode.INVALID_REQUEST,
+                "operation is not permitted for profile",
+            )
+            raise _ControllerFailure(
+                ErrorCode.INVALID_REQUEST,
+                "operation is not permitted for profile",
+                details=SafeDetails(profile_id=profile.id, allowed_actions=tuple(sorted(profile.operations, key=lambda item: item.value))),
+            )
+
+    def _audit_rejection_sync(
+        self,
+        actor: str,
+        action: str,
+        profile_id: ProfileId | None,
+        code: ErrorCode,
+        detail: str,
+    ) -> None:
+        self._audit(actor, action, profile_id, "rejected", code, detail)
+        self._db().commit()
+
+    async def _transaction(self, callback: Callable[[], Any]) -> Any:
+        async with self._transition_lock:
+            with self._operation_lock_factory():
+                return callback()
+
+    def _job_intent(self, actor: str, action: str, profile_id: ProfileId | None) -> str:
+        job_id = uuid4().hex
+        now = _iso(self._clock())
+        self._db().execute(
+            "INSERT INTO jobs(id,profile_id,operation,state,created_at,detail) VALUES (?,?,?,?,?,?)",
+            (job_id, profile_id.value if profile_id else None, action, "accepted", now, None),
+        )
+        self._audit(actor, action, profile_id, "accepted", None, "job accepted")
+        self._db().commit()
+        return job_id
+
+    def _finish(self, job_id: str, actor: str, action: str, profile_id: ProfileId | None, *, ok: bool, code: ErrorCode | None = None, detail: str = "") -> None:
+        now = _iso(self._clock())
+        self._db().execute(
+            "UPDATE jobs SET state=?,finished_at=?,completion_seq=("
+            "SELECT COALESCE(MAX(completion_seq), 0) + 1 FROM jobs"
+            "),detail=? WHERE id=?",
+            ("succeeded" if ok else "failed", now, detail[:512], job_id),
+        )
+        self._audit(actor, action, profile_id, "succeeded" if ok else "failed", code, detail or "completed")
+        self._bump_generation()
+        self._db().commit()
+
+    def _audit(self, actor: str, action: str, profile_id: ProfileId | None, result: str, code: ErrorCode | None, detail: str) -> None:
+        self._db().execute(
+            "INSERT INTO audit(id,timestamp,actor,action,profile_id,result,error_code,detail) VALUES (?,?,?,?,?,?,?,?)",
+            (uuid4().hex, _iso(self._clock()), actor, action, profile_id.value if profile_id else None, result, code.value if code else None, detail[:512]),
+        )
+
+    def _lease_renewal(self, lease: tuple[ProfileId, str, int]):
+        if self.reservation_store is None or not hasattr(self.reservation_store, "renew_if_owned"):
+            return asyncio.create_task(asyncio.sleep(10**9))
+        async def renew():
+            while True:
+                await asyncio.sleep(5.0)
+                result = self.reservation_store.renew_if_owned(*lease[:2], ttl=30.0, state_generation=lease[2])
+                if inspect.isawaitable(result):
+                    await result
+        return asyncio.create_task(renew())
+
+    async def _assert_lease(self, task) -> None:
+        if task.done():
+            try:
+                task.result()
+                raise _ControllerFailure(ErrorCode.SLOT_CONFLICT, "slot reservation was lost")
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                raise _ControllerFailure(ErrorCode.SLOT_CONFLICT, "slot reservation was lost") from exc
+
+    async def _await_lease(self, awaitable, renewal_task):
+        if renewal_task is None:
+            return await awaitable
+        work = asyncio.create_task(awaitable)
+        done, _ = await asyncio.wait((work, renewal_task), return_when=asyncio.FIRST_COMPLETED)
+        if renewal_task in done and work not in done:
+            work.cancel()
+            try:
+                await work
+            except asyncio.CancelledError:
+                pass
+            await self._assert_lease(renewal_task)
+        result = await work
+        await self._assert_lease(renewal_task)
+        return result
+
+    async def _wait_for_free_slot(self, profile: Profile, renewal_task=None) -> bool:
+        """Wait for a consistent free slot using the stopping profile budget."""
+        budget = max(0.0, float(profile.stop_timeout_seconds))
+        callback = self.await_free_slot
+        try:
+            parameters = inspect.signature(callback).parameters
+        except (TypeError, ValueError):
+            parameters = ()
+        free = callback(budget) if parameters else callback()
+        wait = asyncio.wait_for(free, timeout=budget) if inspect.isawaitable(free) else free
+        if inspect.isawaitable(wait):
+            return bool(await self._await_lease(wait, renewal_task))
+        return bool(wait)
+
+    async def _start(self, action: Start, actor: str, request_id: UUID) -> JobAccepted:
+        profile = self._profile(action.profile_id)
+        self._require_operation(profile, OperationName.START, actor)
+        lease = None
+        renewal_task = None
+        job_id = None
+        try:
+            lease = await self._reserve(profile, "start", str(request_id), actor=actor)
+            renewal_task = self._lease_renewal(lease)
+            job_id = await self._transaction(lambda: self._job_intent(actor, "start", profile.id))
+            free = await self._wait_for_free_slot(profile, renewal_task)
+            if free is False:
+                raise _ControllerFailure(ErrorCode.SLOT_CONFLICT, "slot is occupied")
+            await self._await_lease(self._adapter(profile).start(profile), renewal_task)
+            await self._assert_lease(renewal_task)
+            ready = self.await_ready(profile)
+            if inspect.isawaitable(ready):
+                ready = await self._await_lease(
+                    asyncio.wait_for(ready, timeout=profile.health_timeout_seconds),
+                    renewal_task,
+                )
+            if ready is False:
+                raise RuntimeError("start readiness failed")
+            await self._transaction(lambda: self._finish(job_id, actor, "start", profile.id, ok=True))
+            return JobAccepted(job_id=job_id, state="running")
+        except asyncio.TimeoutError:
+            if job_id is not None:
+                await self._transaction(lambda: self._finish(job_id, actor, "start", profile.id, ok=False, code=ErrorCode.START_TIMEOUT, detail="start timed out"))
+            raise _ControllerFailure(ErrorCode.START_TIMEOUT, "start timed out", retryable=True)
+        except Exception as exc:
+            code = exc.code if isinstance(exc, _ControllerFailure) else ErrorCode.HEALTH_FAILED
+            detail = exc.message if isinstance(exc, _ControllerFailure) else "start failed"
+            if job_id is not None:
+                await self._transaction(lambda: self._finish(job_id, actor, "start", profile.id, ok=False, code=code, detail=detail))
+            raise _ControllerFailure(code, detail, retryable=code is ErrorCode.HEALTH_FAILED) from exc
+        finally:
+            if renewal_task is not None:
+                renewal_task.cancel()
+                try:
+                    await renewal_task
+                except asyncio.CancelledError:
+                    pass
+            if lease is not None:
+                await self._clear_reservation(lease)
+
+    async def _stop(self, action: Stop, actor: str, request_id: UUID) -> JobAccepted:
+        profile = self._profile(action.profile_id)
+        self._require_operation(profile, OperationName.STOP, actor)
+        job_id = await self._transaction(lambda: self._job_intent(actor, "stop", profile.id))
+        try:
+            await asyncio.wait_for(self._adapter(profile).graceful_stop(profile), timeout=profile.stop_timeout_seconds)
+            await self._transaction(lambda: self._finish(job_id, actor, "stop", profile.id, ok=True))
+            return JobAccepted(job_id=job_id, state="running")
+        except asyncio.TimeoutError as exc:
+            await self._transaction(lambda: self._finish(job_id, actor, "stop", profile.id, ok=False, code=ErrorCode.GRACE_TIMEOUT, detail="graceful stop timed out"))
+            raise _ControllerFailure(ErrorCode.GRACE_TIMEOUT, "graceful stop timed out") from exc
+        except Exception as exc:
+            await self._transaction(lambda: self._finish(job_id, actor, "stop", profile.id, ok=False, code=ErrorCode.INTERNAL_ERROR, detail="stop failed"))
+            raise _ControllerFailure(ErrorCode.INTERNAL_ERROR, "stop failed") from exc
+
+    async def _restart(self, action: Restart, actor: str, request_id: UUID) -> JobAccepted:
+        await self._stop(Stop(kind="stop", profile_id=action.profile_id), actor, request_id)
+        return await self._start(Start(kind="start", profile_id=action.profile_id), actor, request_id)
+
+    async def _command(self, action: Command, actor: str, request_id: UUID) -> JobAccepted:
+        profile = self._profile(action.profile_id)
+        self._require_operation(profile, OperationName.COMMAND, actor)
+        job_id = await self._transaction(lambda: self._job_intent(actor, "command", profile.id))
+        try:
+            await self._adapter(profile).send_command(profile, action.command)
+        except AdapterError as exc:
+            code = ErrorCode.UPSTREAM_UNAVAILABLE if exc.retryable else ErrorCode.INVALID_REQUEST
+            detail = "command transport failed" if exc.retryable else "command unsupported"
+            await self._transaction(
+                lambda: self._finish(
+                    job_id,
+                    actor,
+                    "command",
+                    profile.id,
+                    ok=False,
+                    code=code,
+                    detail=detail,
+                )
+            )
+            raise _ControllerFailure(
+                code,
+                detail,
+                retryable=exc.retryable,
+            ) from exc
+        except Exception as exc:
+            await self._transaction(
+                lambda: self._finish(
+                    job_id,
+                    actor,
+                    "command",
+                    profile.id,
+                    ok=False,
+                    code=ErrorCode.INTERNAL_ERROR,
+                    detail="command failed",
+                )
+            )
+            raise _ControllerFailure(ErrorCode.INTERNAL_ERROR, "command failed") from exc
+        await self._transaction(
+            lambda: self._finish(job_id, actor, "command", profile.id, ok=True)
+        )
+        return JobAccepted(job_id=job_id, state="running")
+
+    async def _reserve(
+        self,
+        profile: Profile,
+        operation: str,
+        operation_id: str | None = None,
+        *,
+        actor: str = "system",
+    ) -> tuple[ProfileId, str, int]:
+        generation = self._current_generation()
+        lease_id = operation_id or uuid4().hex
+        if self.reservation_store is None:
+            return profile.id, lease_id, generation
+        try:
+            reserve_atomic = getattr(self.reservation_store, "reserve_if_available", None)
+            if reserve_atomic is not None:
+                reservation_id = lease_id
+                try:
+                    reserve_atomic(
+                        profile.id, reservation_id, 30.0,
+                        state_generation=generation,
+                    )
+                except TypeError:
+                    # Narrow test seams may predate the generation keyword;
+                    # they still provide an atomic reserve operation.
+                    reserve_atomic(profile.id, reservation_id, 30.0)
+            else:
+                # Test doubles from Task 2 may only expose reserve; keep the
+                # lock transaction around their check/commit if possible.
+                with self._operation_lock_factory():
+                    existing = self.reservation_store.read()
+                    if existing is not None and existing.profile_id != profile.id:
+                        raise BlockingIOError
+                    self.reservation_store.reserve(profile.id, lease_id, 30.0)
+        except Exception as exc:
+            await self._record_event(profile.id, ErrorCode.SLOT_CONFLICT.value, "game slot is unavailable")
+            await self._record_rejected_audit(
+                actor,
+                operation,
+                profile.id,
+                ErrorCode.SLOT_CONFLICT,
+                "game slot is reserved",
+            )
+            owner = getattr(locals().get("existing", None), "profile_id", None)
+            raise _ControllerFailure(
+                ErrorCode.SLOT_CONFLICT,
+                "game slot is reserved",
+                details=SafeDetails(current_owner=owner),
+            ) from exc
+        return profile.id, lease_id, generation
+
+    async def _clear_reservation(self, lease: tuple[ProfileId, str, int] | None = None) -> None:
+        store = self.reservation_store
+        if store is None:
+            return
+        if lease is not None:
+            release = getattr(store, "release_if_owned", None)
+            if release is not None:
+                result = release(*lease)
+                if inspect.isawaitable(result):
+                    await result
+                return
+        clear = getattr(store, "clear", None)
+        if clear:
+            result = clear()
+            if inspect.isawaitable(result):
+                await result
+            return
+        path = getattr(store, "reservation_path", None)
+        if path is not None:
+            def clear_path() -> None:
+                try:
+                    Path(path).unlink(missing_ok=True)
+                except OSError:
+                    pass
+
+            await self._transaction(clear_path)
+
+    async def _record_rejected_audit(
+        self,
+        actor: str,
+        action: str,
+        profile_id: ProfileId | None,
+        code: ErrorCode,
+        detail: str,
+    ) -> None:
+        await self._record_audit(actor, action, profile_id, "rejected", code, detail)
+
+    async def _record_audit(
+        self,
+        actor: str,
+        action: str,
+        profile_id: ProfileId | None,
+        result: str,
+        code: ErrorCode | None,
+        detail: str,
+    ) -> None:
+        def write_audit() -> None:
+            self._audit(actor, action, profile_id, result, code, detail)
+            self._db().commit()
+
+        await self._transaction(write_audit)
+
+    async def _record_event(self, profile_id: ProfileId | None, code: str, message: str) -> None:
+        def write_event() -> None:
+            existing = self._db().execute(
+                "SELECT 1 FROM events WHERE profile_id IS ? AND code=? AND message=? AND timestamp>=? LIMIT 1",
+                (
+                    profile_id.value if profile_id else None,
+                    code,
+                    message[:512],
+                    _iso(self._clock() - timedelta(minutes=5)),
+                ),
+            ).fetchone()
+            if existing is None:
+                self._db().execute(
+                    "INSERT INTO events(id,timestamp,profile_id,code,message) VALUES (?,?,?,?,?)",
+                    (uuid4().hex, _iso(self._clock()), profile_id.value if profile_id else None, code, message[:512]),
+                )
+                self._db().commit()
+
+        await self._transaction(write_event)
+
+    async def _prepare_switch(self, action: PrepareSwitch, actor: str, request_id: UUID) -> ConfirmationSummary:
+        if action.current_profile_id == action.target_profile_id:
+            raise _ControllerFailure(ErrorCode.INVALID_REQUEST, "profiles must differ")
+        source = self._profile(action.current_profile_id)
+        target = self._profile(action.target_profile_id)
+        self._require_operation(source, OperationName.STOP, actor)
+        self._require_operation(target, OperationName.START, actor)
+        return await self._create_confirmation(
+            actor,
+            "switch",
+            action.current_profile_id,
+            {
+                "source_profile_id": action.current_profile_id.value,
+                "target_profile_id": action.target_profile_id.value,
+                **action.options.model_dump(mode="json"),
+            },
+            lambda confirmation_id, expires, summary_hash, generation: SwitchConfirmation(
+                confirmation_id=confirmation_id,
+                expires_at=expires,
+                summary_hash=summary_hash,
+                state_generation=generation,
+                action="switch",
+                source_profile_id=action.current_profile_id,
+                target_profile_id=action.target_profile_id,
+                **action.options.model_dump(),
+            ),
+        )
+
+    async def _confirm_switch(self, action: ConfirmSwitch, actor: str, request_id: UUID) -> JobAccepted:
+        payload = await self._consume_confirmation(actor, "switch", action.confirmation_id)
+        source = ProfileId(payload["source_profile_id"])
+        target = ProfileId(payload["target_profile_id"])
+        source_profile = self._profile(source)
+        target_profile = self._profile(target)
+        job_id = await self._transaction(lambda: self._job_intent(actor, "switch", target))
+        renewal_task = None
+        lease = None
+        target_started = False
+        rollback_lease = None
+        rollback_task = None
+        try:
+            lease = await self._reserve(target_profile, "switch", action.confirmation_id, actor=actor)
+            renewal_task = self._lease_renewal(lease)
+            if payload.get("create_backup"):
+                backup = self._service("backups", "create")
+                if backup is None:
+                    raise _ControllerFailure(ErrorCode.BACKUP_FAILED, "backup service unavailable")
+                await self._await_lease(
+                    self._invoke(backup, CreateBackup(kind="create_backup", profile_id=source, protected=True), actor, request_id),
+                    renewal_task,
+                )
+                await self._assert_lease(renewal_task)
+            try:
+                await self._await_lease(
+                    asyncio.wait_for(
+                        self._adapter(source_profile).graceful_stop(source_profile),
+                        timeout=source_profile.stop_timeout_seconds,
+                    ),
+                    renewal_task,
+                )
+            except asyncio.TimeoutError:
+                if not payload.get("force_after_timeout", False):
+                    raise _ControllerFailure(ErrorCode.GRACE_TIMEOUT, "graceful stop timed out")
+                await self._await_lease(
+                    self._adapter(source_profile).force_stop(source_profile),
+                    renewal_task,
+                )
+            await self._assert_lease(renewal_task)
+            free = await self._wait_for_free_slot(source_profile, renewal_task)
+            if free is False:
+                raise _ControllerFailure(ErrorCode.SLOT_CONFLICT, "slot did not become free")
+            await self._assert_lease(renewal_task)
+            target_started = True
+            await self._start_with_free_retry(target_profile, renewal_task)
+            await self._assert_lease(renewal_task)
+            ready = self.await_ready(target_profile)
+            if inspect.isawaitable(ready):
+                ready = await self._await_lease(
+                    asyncio.wait_for(ready, timeout=target_profile.health_timeout_seconds),
+                    renewal_task,
+                )
+            if ready is False:
+                raise RuntimeError("target readiness failed")
+            await self._transaction(lambda: self._finish(job_id, actor, "switch", target, ok=True))
+            return JobAccepted(job_id=job_id, state="running")
+        except Exception as exc:
+            if payload.get("rollback_on_failure", True):
+                await self._record_event(source, "rollback_attempt", "attempting to restore previous profile")
+                await self._record_audit(actor, "rollback", source, "accepted", None, "rollback attempt started")
+                try:
+                    if target_started:
+                        try:
+                            await self._await_lease(
+                                asyncio.wait_for(
+                                    self._adapter(target_profile).graceful_stop(target_profile),
+                                    timeout=target_profile.stop_timeout_seconds,
+                                ),
+                                renewal_task,
+                            )
+                        except asyncio.TimeoutError:
+                            if payload.get("force_after_timeout", False):
+                                await self._await_lease(
+                                    self._adapter(target_profile).force_stop(target_profile),
+                                    renewal_task,
+                                )
+                            else:
+                                raise
+                    if lease is not None and hasattr(self.reservation_store, "transfer_if_owned"):
+                        rollback_id = uuid4().hex
+                        rollback = self.reservation_store.transfer_if_owned(
+                            lease[0], lease[1], lease[2], source_profile.id, rollback_id,
+                        )
+                        if inspect.isawaitable(rollback):
+                            rollback = await rollback
+                        rollback_lease = (source_profile.id, rollback_id, lease[2])
+                        lease = None
+                    else:
+                        if lease is not None:
+                            await self._clear_reservation(lease)
+                            lease = None
+                        rollback_lease = await self._reserve(source_profile, "rollback", uuid4().hex, actor=actor)
+                    rollback_task = self._lease_renewal(rollback_lease)
+                    free = await self._wait_for_free_slot(source_profile, rollback_task)
+                    if free is False:
+                        raise RuntimeError("slot did not become free for rollback")
+                    await self._start_with_free_retry(source_profile, rollback_task)
+                    ready = self.await_ready(source_profile)
+                    if inspect.isawaitable(ready):
+                        ready = await self._await_lease(
+                            asyncio.wait_for(ready, timeout=source_profile.health_timeout_seconds),
+                            rollback_task,
+                        )
+                    if ready is False:
+                        raise RuntimeError("rollback readiness failed")
+                except Exception as rollback_exc:
+                    await self._record_event(source, "rollback_failed", "rollback did not restore the previous profile")
+                    await self._record_audit(
+                        actor,
+                        "rollback",
+                        source,
+                        "failed",
+                        ErrorCode.HEALTH_FAILED,
+                        "rollback failed",
+                    )
+                else:
+                    await self._record_event(source, "rollback_succeeded", "previous profile restored")
+                    await self._record_audit(actor, "rollback", source, "succeeded", None, "rollback completed")
+            code = exc.code if isinstance(exc, _ControllerFailure) else ErrorCode.HEALTH_FAILED
+            detail = exc.message if isinstance(exc, _ControllerFailure) else "switch failed"
+            await self._transaction(lambda: self._finish(job_id, actor, "switch", target, ok=False, code=code, detail=detail))
+            raise _ControllerFailure(code, detail) from exc
+        finally:
+            if renewal_task is not None:
+                renewal_task.cancel()
+                try:
+                    await renewal_task
+                except asyncio.CancelledError:
+                    pass
+            if lease is not None:
+                await self._clear_reservation(lease)
+            if rollback_task is not None:
+                rollback_task.cancel()
+                try:
+                    await rollback_task
+                except asyncio.CancelledError:
+                    pass
+            if rollback_lease is not None:
+                await self._clear_reservation(rollback_lease)
+
+    async def _start_with_free_retry(self, profile: Profile, renewal_task=None) -> None:
+        try:
+            if renewal_task is None:
+                await self._adapter(profile).start(profile)
+            else:
+                await self._await_lease(self._adapter(profile).start(profile), renewal_task)
+        except Exception as exc:
+            code = getattr(exc, "returncode", getattr(exc, "code", None))
+            if code != 75:
+                raise
+            free = await self._wait_for_free_slot(profile, renewal_task)
+            if free is False:
+                raise _ControllerFailure(ErrorCode.SLOT_CONFLICT, "slot did not become free")
+            if renewal_task is None:
+                await self._adapter(profile).start(profile)
+            else:
+                await self._await_lease(self._adapter(profile).start(profile), renewal_task)
+
+    async def _prepare_force_stop(self, action: PrepareForceStop, actor: str, request_id: UUID) -> ConfirmationSummary:
+        profile = self._profile(action.profile_id)
+        self._require_operation(profile, OperationName.FORCE_STOP, actor)
+        return await self._create_confirmation(
+            actor,
+            "force_stop",
+            action.profile_id,
+            {},
+            lambda confirmation_id, expires, summary_hash, generation: ForceStopConfirmation(
+                confirmation_id=confirmation_id, expires_at=expires, summary_hash=summary_hash,
+                state_generation=generation, action="force_stop", profile_id=action.profile_id
+            ),
+        )
+
+    async def _confirm_force_stop(self, action: ConfirmForceStop, actor: str, request_id: UUID) -> JobAccepted:
+        payload = await self._consume_confirmation(actor, "force_stop", action.confirmation_id)
+        profile = self._profile(ProfileId(payload["profile_id"]))
+        job_id = await self._transaction(lambda: self._job_intent(actor, "force_stop", profile.id))
+        try:
+            await self._adapter(profile).force_stop(profile)
+            await self._transaction(lambda: self._finish(job_id, actor, "force_stop", profile.id, ok=True))
+            return JobAccepted(job_id=job_id, state="running")
+        except Exception as exc:
+            await self._transaction(lambda: self._finish(job_id, actor, "force_stop", profile.id, ok=False, code=ErrorCode.INTERNAL_ERROR, detail="force stop failed"))
+            raise _ControllerFailure(ErrorCode.INTERNAL_ERROR, "force stop failed") from exc
+
+    async def _create_confirmation(self, actor: str, action: str, profile_id: ProfileId, payload: dict[str, Any], build: Callable[..., ConfirmationSummary]) -> ConfirmationSummary:
+        confirmation_id = uuid4().hex
+        expires = self._clock() + timedelta(minutes=5)
+        generation = self._current_generation()
+        encoded = json.dumps(
+            {"action": action, "profile_id": profile_id.value, "payload": payload},
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        summary_hash = hashlib.sha256(encoded.encode()).hexdigest()
+        row_payload = json.dumps({**payload, "profile_id": profile_id.value}, sort_keys=True, separators=(",", ":"))
+        def write_confirmation() -> None:
+            self._db().execute(
+                "INSERT INTO confirmations(id,actor,action,profile_id,payload,expires_at,state_generation) VALUES (?,?,?,?,?,?,?)",
+                (confirmation_id, actor, action, profile_id.value, row_payload, _iso(expires), generation),
+            )
+            self._db().commit()
+
+        await self._transaction(write_confirmation)
+        return build(confirmation_id, expires, summary_hash, generation)
+
+    async def _consume_confirmation(self, actor: str, action: str, confirmation_id: str) -> dict[str, Any]:
+        def consume():
+            row = self._db().execute(
+                "SELECT actor,action,payload,expires_at,consumed_at,state_generation,profile_id FROM confirmations WHERE id=?",
+                (confirmation_id,),
+            ).fetchone()
+            if row is None or row[1] != action or row[0] != actor:
+                self._audit_rejection_sync(actor, action, None, ErrorCode.CONFIRMATION_MISMATCH, "confirmation does not match")
+                raise _ControllerFailure(ErrorCode.CONFIRMATION_MISMATCH, "confirmation does not match")
+            if row[4] is not None:
+                self._audit_rejection_sync(actor, action, ProfileId(row[6]), ErrorCode.CONFIRMATION_MISMATCH, "confirmation was already consumed")
+                raise _ControllerFailure(ErrorCode.CONFIRMATION_MISMATCH, "confirmation was already consumed")
+            expires = datetime.fromisoformat(row[3].replace("Z", "+00:00"))
+            if expires <= self._clock():
+                self._audit_rejection_sync(actor, action, ProfileId(row[6]), ErrorCode.CONFIRMATION_EXPIRED, "confirmation expired")
+                raise _ControllerFailure(ErrorCode.CONFIRMATION_EXPIRED, "confirmation expired")
+            if row[5] != self._current_generation():
+                self._audit_rejection_sync(actor, action, ProfileId(row[6]), ErrorCode.CONFIRMATION_MISMATCH, "confirmation is stale")
+                raise _ControllerFailure(ErrorCode.CONFIRMATION_MISMATCH, "confirmation is stale")
+            updated = self._db().execute(
+                "UPDATE confirmations SET consumed_at=? WHERE id=? AND consumed_at IS NULL AND state_generation=?",
+                (_iso(self._clock()), confirmation_id, row[5]),
+            )
+            if updated.rowcount != 1:
+                self._audit_rejection_sync(actor, action, ProfileId(row[6]), ErrorCode.CONFIRMATION_MISMATCH, "confirmation was already consumed")
+                raise _ControllerFailure(ErrorCode.CONFIRMATION_MISMATCH, "confirmation was already consumed")
+            self._db().commit()
+            return json.loads(row[2])
+
+        return await self._transaction(consume)
+
+    # Typed seams for later services.  They intentionally return safe empty
+    # views rather than accepting arbitrary mappings.
+    async def _get_status(self, action: GetStatus, actor: str, request_id: UUID) -> StatusSnapshot:
+        started = time.monotonic()
+        try:
+            return await self._get_status_timed(action, actor, request_id)
+        finally:
+            self.performance.record_cycle((time.monotonic() - started) * 1000.0)
+
+    async def _get_status_timed(self, action: GetStatus, actor: str, request_id: UUID) -> StatusSnapshot:
+        service_group = getattr(self.services, "status", None)
+        if service_group is not None:
+            method = "snapshot" if action.refresh else "cached_snapshot"
+            result = getattr(service_group, method)(action, actor, request_id)
+            result = await result if inspect.isawaitable(result) else result
+        else:
+            result = StatusSnapshot(generation=0, observed_at=self._clock(), profiles=())
+        if isinstance(result, StatusSnapshot):
+            result = result.model_copy(update={"initializing": self.initializing})
+            if action.refresh:
+                await self._apply_idle_stops(result, request_id)
+                await self._apply_schedules(result, request_id)
+            return result
+        return result
+
+    async def _apply_idle_stops(self, snapshot: StatusSnapshot, request_id: UUID) -> None:
+        """Apply due idle stops from the existing fresh status sample."""
+        for status in snapshot.profiles:
+            try:
+                profile = self._profile(status.profile_id)
+            except _ControllerFailure:
+                continue
+            if not self._idle_stop.observe(profile, status):
+                continue
+            await self._record_event(profile.id, "idle_stop", "idle-stop threshold reached")
+            notifier = self._service("notifications", "send")
+            if notifier is not None:
+                try:
+                    result = notifier(
+                        profile.id,
+                        NotificationEvent.IDLE_STOP,
+                        self._current_generation(),
+                        "auto-stop requested after the configured idle period",
+                    )
+                    if inspect.isawaitable(result):
+                        await result
+                except Exception:
+                    _LOG.warning("idle-stop notification failed for %s", profile.id, exc_info=True)
+            try:
+                await self._stop(
+                    Stop(kind="stop", profile_id=profile.id),
+                    "system:idle-stop",
+                    request_id,
+                )
+            except Exception:
+                await self._record_event(profile.id, "idle_stop", "idle-stop request failed")
+                _LOG.warning("idle-stop failed for %s", profile.id, exc_info=True)
+
+    async def _apply_schedules(self, snapshot: StatusSnapshot, request_id: UUID) -> None:
+        """Run due config-only switches from the fresh status cycle."""
+        if not self._schedule.entries:
+            return
+        due = self._schedule.due(snapshot.observed_at)
+        if not due:
+            return
+        statuses = {item.profile_id: item for item in snapshot.profiles}
+        owner = next((item.slot_owner for item in snapshot.profiles if item.slot_owner), None)
+        current = statuses.get(owner) if owner is not None else None
+        if owner is None or current is None:
+            for entry in due:
+                await self._record_event(entry.profile, "scheduled_switch_skipped", "no active owner")
+            return
+        if current.players_online != 0 or current.active_job_id is not None:
+            for entry in due:
+                if entry.profile != owner:
+                    await self._record_event(entry.profile, "scheduled_switch_skipped", "current owner has players or an active job")
+            return
+        for entry in due:
+            if entry.profile == owner:
+                await self._record_event(entry.profile, "scheduled_switch", "scheduled profile is already the owner")
+                continue
+            try:
+                prepared = await self._prepare_switch(
+                    PrepareSwitch(
+                        kind="prepare_switch",
+                        current_profile_id=owner,
+                        target_profile_id=entry.profile,
+                        options=SwitchOptions(),
+                    ),
+                    "system:schedule",
+                    request_id,
+                )
+                confirmation_id = getattr(prepared, "confirmation_id", None)
+                if not isinstance(confirmation_id, str):
+                    raise RuntimeError("scheduled switch confirmation unavailable")
+                await self._confirm_switch(
+                    ConfirmSwitch(kind="confirm_switch", confirmation_id=confirmation_id),
+                    "system:schedule",
+                    request_id,
+                )
+                await self._record_event(entry.profile, "scheduled_switch", "scheduled switch completed")
+            except Exception:
+                await self._record_event(entry.profile, "scheduled_switch", "scheduled switch failed")
+                _LOG.warning("scheduled switch failed for %s", entry.profile, exc_info=True)
+
+    async def _get_perf(self, action: GetPerf, actor: str, request_id: UUID) -> PerfSnapshot:
+        return PerfSnapshot.model_validate(self.performance.snapshot())
+
+    async def _get_profiles(self, action: GetProfiles, actor: str, request_id: UUID) -> tuple[PublicProfile, ...]:
+        service = self._service("profiles", "public_profiles")
+        if service is not None:
+            result = service(action, actor, request_id)
+            return await result if inspect.isawaitable(result) else result
+        profiles = getattr(self.profiles, "profiles", ()) if self.profiles is not None else ()
+        return tuple(
+            PublicProfile(
+                id=p.id,
+                display_name=p.display_name,
+                adapter=p.adapter,
+                operations=p.operations,
+                idle_stop_minutes=getattr(p, "idle_stop_minutes", 0) or 0,
+                public_endpoint=(
+                    PublicEndpoint(
+                        host=p.public_endpoint.host,
+                        port=p.public_endpoint.port,
+                        protocol=p.public_endpoint.protocol,
+                        reachable=None,
+                    ) if p.public_endpoint is not None else None
+                ),
+            )
+            for p in profiles
+        )
+
+    async def _get_logs(self, action: GetLogs, actor: str, request_id: UUID) -> LogPage:
+        service = self._service("logs", "page")
+        if service is not None:
+            result = service(action, actor, request_id)
+            return await result if inspect.isawaitable(result) else result
+        profile = self._profile(action.profile_id)
+        adapter = self._adapter(profile)
+        if action.page.since is None and action.page.until is None:
+            logs = await adapter.recent_logs(profile, action.page.limit)
+        else:
+            logs = await adapter.recent_logs(
+                profile,
+                action.page.limit,
+                since=action.page.since,
+                until=action.page.until,
+            )
+        return LogPage(items=tuple(logs), next_cursor=None)
+
+    async def _list_backups(self, action: ListBackups, actor: str, request_id: UUID) -> BackupPage:
+        service = self._service("backups", "list")
+        if service is not None:
+            result = service(action, actor, request_id)
+            return await result if inspect.isawaitable(result) else result
+        return BackupPage(items=(), next_cursor=None)
+
+    async def _list_events(self, action: ListEvents, actor: str, request_id: UUID) -> EventPage:
+        service = self._service("audit", "list_events")
+        if service is not None:
+            result = service(action, actor, request_id)
+            return await result if inspect.isawaitable(result) else result
+        return EventPage(items=(), next_cursor=None)
+
+    async def _get_stats_summary(self, action: GetStatsSummary, actor: str, request_id: UUID) -> dict[str, Any]:
+        return stats_summary(self._db(), action.profile_id.value, action.days, now=_iso(self._clock()))
+
+    async def _get_stats_heatmap(self, action: GetStatsHeatmap, actor: str, request_id: UUID) -> dict[str, Any]:
+        return stats_heatmap(self._db(), action.profile_id.value, action.days, now=_iso(self._clock()))
+
+    async def _get_stats_tps(self, action: GetStatsTps, actor: str, request_id: UUID) -> dict[str, Any]:
+        if action.profile_id.value != "minecraft":
+            raise _ControllerFailure(ErrorCode.INVALID_REQUEST, "tick telemetry is only available for Minecraft")
+        return stats_tps(self._db(), action.profile_id.value, action.window, now=_iso(self._clock()))
+
+    async def _get_profile_config(self, action: GetProfileConfig, actor: str, request_id: UUID) -> ProfileConfigResponse:
+        profile = self._profile(action.profile_id)
+        try:
+            settings = tuple(ProfileConfigEntry.model_validate(item) for item in get_profile_config(profile))
+        except ConfigValidationError as exc:
+            raise _ControllerFailure(ErrorCode.INVALID_REQUEST, str(exc)) from exc
+        return ProfileConfigResponse(profile_id=profile.id, settings=settings)
+
+    async def _set_profile_config(self, action: SetProfileConfig, actor: str, request_id: UUID) -> ProfileConfigResponse:
+        profile = self._profile(action.profile_id)
+        status_service = getattr(self.services, "status", None)
+        if status_service is not None:
+            snapshot = status_service.cached_snapshot()
+            if inspect.isawaitable(snapshot):
+                snapshot = await snapshot
+            current = next((item for item in snapshot.profiles if item.profile_id == profile.id), None)
+            state = getattr(getattr(current, "state", None), "value", getattr(current, "state", None))
+            if state in {"starting", "stopping"}:
+                raise _ControllerFailure(ErrorCode.INVALID_STATE, "profile config cannot change while the profile is transitioning")
+        try:
+            result = set_profile_config(profile, action.changes)
+            settings = tuple(ProfileConfigEntry.model_validate(item) for item in get_profile_config(profile))
+        except ConfigValidationError as exc:
+            raise _ControllerFailure(ErrorCode.INVALID_REQUEST, str(exc)) from exc
+        changed = tuple(result["changed"])
+        restart_required = tuple(result["restart_required"])
+        await self._record_event(profile.id, "config_changed", f"config changed: {', '.join(changed) or 'no changes'}")
+        await self._record_audit(actor, "set_profile_config", profile.id, "succeeded", None, f"changed keys: {', '.join(changed) or 'none'}; restart required: {', '.join(restart_required) or 'none'}")
+        return ProfileConfigResponse(profile_id=profile.id, settings=settings, changed=changed, restart_required=restart_required)
+
+    async def _list_audit(self, action: ListAudit, actor: str, request_id: UUID) -> AuditPage:
+        service = self._service("audit", "list_audit")
+        if service is not None:
+            result = service(action, actor, request_id)
+            return await result if inspect.isawaitable(result) else result
+        return AuditPage(items=(), next_cursor=None)
+
+    async def _create_backup(self, action: CreateBackup, actor: str, request_id: UUID) -> JobAccepted:
+        profile = self._profile(action.profile_id)
+        self._require_operation(profile, OperationName.BACKUP, actor)
+        service = self._service("backups", "create")
+        if service is None:
+            raise _ControllerFailure(ErrorCode.BACKUP_FAILED, "backup service unavailable")
+        result = await self._invoke(service, action, actor, request_id)
+        return result
+
+    async def _prepare_restore(self, action: PrepareRestore, actor: str, request_id: UUID) -> ConfirmationSummary:
+        profile = self._profile(action.profile_id)
+        self._require_operation(profile, OperationName.RESTORE, actor)
+        return await self._create_confirmation(
+            actor,
+            "restore",
+            action.profile_id,
+            {"backup_id": action.backup_id},
+            lambda confirmation_id, expires, summary_hash, generation: RestoreConfirmation(
+                confirmation_id=confirmation_id,
+                expires_at=expires,
+                summary_hash=summary_hash,
+                state_generation=generation,
+                action="restore",
+                profile_id=action.profile_id,
+                backup_id=action.backup_id,
+            ),
+        )
+
+    async def _confirm_restore(self, action: ConfirmRestore, actor: str, request_id: UUID) -> JobAccepted:
+        payload = await self._consume_confirmation(actor, "restore", action.confirmation_id)
+        service = self._service("backups", "confirm_restore")
+        if service is None:
+            service = self._service("backups", "restore")
+        if service is None:
+            raise _ControllerFailure(ErrorCode.RESTORE_FAILED, "restore service unavailable")
+        return await self._invoke(service, action, actor, request_id, payload=payload)
+
+    async def _prepare_world_clone(self, action: PrepareWorldClone, actor: str, request_id: UUID) -> ConfirmationSummary:
+        source = self._profile(ProfileId.TERRARIA_VANILLA)
+        target = self._profile(ProfileId.TERRARIA_TMOD)
+        self._require_operation(source, OperationName.CLONE_SOURCE, actor)
+        self._require_operation(target, OperationName.CLONE_TARGET, actor)
+        return await self._create_confirmation(
+            actor,
+            "world_clone",
+            ProfileId.TERRARIA_VANILLA,
+            {
+                "source_profile_id": ProfileId.TERRARIA_VANILLA.value,
+                "target_profile_id": ProfileId.TERRARIA_TMOD.value,
+                "source_world_id": action.source_world_id,
+                "destination_name": action.destination_name,
+            },
+            lambda confirmation_id, expires, summary_hash, generation: WorldCloneConfirmation(
+                confirmation_id=confirmation_id,
+                expires_at=expires,
+                summary_hash=summary_hash,
+                state_generation=generation,
+                action="world_clone",
+                source_profile_id=ProfileId.TERRARIA_VANILLA,
+                target_profile_id=ProfileId.TERRARIA_TMOD,
+                source_world_id=action.source_world_id,
+                destination_name=action.destination_name,
+            ),
+        )
+
+    async def _confirm_world_clone(self, action: ConfirmWorldClone, actor: str, request_id: UUID) -> JobAccepted:
+        payload = await self._consume_confirmation(actor, "world_clone", action.confirmation_id)
+        service = self._service("worlds", "confirm_clone")
+        if service is None:
+            service = self._service("worlds", "clone")
+        if service is None:
+            raise _ControllerFailure(ErrorCode.INVALID_REQUEST, "world clone service unavailable")
+        return await self._invoke(service, action, actor, request_id, payload=payload)
+
+    async def _check_update(self, action: CheckUpdate, actor: str, request_id: UUID) -> UpdateStatus:
+        profile = self._profile(action.profile_id)
+        self._require_operation(profile, OperationName.UPDATE_CHECK, actor)
+        service = self._service("updates", "check")
+        if service is None:
+            raise _ControllerFailure(ErrorCode.UPDATE_FAILED, "update service unavailable")
+        return await self._invoke(service, action, actor, request_id)
+
+    async def _prepare_update(self, action: PrepareUpdate, actor: str, request_id: UUID) -> ConfirmationSummary:
+        profile = self._profile(action.profile_id)
+        self._require_operation(profile, OperationName.UPDATE_APPLY, actor)
+        return await self._create_confirmation(
+            actor,
+            "update",
+            action.profile_id,
+            {"installed_version": None, "available_version": None},
+            lambda confirmation_id, expires, summary_hash, generation: UpdateConfirmation(
+                confirmation_id=confirmation_id,
+                expires_at=expires,
+                summary_hash=summary_hash,
+                state_generation=generation,
+                action="update",
+                profile_id=action.profile_id,
+                installed_version=None,
+                available_version=None,
+            ),
+        )
+
+    async def _confirm_update(self, action: ConfirmUpdate, actor: str, request_id: UUID) -> JobAccepted:
+        payload = await self._consume_confirmation(actor, "update", action.confirmation_id)
+        service = self._service("updates", "confirm")
+        if service is None:
+            service = self._service("updates", "apply")
+        if service is None:
+            raise _ControllerFailure(ErrorCode.UPDATE_FAILED, "update service unavailable")
+        return await self._invoke(service, action, actor, request_id, payload=payload)
+
+    async def _get_notification_config(self, action: GetNotificationConfig, actor: str, request_id: UUID) -> NotificationConfig:
+        service = self._service("notifications", "get_config")
+        if service is not None:
+            result = service(action, actor, request_id)
+            return await result if inspect.isawaitable(result) else result
+        raise _ControllerFailure(ErrorCode.INTERNAL_ERROR, "notification service unavailable")
+
+    async def _set_notification_rule(self, action, actor: str, request_id: UUID) -> NotificationConfig:
+        service = self._service("notifications", "set_rule")
+        if service is None:
+            raise _ControllerFailure(ErrorCode.INTERNAL_ERROR, "notification service unavailable")
+        return await self._invoke(service, action, actor, request_id)
+
+    async def _test_notification(self, action, actor: str, request_id: UUID) -> JobAccepted:
+        service = self._service("notifications", "test")
+        if service is None:
+            raise _ControllerFailure(ErrorCode.INTERNAL_ERROR, "notification service unavailable")
+        return await self._invoke(service, action, actor, request_id)
+
+    async def _set_idle_stop(self, action: SetIdleStop, actor: str, request_id: UUID) -> dict[str, Any]:
+        updater = getattr(self.profiles, "update_idle_stop", None)
+        if updater is None:
+            raise _ControllerFailure(ErrorCode.INTERNAL_ERROR, "profile configuration is unavailable")
+        try:
+            profile = updater(action.profile_id, action.minutes)
+        except (OSError, RuntimeError, ValueError) as exc:
+            raise _ControllerFailure(ErrorCode.INVALID_REQUEST, "idle-stop setting could not be saved") from exc
+        for group_name in ("profiles", "notifications"):
+            group = getattr(self.services, group_name, None)
+            mapping = getattr(group, "profiles", None)
+            if isinstance(mapping, dict):
+                mapping[profile.id.value] = profile
+        await self._record_audit(
+            actor,
+            "set_idle_stop",
+            profile.id,
+            "succeeded",
+            None,
+            "idle-stop setting updated",
+        )
+        return {"profile_id": profile.id.value, "idle_stop_minutes": profile.idle_stop_minutes}
+
+    def _service(self, group: str, method: str):
+        service_group = getattr(self.services, group, None)
+        return getattr(service_group, method, None) if service_group is not None else None
+
+    async def _invoke(self, service, action, actor: str, request_id: UUID, **extra):
+        """Call an injected typed seam without forwarding arbitrary RPC maps."""
+        try:
+            signature = inspect.signature(service)
+            names = tuple(signature.parameters)
+        except (TypeError, ValueError):
+            names = ()
+        kwargs = {name: value for name, value in extra.items() if name in names}
+        if "actor" in names:
+            kwargs["actor"] = actor
+        if "request_id" in names:
+            kwargs["request_id"] = request_id
+        if kwargs:
+            result = service(action, **kwargs)
+        else:
+            positional = [action]
+            if len(names) >= 3:
+                positional.extend((actor, request_id))
+            result = service(*positional)
+        return await result if inspect.isawaitable(result) else result
+
+
+class _ControllerFailure(Exception):
+    def __init__(self, code: ErrorCode, message: str, *, retryable: bool = False, details: SafeDetails | None = None):
+        self.code, self.message, self.retryable, self.details = code, message, retryable, details
+        super().__init__(message)
+
+
+__all__ = ["Controller", "DISPATCH", "dispatch_is_exhaustive"]

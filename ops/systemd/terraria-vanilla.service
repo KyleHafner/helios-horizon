@@ -1,0 +1,25 @@
+[Unit]
+Description=Terraria Vanilla game server
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=terraria-vanilla
+Group=terraria-vanilla
+WorkingDirectory=/srv/game-servers/terraria-vanilla
+ExecStart=/usr/local/libexec/game-slot-run terraria-vanilla
+ExecStop=/usr/local/libexec/game-console-stop terraria-vanilla $MAINPID
+KillSignal=SIGINT
+TimeoutStopSec=90
+Restart=no
+StandardOutput=journal
+StandardError=journal
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=yes
+NoNewPrivileges=yes
+RestrictSUIDSGID=yes
+ReadOnlyPaths=/opt/game-control /etc/game-control /usr/local/libexec /usr/bin
+ReadWritePaths=/run/game-control /run/game-slot /opt/game-servers/terraria-vanilla /srv/game-servers/terraria-vanilla
+UMask=0077

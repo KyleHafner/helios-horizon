@@ -1,0 +1,41 @@
+name: CI
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  unit:
+    name: Unit tests (Python ${{ matrix.python-version }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.11", "3.12"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+        with:
+          python-version: ${{ matrix.python-version }}
+          enable-cache: true
+      - run: uv sync --frozen --extra test
+      - run: uv run pytest -q --ignore=tests/browser
+      - run: uv run python -m compileall -q src ops tests
+
+  browser:
+    name: Browser tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+        with:
+          python-version: "3.11"
+          enable-cache: true
+      - run: uv sync --frozen --extra test
+      - run: uv run playwright install --with-deps chromium
+      - run: uv run pytest -q tests/browser

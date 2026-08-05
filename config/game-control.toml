@@ -1,0 +1,19 @@
+profiles_dir = "/etc/game-control/profiles.d"
+state_db = "/var/lib/game-control/state.db"
+reservation_path = "/run/game-control/reservation.json"
+# Keep boot_profile and boot_autostart at TOML root, before the first [section].
+# Resume the last successfully active profile after a future slotd restart.
+# The controller owns this start and applies normal reservation/health gates.
+boot_profile = "resume-last-active"
+boot_autostart = true
+# Optional [[schedule]] entries are parsed at slotd startup; restart slotd to reload.
+# Example: [[schedule]] / cron = "0 20 * * 5" / profile = "pz-rising"
+
+[crafty]
+base_url = "https://127.0.0.1:8443"
+token_path = "/etc/game-control/secrets.d/crafty-token"
+verify = false
+
+[stats]
+exporter_url = "http://127.0.0.1:19565/metrics"
+tps_interval_seconds = 30

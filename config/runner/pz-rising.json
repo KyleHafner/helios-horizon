@@ -1,0 +1,8 @@
+{
+  "user": "pzuser",
+  "group": "pzuser",
+  "cwd": "/opt/pzserver",
+  "console_fifo": "/run/game-slot/pz-rising.console",
+  "argv": ["/usr/bin/bash", "start-server.sh", "-servername", "rising", "-statistic", "0"],
+  "environment": {}
+}

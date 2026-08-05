@@ -1,0 +1,15 @@
+{
+  "user": "tmodloader",
+  "group": "tmodloader",
+  "cwd": "/srv/game-servers/terraria-tmod",
+  "console_fifo": "/run/game-slot/terraria-tmod.console",
+  "argv": [
+    "/opt/game-servers/terraria-tmod/current/start-tModLoaderServer.sh",
+    "-nosteam",
+    "-config",
+    "/srv/game-servers/terraria-tmod/config/serverconfig.txt",
+    "-tmlsavedirectory",
+    "/srv/game-servers/terraria-tmod"
+  ],
+  "environment": {}
+}

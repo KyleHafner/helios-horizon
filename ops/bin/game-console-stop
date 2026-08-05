@@ -1,0 +1,147 @@
+#!/usr/bin/env python3
+"""Send fixed save/exit commands to a managed Terraria console FIFO."""
+from __future__ import annotations
+
+import os
+import errno
+import stat
+import sys
+import time
+from pathlib import Path
+
+
+DEFAULT_CONSOLE_DIR = Path("/run/game-slot")
+PROFILES = frozenset(
+    {"terraria-vanilla", "terraria-tmod", "terraria-tmod-145-candidate"}
+)
+DEFAULT_TIMEOUT = 75.0
+
+
+class _NoConsole(Exception):
+    """The managed process has no usable console (legacy or already gone)."""
+
+
+def _console_dir() -> Path:
+    value = os.environ.get("GAME_CONSOLE_STOP_DIR")
+    if value is None:
+        return DEFAULT_CONSOLE_DIR
+    if os.geteuid() != 0 or os.environ.get("GAME_CONSOLE_STOP_TEST_MODE") != "1":
+        raise ValueError("console directory override requires root test mode")
+    return Path(value)
+
+
+def _timeout() -> float:
+    value = os.environ.get("GAME_CONSOLE_STOP_TIMEOUT")
+    if value is None:
+        return DEFAULT_TIMEOUT
+    if os.geteuid() != 0 or os.environ.get("GAME_CONSOLE_STOP_TEST_MODE") != "1":
+        raise ValueError("timeout override requires root test mode")
+    timeout = float(value)
+    if not 0 < timeout <= DEFAULT_TIMEOUT:
+        raise ValueError("invalid timeout")
+    return timeout
+
+
+def _pid(value: str) -> int | None:
+    pid = int(value)
+    if pid <= 1:
+        raise ValueError("invalid pid")
+    try:
+        status = Path(f"/proc/{pid}/status").read_text()
+    except FileNotFoundError:
+        return None
+    uid_line = next(line for line in status.splitlines() if line.startswith("Uid:"))
+    real_uid = int(uid_line.split()[1])
+    if real_uid != os.geteuid():
+        raise ValueError("pid owner mismatch")
+    return pid
+
+
+def _open_fifo(path: Path) -> int:
+    try:
+        info = path.lstat()
+    except FileNotFoundError as exc:
+        raise _NoConsole from exc
+    if (
+        not stat.S_ISFIFO(info.st_mode)
+        or info.st_uid != os.geteuid()
+        or stat.S_IMODE(info.st_mode) != 0o600
+        or info.st_nlink != 1
+    ):
+        raise ValueError("invalid console fifo")
+    try:
+        fd = os.open(path, os.O_WRONLY | os.O_NONBLOCK | os.O_NOFOLLOW)
+    except FileNotFoundError as exc:
+        raise _NoConsole from exc
+    except OSError as exc:
+        # A FIFO with no reader is a leftover from a prior runner process.
+        # Treat it like a missing console; the next start will replace it.
+        if exc.errno == errno.ENXIO:
+            raise _NoConsole from exc
+        raise
+    try:
+        info = os.fstat(fd)
+        if (
+            not stat.S_ISFIFO(info.st_mode)
+            or info.st_uid != os.geteuid()
+            or stat.S_IMODE(info.st_mode) != 0o600
+            or info.st_nlink != 1
+        ):
+            raise ValueError("invalid console fifo")
+        return fd
+    except BaseException:
+        os.close(fd)
+        raise
+
+
+def _write_all(fd: int, payload: bytes) -> None:
+    offset = 0
+    while offset < len(payload):
+        offset += os.write(fd, payload[offset:])
+
+
+def _exited(pid: int) -> bool:
+    try:
+        fields = Path(f"/proc/{pid}/stat").read_text().split(") ", 1)[1].split()
+        return fields[0] == "Z"
+    except (FileNotFoundError, ProcessLookupError):
+        return True
+    except (OSError, IndexError):
+        return False
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = sys.argv[1:] if argv is None else argv
+    try:
+        if len(args) != 2 or args[0] not in PROFILES:
+            return 2
+        profile = args[0]
+        path = _console_dir() / f"{profile}.console"
+        try:
+            path.lstat()
+        except FileNotFoundError:
+            return 0
+        pid = _pid(args[1])
+        if pid is None:
+            return 0
+        try:
+            fd = _open_fifo(path)
+        except _NoConsole:
+            return 0
+        try:
+            _write_all(fd, b"save\nexit\n")
+        finally:
+            os.close(fd)
+        deadline = time.monotonic() + _timeout()
+        while time.monotonic() < deadline:
+            if _exited(pid):
+                path.unlink(missing_ok=True)
+                return 0
+            time.sleep(0.1)
+        return 1
+    except (OSError, ValueError, StopIteration):
+        return 2
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

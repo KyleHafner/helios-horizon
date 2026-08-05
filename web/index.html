@@ -1,0 +1,379 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta name="color-scheme" content="dark">
+    <title>Helios Control</title>
+    <link rel="icon" type="image/svg+xml" href="data:image/svg+xml,%3Csvg xmlns=%22http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%22 viewBox=%220 0 32 32%22%3E%3Crect width=%2232%22 height=%2232%22 rx=%223%22 fill=%22%230f1718%22%2F%3E%3Crect x=%226%22 y=%227%22 width=%224%22 height=%2218%22 fill=%22%2359d991%22%2F%3E%3Crect x=%2214%22 y=%227%22 width=%224%22 height=%2218%22 fill=%22%2359d991%22 opacity=%22.72%22%2F%3E%3Crect x=%2222%22 y=%227%22 width=%224%22 height=%2218%22 fill=%22%2359d991%22 opacity=%22.44%22%2F%3E%3C%2Fsvg%3E">
+    <link rel="stylesheet" href="/styles.css">
+  </head>
+  <body>
+    <div class="app-shell">
+      <div class="drawer-overlay" id="drawer-overlay" hidden></div>
+      <aside class="sidebar" id="sidebar" aria-label="Primary navigation" aria-hidden="false">
+        <div class="sidebar-top">
+          <a class="wordmark" href="#/" aria-label="Game server control home">HELIOS <span>CONTROL</span></a>
+          <button class="icon-button drawer-close" id="drawer-close" type="button" aria-label="Close navigation">×</button>
+        </div>
+        <nav class="primary-nav" aria-label="Application">
+          <a class="nav-item is-active" href="#/" data-view="dashboard"><span>Dashboard</span></a>
+          <div class="nav-group">
+            <button class="nav-group-toggle" id="servers-toggle" type="button" aria-label="Servers" aria-expanded="true" aria-controls="server-nav">
+              <span>SERVERS</span><span class="nav-chevron" aria-hidden="true">⌄</span>
+            </button>
+            <div class="nav-subnav" id="server-nav">
+              <a class="nav-item nav-server" href="#/servers/minecraft/console" data-profile-nav="minecraft"><span class="server-dot" aria-hidden="true"></span><span data-profile-label="minecraft">Minecraft</span></a>
+              <a class="nav-item nav-server" href="#/servers/pz-rising/console" data-profile-nav="pz-rising"><span class="server-dot" aria-hidden="true"></span><span data-profile-label="pz-rising">Project Zomboid</span></a>
+              <a class="nav-item nav-server" href="#/servers/terraria-vanilla/console" data-profile-nav="terraria-vanilla"><span class="server-dot" aria-hidden="true"></span><span data-profile-label="terraria-vanilla">Terraria Vanilla</span></a>
+              <a class="nav-item nav-server" href="#/servers/terraria-tmod/console" data-profile-nav="terraria-tmod"><span class="server-dot" aria-hidden="true"></span><span data-profile-label="terraria-tmod">Terraria tModLoader</span></a>
+            </div>
+          </div>
+          <div class="nav-group system-group">
+            <p class="nav-group-label">system</p>
+            <a class="nav-item" href="#/backups" data-view="backups"><span>Backups</span></a>
+            <a class="nav-item" href="#/events" data-view="events"><span>Events</span></a>
+            <a class="nav-item" href="#/audit" data-view="audit"><span>Audit</span></a>
+            <button class="nav-item" id="settings-nav" type="button" data-view="settings"><span>Settings</span></button>
+          </div>
+        </nav>
+        <p class="session-note sidebar-session" id="session-note">Checking operator session…</p>
+        <button class="button button-quiet" id="logout" type="button">Log out</button>
+      </aside>
+
+      <main id="main-content" class="main-pane">
+        <button class="menu-toggle" id="menu-toggle" type="button" aria-label="Open navigation" aria-controls="sidebar" aria-expanded="false">☰</button>
+        <button class="palette-trigger" id="palette-trigger" type="button" aria-haspopup="dialog" aria-controls="command-palette" aria-keyshortcuts="Control+K Meta+K"><span>Command palette</span><kbd>⌘K</kbd></button>
+        <div class="view" id="dashboard-view">
+      <section class="page-intro" aria-labelledby="page-title">
+        <div>
+          <h1 id="page-title">Dashboard</h1>
+        </div>
+        <div class="intro-actions">
+          <p class="section-meta"><span id="last-updated">Awaiting status</span> <span id="conn-state" class="conn-pill" data-state="live">Live</span></p><button class="button button-quiet" id="retry-load" type="button" hidden>Retry load</button>
+          <button class="button button-primary" type="button" id="switch-active" aria-haspopup="dialog">Switch server…</button>
+        </div>
+      </section>
+
+      <section class="active-slot is-empty" id="active-slot" aria-labelledby="active-slot-title" data-slot-strip>
+        <div class="slot-mark" aria-hidden="true"></div>
+        <div class="slot-copy">
+          <p class="eyebrow">active slot</p>
+          <h2 id="active-slot-title">Nothing is running</h2>
+          <p id="active-slot-summary" aria-live="polite"></p>
+          <a class="manage-link active-manage" id="active-manage" href="#/servers/minecraft/console">Manage →</a>
+        </div>
+        <dl class="slot-metrics">
+          <div><dt>Players</dt><dd id="active-players">—</dd></div>
+          <div><dt>Uptime</dt><dd id="active-uptime">—</dd></div>
+          <div><dt>Health</dt><dd id="active-health">—</dd></div>
+        </dl>
+      </section>
+
+      <section class="content-grid" aria-labelledby="servers-title">
+        <div class="section-heading">
+          <div>
+            <h2 id="servers-title">Servers</h2>
+          </div>
+        </div>
+        <div class="cards" id="profile-cards" aria-busy="true">
+          <article class="skeleton-card" data-skeleton aria-hidden="true"><span class="skeleton-block skeleton-kicker"></span><span class="skeleton-block skeleton-title"></span><span class="skeleton-block skeleton-copy"></span><span class="skeleton-block skeleton-chart"></span><span class="skeleton-block skeleton-metrics"></span><span class="skeleton-block skeleton-actions"></span></article>
+          <article class="skeleton-card" data-skeleton aria-hidden="true"><span class="skeleton-block skeleton-kicker"></span><span class="skeleton-block skeleton-title"></span><span class="skeleton-block skeleton-copy"></span><span class="skeleton-block skeleton-chart"></span><span class="skeleton-block skeleton-metrics"></span><span class="skeleton-block skeleton-actions"></span></article>
+          <article class="skeleton-card" data-skeleton aria-hidden="true"><span class="skeleton-block skeleton-kicker"></span><span class="skeleton-block skeleton-title"></span><span class="skeleton-block skeleton-copy"></span><span class="skeleton-block skeleton-chart"></span><span class="skeleton-block skeleton-metrics"></span><span class="skeleton-block skeleton-actions"></span></article>
+          <article class="skeleton-card" data-skeleton aria-hidden="true"><span class="skeleton-block skeleton-kicker"></span><span class="skeleton-block skeleton-title"></span><span class="skeleton-block skeleton-copy"></span><span class="skeleton-block skeleton-chart"></span><span class="skeleton-block skeleton-metrics"></span><span class="skeleton-block skeleton-actions"></span></article>
+          <article class="skeleton-card" data-skeleton aria-hidden="true"><span class="skeleton-block skeleton-kicker"></span><span class="skeleton-block skeleton-title"></span><span class="skeleton-block skeleton-copy"></span><span class="skeleton-block skeleton-chart"></span><span class="skeleton-block skeleton-metrics"></span><span class="skeleton-block skeleton-actions"></span></article>
+        </div>
+      </section>
+        </div>
+
+        <section class="view detail-view" id="detail-view" aria-labelledby="detail-title" hidden>
+          <div class="detail-header">
+            <div>
+              <p class="breadcrumb"><a href="#/">Servers</a><span id="detail-breadcrumb-name"> / Server</span></p>
+              <h1 id="detail-title">Server</h1>
+              <p class="detail-subtitle" id="detail-subtitle">private</p>
+            </div>
+            <div class="detail-header-right">
+              <span class="status-badge" id="detail-status"><span class="status-dot" aria-hidden="true"></span><span class="status-text">Unknown</span></span>
+              <div class="detail-actions" id="detail-actions">
+                <button class="button button-primary" id="detail-start" type="button">Start</button>
+                <button class="button button-quiet" id="detail-stop" type="button">Stop</button>
+                <button class="button button-quiet" id="detail-restart" type="button">Restart</button>
+                <button class="button button-danger" id="detail-force" type="button">Force stop</button>
+              </div>
+            </div>
+          </div>
+          <div class="detail-tabs" role="tablist" aria-label="Server detail sections">
+            <button role="tab" id="tab-console" data-detail-tab="console" aria-controls="panel-console" aria-selected="true" tabindex="0">Console</button>
+            <button role="tab" id="tab-metrics" data-detail-tab="metrics" aria-controls="panel-metrics" aria-selected="false" tabindex="-1">Metrics</button>
+            <button role="tab" id="tab-stats" data-detail-tab="stats" aria-controls="panel-stats" aria-selected="false" tabindex="-1">Stats</button>
+            <button role="tab" id="tab-logs" data-detail-tab="logs" aria-controls="panel-logs" aria-selected="false" tabindex="-1">Logs</button>
+            <button role="tab" id="tab-backups" data-detail-tab="backups" aria-controls="panel-backups" aria-selected="false" tabindex="-1">Backups</button>
+            <button role="tab" id="tab-config" data-detail-tab="config" aria-controls="panel-config" aria-selected="false" tabindex="-1">Config</button>
+          </div>
+          <div class="detail-grid">
+            <div class="detail-main">
+              <section class="detail-panel" id="panel-console" role="tabpanel" aria-labelledby="tab-console" tabindex="0">
+                <div class="console-wrap">
+                  <div class="console-toolbar">
+                    <button id="console-clear" class="button button-small button-quiet" type="button">Clear</button>
+                    <button id="console-save" class="button button-small button-quiet" type="button">Save</button>
+                    <button id="console-save-as" class="button button-small button-quiet" type="button">Save As…</button>
+                    <button id="console-jump" class="button button-small" type="button" hidden>Jump to latest ↓</button>
+                    <label class="check-row noise-toggle"><input id="console-noise-toggle" type="checkbox" checked><span id="console-noise-label">Hide network noise · 0 hidden</span></label>
+                  </div>
+                  <div class="console-output" id="console-output" aria-label="Console output"><div class="detail-skeleton" data-detail-skeleton aria-hidden="true"><span class="skeleton-block skeleton-line-wide"></span><span class="skeleton-block skeleton-line"></span><span class="skeleton-block skeleton-line-medium"></span><span class="skeleton-block skeleton-line"></span><span class="skeleton-block skeleton-line-wide"></span></div></div>
+                  <details class="command-list">
+                    <summary>Commands</summary>
+                    <div id="command-catalog" class="command-catalog"></div>
+                  </details>
+                  <div class="command-row">
+                    <label class="sr-only" for="command-input">Command</label>
+                    <input id="command-input" aria-label="Command" list="command-suggestions" type="text" autocomplete="off" maxlength="512" placeholder="Command input unavailable">
+                    <datalist id="command-suggestions"></datalist>
+                    <button class="button button-primary" id="command-send" type="button">Send</button>
+                  </div>
+                  <p class="field-hint" id="command-note">Command availability is loading.</p>
+                </div>
+              </section>
+              <section class="detail-panel" id="panel-metrics" role="tabpanel" aria-labelledby="tab-metrics" tabindex="0" hidden>
+                <div class="metrics-grid">
+                  <article class="metric-chart" data-metric="cpu"><h2>CPU</h2><strong id="metric-cpu-current">Unavailable</strong><svg id="metric-cpu-chart" viewBox="0 0 220 110" aria-label="CPU chart"><line class="chart-axis" x1="30" y1="8" x2="30" y2="90"></line><line class="chart-axis" x1="30" y1="90" x2="215" y2="90"></line><text class="chart-ymax" x="26" y="12" text-anchor="end">1%</text><text class="chart-ymid" x="26" y="52" text-anchor="end">0%</text><text x="26" y="94" text-anchor="end">0</text><text class="chart-x0" x="30" y="106">—</text><text class="chart-x1" x="215" y="106" text-anchor="end">—</text><polyline class="chart-line" points="30,90 215,90"></polyline></svg><p>Normal range below 80%</p></article>
+                  <article class="metric-chart" data-metric="memory"><h2>Memory RSS</h2><strong id="metric-memory-current">Unavailable</strong><svg id="metric-memory-chart" viewBox="0 0 220 110" aria-label="Memory RSS chart"><line class="chart-axis" x1="30" y1="8" x2="30" y2="90"></line><line class="chart-axis" x1="30" y1="90" x2="215" y2="90"></line><text class="chart-ymax" x="26" y="12" text-anchor="end">1 GiB</text><text class="chart-ymid" x="26" y="52" text-anchor="end">0.5 GiB</text><text x="26" y="94" text-anchor="end">0</text><text class="chart-x0" x="30" y="106">—</text><text class="chart-x1" x="215" y="106" text-anchor="end">—</text><polyline class="chart-line" points="30,90 215,90"></polyline></svg><p>Observed resident memory</p></article>
+                  <article class="metric-chart" data-metric="players"><h2>Players online</h2><strong id="metric-players-current">Unavailable</strong><svg id="metric-players-chart" viewBox="0 0 220 110" aria-label="Players online chart"><line class="chart-axis" x1="30" y1="8" x2="30" y2="90"></line><line class="chart-axis" x1="30" y1="90" x2="215" y2="90"></line><text class="chart-ymax" x="26" y="12" text-anchor="end">1</text><text class="chart-ymid" x="26" y="52" text-anchor="end">0</text><text x="26" y="94" text-anchor="end">0</text><text class="chart-x0" x="30" y="106">—</text><text class="chart-x1" x="215" y="106" text-anchor="end">—</text><polyline class="chart-line" points="30,90 215,90"></polyline></svg><p>Players observed by latest status</p></article>
+                  <article class="metric-chart" data-metric="uptime"><h2>Uptime</h2><strong id="metric-uptime">—</strong><p>Since last start</p></article>
+                  <article class="metric-chart" data-metric="disk"><h2>Disk free</h2><strong id="metric-disk-free">Unavailable</strong><p id="metric-disk-free-note">Profile mutable root</p></article>
+                  <article class="metric-chart" data-metric="disk-io"><h2>Disk I/O</h2><strong id="metric-disk-io">Unavailable</strong><p>Read/write rate · unavailable when process I/O is restricted</p></article>
+                </div>
+              </section>
+              <section class="detail-panel stats-panel" id="panel-stats" role="tabpanel" aria-labelledby="tab-stats" tabindex="0" hidden>
+                <div class="stats-heading">
+                  <div><p class="eyebrow">Player activity</p><h2>Sessions and telemetry</h2></div>
+                  <label class="stats-window">Window <select id="stats-window"><option value="1h">1 hour</option><option value="6h">6 hours</option><option value="24h" selected>24 hours</option></select></label>
+                </div>
+                <div class="stats-summary" id="stats-summary" aria-live="polite">
+                  <div><span>Total player-hours</span><strong id="stats-total-hours">—</strong></div>
+                  <div><span>Unique players</span><strong id="stats-unique-players">—</strong></div>
+                </div>
+                <div class="stats-sections">
+                  <section class="stats-block" aria-labelledby="stats-leaderboard-title">
+                    <div class="stats-block-heading"><h3 id="stats-leaderboard-title">Leaderboard</h3><span class="section-meta" id="stats-leaderboard-meta">—</span></div>
+                    <div class="stats-table-wrap"><table class="stats-table"><thead><tr><th scope="col">Player</th><th scope="col">Hours</th><th scope="col">Sessions</th><th scope="col">Last seen</th></tr></thead><tbody id="stats-leaderboard"><tr><td class="empty-state" colspan="4">No sessions recorded yet.</td></tr></tbody></table></div>
+                  </section>
+                  <section class="stats-block" aria-labelledby="stats-heatmap-title">
+                    <div class="stats-block-heading"><h3 id="stats-heatmap-title">Activity heatmap</h3><span class="section-meta">UTC · last 90 days</span></div>
+                    <div class="heatmap-grid" id="stats-heatmap" aria-label="Player-hours by UTC day and hour"></div>
+                  </section>
+                  <section class="stats-block" id="stats-occupancy-block" aria-labelledby="stats-occupancy-title" hidden>
+                    <div class="stats-block-heading"><div><h3 id="stats-occupancy-title">Occupancy</h3><p class="stats-note" id="stats-occupancy-note">Count-based occupancy; player names are not available for this game.</p></div><strong id="stats-occupancy-current">—</strong></div>
+                  </section>
+                  <section class="stats-block stats-tps-block" aria-labelledby="stats-tps-title">
+                    <div class="stats-block-heading"><div><h3 id="stats-tps-title">Minecraft tick telemetry</h3><p class="stats-note" id="stats-tps-note">Loading tick samples…</p></div><div class="stats-tps-values"><strong id="stats-tps-current">—</strong><span id="stats-mspt-current">—</span></div></div>
+                    <svg id="stats-tps-chart" class="stats-tps-chart" viewBox="0 0 520 180" role="img" aria-label="Minecraft TPS and MSPT chart">
+                      <line class="chart-axis" x1="42" y1="12" x2="42" y2="150"></line><line class="chart-axis" x1="42" y1="150" x2="510" y2="150"></line>
+                      <text class="chart-ymax" x="38" y="16" text-anchor="end">20 TPS</text><text class="chart-ymid" x="38" y="84" text-anchor="end">10 TPS</text><text x="38" y="154" text-anchor="end">0</text><text class="chart-x0" x="42" y="172">—</text><text class="chart-x1" x="510" y="172" text-anchor="end">—</text>
+                      <g class="tps-chart-lines"><polyline class="chart-line" points="42,150 510,150"></polyline></g>
+                    </svg>
+                  </section>
+                </div>
+              </section>
+              <section class="detail-panel" id="panel-logs" role="tabpanel" aria-labelledby="tab-logs" tabindex="0" hidden>
+                <div class="log-toolbar detail-log-toolbar">
+                  <label for="detail-log-query">Filter</label><input id="detail-log-query" type="search" placeholder="Filter messages">
+                  <label for="detail-log-severity">Severity</label><select id="detail-log-severity"><option value="all">All levels</option><option value="debug">Debug</option><option value="info">Info</option><option value="warning">Warning</option><option value="error">Error</option></select>
+                  <label class="check-row noise-toggle"><input id="detail-noise-toggle" type="checkbox" checked><span id="detail-noise-label">Hide network noise · 0 hidden</span></label>
+                  <button type="button" class="button button-quiet" id="detail-log-pause">Pause live logs</button>
+                </div>
+                <ol class="log-list detail-log-list" id="detail-log-list"><li class="empty-state">No log lines loaded.</li></ol>
+                <p class="detail-footer" id="detail-log-footer">0 lines · secrets redacted</p>
+              </section>
+              <section class="detail-panel" id="panel-backups" role="tabpanel" aria-labelledby="tab-backups" tabindex="0" hidden>
+                <div class="detail-actions"><button class="button button-small button-primary" id="create-backup" type="button">Create backup</button><button class="button button-small button-quiet" id="create-protected-backup" type="button">Create protected backup</button></div>
+                <ol class="backup-list" id="backup-list"><li class="empty-state">No backups loaded.</li></ol>
+                <p class="detail-footer">Backup schedule and retention are managed by the profile.</p>
+              </section>
+              <section class="detail-panel" id="panel-config" role="tabpanel" aria-labelledby="tab-config" tabindex="0" hidden>
+                <dl class="config-list" id="config-summary"></dl>
+                <form class="settings-panel idle-stop-settings" id="idle-stop-form">
+                  <h2>Auto-stop</h2>
+                  <label class="check-row"><input id="idle-stop-enabled" type="checkbox"> Stop after continuous player-free idle time</label>
+                  <label for="idle-stop-minutes">Idle minutes</label>
+                  <input id="idle-stop-minutes" type="number" min="5" max="1440" step="1" inputmode="numeric">
+                  <button class="button button-small button-quiet" id="idle-stop-save" type="submit">Save auto-stop</button>
+                  <p class="field-hint" id="idle-stop-status" aria-live="polite"></p>
+                </form>
+                <form id="config-form" class="config-form">
+                  <div class="config-list" id="config-panel"></div>
+                  <p class="field-hint" id="config-diff" aria-live="polite">Loading editable settings…</p>
+                  <button class="button button-primary" id="config-apply" type="submit" disabled>Apply changes</button>
+                  <p class="detail-footer" id="config-status" aria-live="polite">No changes applied.</p>
+                </form>
+                <details class="config-reference"><summary>Raw file reference</summary><p class="detail-footer">The raw profile-owned file remains read-only here. Only the typed settings above can be changed.</p></details>
+              </section>
+            </div>
+            <aside class="detail-rail" aria-label="Live server summary">
+              <section class="rail-card"><h2>Live rail</h2><div class="rail-stat"><span>CPU</span><strong id="rail-cpu">—</strong><svg viewBox="0 0 120 32"><polyline id="rail-cpu-line" points="0,30 120,30"></polyline></svg></div><div class="rail-stat"><span>Memory</span><strong id="rail-memory">—</strong><svg viewBox="0 0 120 32"><polyline id="rail-memory-line" points="0,30 120,30"></polyline></svg></div><div class="rail-stat"><span>Players</span><strong id="rail-players">—</strong><p id="rail-players-note"></p></div><div class="rail-stat"><span>Version</span><strong id="rail-version">—</strong><p id="rail-version-note"></p></div><button class="button button-small button-quiet" id="check-update" type="button">Check for updates</button></section>
+            </aside>
+          </div>
+        </section>
+
+        <section class="view backups-view" id="backups-view" aria-labelledby="backups-title" hidden>
+          <div class="page-intro settings-intro"><div><p class="eyebrow">system</p><h1 id="backups-title">Backups</h1><p class="lede">Recent verified backups across every profile.</p></div></div>
+          <ol class="backup-list" id="aggregate-backup-list"><li class="empty-state">No backups loaded.</li></ol>
+        </section>
+
+        <section class="view activity-view" id="events-view" aria-labelledby="events-title" hidden>
+          <div class="page-intro settings-intro"><div><p class="eyebrow">system</p><h1 id="events-title">Events</h1><p class="lede">Controller events, including slot conflicts and health transitions.</p></div></div>
+          <ol class="activity-list" id="events-list"><li class="empty-state">No events loaded.</li></ol>
+        </section>
+
+        <section class="view activity-view" id="audit-view" aria-labelledby="audit-title" hidden>
+          <div class="page-intro settings-intro"><div><p class="eyebrow">system</p><h1 id="audit-title">Audit</h1><p class="lede">The actor, action, result, and reason trail for controller operations.</p></div></div>
+          <ol class="activity-list" id="audit-list"><li class="empty-state">No audit records loaded.</li></ol>
+        </section>
+
+        <section class="view settings-view" id="settings-view" aria-labelledby="settings-title" hidden>
+          <div class="page-intro settings-intro">
+            <div>
+              <p class="eyebrow">system</p>
+              <h1 id="settings-title">Settings</h1>
+              <p class="lede">Choose the visual atmosphere for this operations console.</p>
+            </div>
+          </div>
+          <div class="settings-panel">
+            <label for="theme-picker">Theme</label>
+            <select id="theme-picker">
+              <option value="ember">Ember</option>
+              <option value="frost">Frost</option>
+              <option value="moss">Moss</option>
+              <option value="aurora">Aurora</option>
+              <option value="paper">Paper</option>
+            </select>
+          </div>
+          <section class="settings-panel performance-panel" id="performance-panel" aria-labelledby="performance-title">
+            <div><p class="eyebrow">measure first</p><h2 id="performance-title">Performance</h2><p class="field-hint">Read-only snapshot from the web tier and slot daemon. Loaded when this page opens; no polling.</p></div>
+            <h3>Web routes</h3>
+            <ul class="performance-list" id="performance-routes"><li class="empty-state">Loading performance…</li></ul>
+            <p class="field-hint" id="performance-slotd">Loading slot daemon timings…</p>
+            <h3>Browser marks</h3>
+            <ul class="performance-list" id="performance-marks"><li class="empty-state">No browser marks measured yet.</li></ul>
+          </section>
+          <section class="settings-panel notification-settings" aria-labelledby="notifications-title">
+            <div><p class="eyebrow">notifications</p><h2 id="notifications-title">Profile alerts</h2><p class="field-hint">Choose which controller events are delivered for each profile.</p></div>
+            <label for="notification-profile">Profile</label>
+            <select id="notification-profile"></select>
+            <div id="notification-rules" class="notification-rules"><p class="empty-state">Choose a profile to load notification rules.</p></div>
+            <div class="notification-tests"><span>Send test</span><button class="button button-small button-quiet" type="button" data-notification-test="discord">Discord</button><button class="button button-small button-quiet" type="button" data-notification-test="telegram">Telegram</button></div>
+            <p class="field-hint" id="notification-status" aria-live="polite"></p>
+          </section>
+        </section>
+    </main>
+    </div>
+
+    <div class="toast-region" id="toast-region" aria-hidden="true"></div>
+
+    <dialog class="dialog palette-dialog" id="command-palette" aria-labelledby="palette-title">
+      <div class="palette-shell">
+        <div class="palette-header">
+          <div>
+            <p class="eyebrow">operator navigation</p>
+            <h2 id="palette-title">Command palette</h2>
+          </div>
+          <button class="icon-button" id="palette-close" type="button" aria-label="Close command palette">×</button>
+        </div>
+        <div class="palette-search-wrap">
+          <label class="sr-only" for="palette-search">Filter commands</label>
+          <span class="palette-prompt" aria-hidden="true">›</span>
+          <input id="palette-search" type="search" autocomplete="off" spellcheck="false" placeholder="Search navigation, actions, or themes…" aria-controls="palette-list" aria-activedescendant="">
+        </div>
+        <div class="palette-results" id="palette-list" role="listbox" aria-label="Commands"></div>
+        <div class="palette-footer"><span><kbd>↑</kbd><kbd>↓</kbd> select</span><span><kbd>Enter</kbd> run</span><span><kbd>Esc</kbd> close</span></div>
+      </div>
+    </dialog>
+
+    <dialog class="dialog" id="switch-dialog" aria-labelledby="switch-dialog-title">
+      <form method="dialog" class="dialog-form" id="switch-form">
+        <div class="dialog-header">
+          <div><p class="eyebrow">Confirmation required</p><h2 id="switch-dialog-title">Switch active server</h2></div>
+          <button class="icon-button" value="cancel" aria-label="Close switch dialog">×</button>
+        </div>
+        <div class="dialog-body">
+          <div class="summary-list">
+            <div><span>Current server</span><strong id="switch-current">—</strong></div>
+            <div><span>Target server</span><strong id="switch-target-summary">—</strong></div>
+            <div><span>Expected maximum downtime</span><strong id="switch-timeout">—</strong></div>
+            <div><span>Last backup</span><strong id="switch-backup">No recent backup recorded</strong></div>
+          </div>
+          <label for="switch-target">Target profile</label>
+          <select id="switch-target" name="target" required></select>
+          <label class="check-row"><input id="switch-backup-option" type="checkbox"> Create a fresh backup before switching</label>
+          <label class="check-row"><input id="switch-force-option" type="checkbox"> Force stop after the grace period</label>
+          <label class="check-row"><input id="switch-rollback-option" type="checkbox" checked> Roll back if the target fails health checks</label>
+          <label for="switch-confirm-text">Type the target profile name to confirm</label>
+          <input id="switch-confirm-text" autocomplete="off" inputmode="text" required>
+          <p class="field-hint" id="switch-hint">Enter the target name exactly as shown.</p>
+        </div>
+        <div class="dialog-actions sticky-actions">
+          <button class="button button-quiet" value="cancel">Cancel</button>
+          <button class="button button-primary" id="switch-confirm" value="default" disabled>Confirm switch</button>
+        </div>
+      </form>
+    </dialog>
+
+    <dialog class="dialog" id="force-dialog" aria-labelledby="force-dialog-title">
+      <form method="dialog" class="dialog-form" id="force-form">
+        <div class="dialog-header"><div><p class="eyebrow">Last resort</p><h2 id="force-dialog-title">Force stop server</h2></div><button class="icon-button" value="cancel" aria-label="Close force stop dialog">×</button></div>
+        <div class="dialog-body">
+          <p id="force-description">This interrupts the server without waiting for a clean shutdown.</p>
+          <label for="force-confirm-text">Type the profile name to confirm</label>
+          <input id="force-confirm-text" autocomplete="off" required>
+        </div>
+        <div class="dialog-actions sticky-actions"><button class="button button-quiet" value="cancel">Cancel</button><button class="button button-danger" id="force-confirm" value="default" disabled>Force stop</button></div>
+      </form>
+    </dialog>
+
+    <dialog class="dialog dialog-wide" id="logs-dialog" aria-labelledby="logs-dialog-title">
+      <form method="dialog" class="dialog-form" id="logs-form">
+        <div class="dialog-header"><div><p class="eyebrow">Live stream</p><h2 id="logs-dialog-title">Logs</h2></div><button class="icon-button" value="cancel" aria-label="Close logs dialog">×</button></div>
+        <div class="dialog-body">
+          <div class="log-toolbar">
+            <label for="log-query">Search logs</label><input id="log-query" type="search" placeholder="Filter messages">
+            <label for="log-severity">Severity</label><select id="log-severity"><option value="all">All levels</option><option value="debug">Debug</option><option value="info">Info</option><option value="warning">Warning</option><option value="error">Error</option></select>
+            <button type="button" class="button button-quiet" id="log-pause">Pause live logs</button>
+          </div>
+          <ol class="log-list" id="log-list"><li class="empty-state">No log lines loaded.</li></ol>
+        </div>
+        <div class="dialog-actions sticky-actions"><button class="button button-primary" value="cancel">Done</button></div>
+      </form>
+    </dialog>
+
+    <dialog class="dialog" id="restore-dialog" aria-labelledby="restore-dialog-title">
+      <form method="dialog" class="dialog-form" id="restore-form">
+        <div class="dialog-header"><div><p class="eyebrow">Data replacement</p><h2 id="restore-dialog-title">Restore backup</h2></div><button class="icon-button" value="cancel" aria-label="Close restore dialog">×</button></div>
+        <div class="dialog-body">
+          <p id="restore-description">Restoring replaces the selected profile's world data.</p>
+          <label for="restore-backup-id">Backup ID</label><input id="restore-backup-id" required pattern="(?:[A-Za-z0-9_]|-){1,128}">
+          <label for="restore-confirm-text">Type the profile name to confirm</label><input id="restore-confirm-text" autocomplete="off" required>
+        </div>
+        <div class="dialog-actions sticky-actions"><button class="button button-quiet" value="cancel">Cancel</button><button class="button button-danger" id="restore-confirm" value="default" disabled>Restore backup</button></div>
+      </form>
+    </dialog>
+
+    <div class="sr-only" id="status-announcer" role="status" aria-live="polite" aria-atomic="true"></div>
+    <dialog class="dialog" id="console-save-as-dialog" aria-labelledby="console-save-as-title">
+      <form method="dialog" class="dialog-form" id="console-save-as-form">
+        <div class="dialog-header"><div><p class="eyebrow">Export console</p><h2 id="console-save-as-title">Save console range</h2></div><button class="icon-button" value="cancel" aria-label="Close export dialog">×</button></div>
+        <div class="dialog-body">
+          <label class="check-row"><input id="console-export-timestamps" type="checkbox" checked> Include timestamps and severity</label>
+          <label for="console-export-severity">Severity</label><select id="console-export-severity"><option value="all">All levels</option><option value="debug">Debug</option><option value="info">Info</option><option value="warning">Warning</option><option value="error">Error</option></select>
+          <label for="console-export-from">From</label><input id="console-export-from" type="datetime-local">
+          <label for="console-export-to">To</label><input id="console-export-to" type="datetime-local">
+          <p class="field-hint">Leave both times empty to export the current console buffer.</p>
+        </div>
+        <div class="dialog-actions sticky-actions"><button class="button button-quiet" value="cancel">Cancel</button><button class="button button-primary" id="console-export-submit" value="default">Save</button></div>
+      </form>
+    </dialog>
+    <script src="/app.js" type="module"></script>
+    <script src="/palette.js" type="module"></script>
+  </body>
+</html>

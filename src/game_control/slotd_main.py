@@ -1,0 +1,406 @@
+"""Privileged newline-delimited Unix-socket controller entrypoint."""
+
+from __future__ import annotations
+
+import asyncio
+import grp
+import errno
+import inspect
+import logging
+import os
+import pwd
+import socket
+import stat
+import struct
+import tomllib
+from datetime import datetime, timezone
+from pathlib import Path
+from uuid import UUID
+
+from .controller import Controller
+from .adapters.crafty import CraftyAdapter
+from .adapters.systemd import SystemdAdapter
+from .profile import ProfileRegistry
+from .slot import ReservationStore, SlotInspector
+from .state_db import StateDatabase, STATE_DB_PATH
+from .models import AdapterKind
+from .service_wiring import build_service_seams
+from .schedule import parse_schedule
+from .protocol import (
+    MAX_REQUEST_BYTES,
+    ErrorCode,
+    RpcFailure,
+    SafeDetails,
+    failure,
+    parse_request_line,
+    response_json,
+)
+
+CONTROL_SOCKET = Path("/run/game-control/control.sock")
+ROOT_CONFIG = Path("/etc/game-control/game-control.toml")
+PROFILES_DIR = Path("/etc/game-control/profiles.d")
+CRAFTY_TOKEN_PATH = Path("/etc/game-control/secrets.d/crafty-token")
+READ_TIMEOUT_SECONDS = 10.0
+WRITE_TIMEOUT_SECONDS = 10.0
+_LOG = logging.getLogger(__name__)
+
+
+class UnixRpcServer:
+    def __init__(
+        self,
+        controller: Controller,
+        *,
+        socket_path: Path = CONTROL_SOCKET,
+        gamecontrol_user: str = "gamecontrol",
+        gamecontrol_group: str = "gamecontrol",
+        uid: int | None = None,
+        gid: int | None = None,
+        primary_gid: int | None = None,
+    ):
+        self.controller = controller
+        self.socket_path = Path(socket_path)
+        self.gamecontrol_user = gamecontrol_user
+        self.gamecontrol_group = gamecontrol_group
+        account = None
+        if uid is not None and gid is not None and primary_gid is None:
+            primary_gid = gid
+        if uid is None or primary_gid is None:
+            try:
+                account = pwd.getpwnam(gamecontrol_user)
+            except KeyError as exc:
+                if uid is None or primary_gid is None:
+                    raise RuntimeError("configured gamecontrol user is unavailable") from exc
+        self.uid = account.pw_uid if uid is None else uid
+        self.peer_gid = (
+            account.pw_gid if primary_gid is None and account is not None
+            else (gid if primary_gid is None else primary_gid)
+        )
+        if gid is None:
+            try:
+                self.gid = grp.getgrnam(gamecontrol_group).gr_gid
+            except KeyError as exc:
+                raise RuntimeError("configured socket group is unavailable") from exc
+        else:
+            self.gid = gid
+        self._server: asyncio.AbstractServer | None = None
+        self._bound_inode: int | None = None
+
+    def authorize_peer(self, uid: int, gid: int) -> bool:
+        return uid == self.uid and gid == self.peer_gid
+
+    @staticmethod
+    def peer_credentials(sock: socket.socket) -> tuple[int, int, int]:
+        raw = sock.getsockopt(socket.SOL_SOCKET, socket.SO_PEERCRED, struct.calcsize("3i"))
+        return struct.unpack("3i", raw)
+
+    def _check_existing_socket(self) -> None:
+        if self.socket_path.is_symlink():
+            raise PermissionError("control socket symlink is not allowed")
+        if self.socket_path.exists() and not stat.S_ISSOCK(self.socket_path.stat().st_mode):
+            raise PermissionError("control socket path is not a socket")
+        parent = self.socket_path.parent
+        if parent.is_symlink():
+            raise PermissionError("control socket directory symlink is not allowed")
+        if parent.exists() and not parent.is_dir():
+            raise PermissionError("control socket parent is not a directory")
+        parent.mkdir(parents=True, exist_ok=True)
+
+    async def start(self) -> None:
+        self._check_existing_socket()
+        if self.socket_path.exists():
+            before = self.socket_path.stat()
+            probe = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            try:
+                probe.settimeout(0.2)
+                probe.connect(str(self.socket_path))
+            except OSError as exc:
+                if exc.errno not in (errno.ECONNREFUSED, errno.ENOENT):
+                    raise RuntimeError("control socket is live") from exc
+            else:
+                raise RuntimeError("control socket is live")
+            finally:
+                probe.close()
+            # Recheck the inode after probing so a concurrent replacement is
+            # never unlinked.
+            try:
+                if self.socket_path.stat().st_ino != before.st_ino:
+                    raise RuntimeError("control socket changed while probing")
+                self.socket_path.unlink()
+            except FileNotFoundError:
+                pass
+        self._server = await asyncio.start_unix_server(
+            self.handle_client, path=str(self.socket_path), limit=MAX_REQUEST_BYTES + 1
+        )
+        try:
+            os.chown(self.socket_path, 0, self.gid)
+            os.chmod(self.socket_path, 0o660)
+        except OSError as exc:
+            await self.close()
+            raise PermissionError("unable to secure control socket") from exc
+        info = self.socket_path.stat()
+        if (
+            not stat.S_ISSOCK(info.st_mode)
+            or info.st_uid != 0
+            or info.st_gid != self.gid
+            or stat.S_IMODE(info.st_mode) != 0o660
+        ):
+            await self.close()
+            raise PermissionError("insecure control socket ownership")
+        self._bound_inode = info.st_ino
+
+    async def close(self) -> None:
+        if self._server is not None:
+            self._server.close()
+            await self._server.wait_closed()
+            self._server = None
+        try:
+            if (
+                self.socket_path.is_socket()
+                and self._bound_inode is not None
+                and self.socket_path.stat().st_ino == self._bound_inode
+            ):
+                self.socket_path.unlink()
+        except FileNotFoundError:
+            pass
+
+    async def handle_client(
+        self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter
+    ) -> None:
+        sock = writer.get_extra_info("socket")
+        request_id = UUID(int=0)
+        try:
+            if sock is None:
+                raise PermissionError("peer socket unavailable")
+            _pid, uid, gid = self.peer_credentials(sock)
+            if not self.authorize_peer(uid, gid):
+                response = failure(request_id, ErrorCode.UNAUTHORIZED_PEER, "unauthorized peer")
+                await self._write(writer, response_json(response))
+                return
+            try:
+                data = await asyncio.wait_for(
+                    reader.readuntil(b"\n"), timeout=READ_TIMEOUT_SECONDS
+                )
+            except (asyncio.LimitOverrunError, asyncio.IncompleteReadError, asyncio.TimeoutError) as exc:
+                response = failure(request_id, ErrorCode.INVALID_REQUEST, "invalid request")
+                await self._write(writer, response_json(response))
+                return
+            if len(data) > MAX_REQUEST_BYTES:
+                response = failure(request_id, ErrorCode.INVALID_REQUEST, "request too large")
+                await self._write(writer, response_json(response))
+                return
+            try:
+                request = parse_request_line(data)
+                request_id = request.request_id
+            except ValueError:
+                response = failure(request_id, ErrorCode.INVALID_REQUEST, "invalid request")
+            else:
+                response = await self.controller.execute(request)
+            await self._write(writer, response_json(response))
+        except Exception:
+            incident = os.urandom(8).hex()
+            _LOG.exception("socket incident %s", incident)
+            response = failure(
+                request_id, ErrorCode.INTERNAL_ERROR, "internal controller error",
+                details=SafeDetails(incident_id=incident),
+            )
+            try:
+                await self._write(writer, response_json(response))
+            except Exception:
+                pass
+        finally:
+            writer.close()
+            try:
+                await writer.wait_closed()
+            except (ConnectionError, OSError):
+                pass
+
+    @staticmethod
+    async def _write(writer: asyncio.StreamWriter, data: bytes) -> None:
+        writer.write(data)
+        await asyncio.wait_for(writer.drain(), timeout=WRITE_TIMEOUT_SECONDS)
+
+
+RpcServer = UnixRpcServer
+
+
+def build_controller(config_path: str | os.PathLike[str] = ROOT_CONFIG) -> Controller:
+    """Construct the production root controller from a closed root config."""
+    config_file = Path(config_path)
+    if config_file.is_symlink() or not config_file.is_file():
+        raise RuntimeError("root controller configuration is unavailable")
+    try:
+        with config_file.open("rb") as stream:
+            config = tomllib.load(stream)
+    except (OSError, tomllib.TOMLDecodeError) as exc:
+        raise RuntimeError("invalid root controller configuration") from exc
+    if not isinstance(config, dict):
+        raise RuntimeError("invalid root controller configuration")
+    boot_profile = config.get("boot_profile")
+    if boot_profile is not None and not isinstance(boot_profile, str):
+        raise RuntimeError("invalid boot profile")
+    boot_autostart = config.get("boot_autostart", False)
+    if not isinstance(boot_autostart, bool):
+        raise RuntimeError("invalid boot autostart flag")
+    try:
+        schedules = parse_schedule(config.get("schedule"))
+    except ValueError as exc:
+        raise RuntimeError("invalid schedule configuration") from exc
+    profiles_dir = Path(config.get("profiles_dir", config.get("profile_dir", PROFILES_DIR)))
+    state_path = Path(config.get("state_db", STATE_DB_PATH))
+    reservation_path = Path(config.get("reservation_path", "/run/game-control/reservation.json"))
+    registry = ProfileRegistry.load(profiles_dir)
+    state_db = StateDatabase.open(state_path)
+    crafty_cfg = config.get("crafty", {})
+    if not crafty_cfg and ("crafty_base_url" in config or "crafty_token_path" in config):
+        crafty_cfg = {
+            "base_url": config.get("crafty_base_url"),
+            "token_path": config.get("crafty_token_path", CRAFTY_TOKEN_PATH),
+            "ca_path": config.get("crafty_ca_path"),
+        }
+    if not isinstance(crafty_cfg, dict):
+        raise RuntimeError("invalid Crafty configuration")
+    adapters = {}
+    crafty = None
+    secret_values: list[str] = []
+    for profile in registry:
+        if profile.adapter is AdapterKind.CRAFTY:
+            if crafty is None:
+                token_path = Path(crafty_cfg.get("token_path", CRAFTY_TOKEN_PATH))
+                token = token_path.read_text(encoding="utf-8").strip()
+                secret_values.append(token)
+                base_url = crafty_cfg.get("base_url")
+                if not isinstance(base_url, str) or not base_url.startswith(("https://", "http://")):
+                    raise RuntimeError("invalid Crafty endpoint")
+                crafty = CraftyAdapter(
+                    base_url,
+                    token,
+                    verify=crafty_cfg.get("verify", crafty_cfg.get("ca_path")),
+                )
+            adapters[profile.id] = crafty
+        else:
+            adapters[profile.id] = SystemdAdapter()
+    inspector = SlotInspector()
+
+    async def await_free_slot(timeout_seconds: float = 30.0):
+        return await _await_free_slot(inspector, timeout_seconds)
+
+    async def await_ready(profile):
+        adapter = adapters[profile.id]
+        deadline = asyncio.get_running_loop().time() + profile.health_timeout_seconds
+        while True:
+            try:
+                observation = await adapter.observe(profile)
+                if (
+                    observation.running
+                    and observation.healthy is True
+                    and observation.required_ports_ready is not False
+                ):
+                    return True
+            except Exception:
+                pass
+            remaining = deadline - asyncio.get_running_loop().time()
+            if remaining <= 0:
+                return False
+            await asyncio.sleep(min(0.25, remaining))
+
+    stats_config = config.get("stats", {})
+    if not isinstance(stats_config, dict):
+        raise RuntimeError("invalid stats configuration")
+    services = build_service_seams(
+        registry,
+        adapters,
+        state_db,
+        inspector,
+        secret_values=tuple(secret_values),
+        stats_config=stats_config,
+    )
+    if services.session_store is not None:
+        services.session_store.recover(now=datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"))
+    return Controller(
+        profiles=registry,
+        state_db=state_db,
+        reservation_store=ReservationStore(reservation_path=reservation_path),
+        adapters=adapters,
+        services=services,
+        slot_inspector=inspector,
+        await_free_slot=await_free_slot,
+        await_ready=await_ready,
+        boot_profile=boot_profile,
+        boot_autostart=boot_autostart,
+        schedules=schedules,
+    )
+
+
+async def _await_free_slot(
+    inspector: SlotInspector,
+    timeout_seconds: float,
+    *,
+    poll_interval: float = 0.5,
+) -> bool:
+    """Poll until the kernel slot is free and metadata is consistent."""
+    deadline = asyncio.get_running_loop().time() + max(0.0, timeout_seconds)
+    while True:
+        observation = inspector.observe()
+        if observation.owner is None and not observation.inconsistent:
+            return True
+        remaining = deadline - asyncio.get_running_loop().time()
+        if remaining <= 0:
+            return False
+        await asyncio.sleep(min(poll_interval, remaining))
+
+
+async def serve() -> None:
+    controller = build_controller()
+    server = UnixRpcServer(controller)
+    await server.start()
+    initialization = asyncio.create_task(controller.reconcile_startup())
+    tps_task = None
+    tps_sampler = getattr(controller.services, "tps_sampler", None)
+
+    async def minecraft_running() -> bool:
+        inspector = controller.slot_inspector
+        if inspector is not None:
+            slot = inspector.observe()
+            owner = getattr(slot, "owner", None)
+            if getattr(owner, "value", owner) != "minecraft":
+                return False
+        profile = next(
+            (item for item in controller.profiles if getattr(getattr(item, "id", None), "value", getattr(item, "id", None)) == "minecraft"),
+            None,
+        )
+        if profile is None:
+            return False
+        adapter = controller.adapters.get(getattr(profile, "id", None))
+        if adapter is None:
+            return False
+        observed = adapter.observe(profile)
+        if inspect.isawaitable(observed):
+            observed = await observed
+        return bool(getattr(observed, "running", False))
+
+    if tps_sampler is not None:
+        tps_task = asyncio.create_task(tps_sampler.run(minecraft_running))
+    try:
+        await server._server.serve_forever()  # type: ignore[union-attr]
+    finally:
+        if tps_task is not None and not tps_task.done():
+            tps_task.cancel()
+        if tps_task is not None:
+            await asyncio.gather(tps_task, return_exceptions=True)
+        if tps_sampler is not None:
+            await tps_sampler.aclose()
+        if not initialization.done():
+            initialization.cancel()
+        await asyncio.gather(initialization, return_exceptions=True)
+        await server.close()
+
+
+def main() -> None:
+    asyncio.run(serve())
+
+
+if __name__ == "__main__":
+    main()
+
+
+__all__ = ["UnixRpcServer", "RpcServer", "CONTROL_SOCKET", "serve", "main"]

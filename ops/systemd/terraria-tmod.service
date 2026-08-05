@@ -1,0 +1,25 @@
+[Unit]
+Description=Terraria tModLoader game server
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=tmodloader
+Group=tmodloader
+WorkingDirectory=/srv/game-servers/terraria-tmod
+ExecStart=/usr/local/libexec/game-slot-run terraria-tmod
+ExecStop=/usr/local/libexec/game-console-stop terraria-tmod $MAINPID
+KillSignal=SIGINT
+TimeoutStopSec=90
+Restart=no
+StandardOutput=journal
+StandardError=journal
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=yes
+NoNewPrivileges=yes
+RestrictSUIDSGID=yes
+ReadOnlyPaths=/opt/game-control /etc/game-control /usr/local/libexec /usr/bin
+ReadWritePaths=/run/game-control /run/game-slot /opt/game-servers/terraria-tmod /srv/game-servers/terraria-tmod
+UMask=0077

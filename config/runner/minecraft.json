@@ -1,0 +1,7 @@
+{
+  "user": "crafty",
+  "group": "crafty",
+  "cwd": "/srv/game-servers/minecraft",
+  "argv": ["/usr/bin/bash", "start.sh"],
+  "environment": {}
+}

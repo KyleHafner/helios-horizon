@@ -1,0 +1,9 @@
+title = "Helios Horizon Gitleaks configuration"
+
+[extend]
+useDefault = true
+
+[[allowlists]]
+description = "Synthetic PEM markers used only to verify fail-closed log redaction"
+rules = ["private-key"]
+paths = ['''^tests/test_redaction_logs\.py$''']
