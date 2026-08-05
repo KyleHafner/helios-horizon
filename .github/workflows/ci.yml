@@ -18,21 +18,22 @@ jobs:
       matrix:
         python-version: ["3.11", "3.12"]
     steps:
-      - uses: actions/checkout@v4
-      - uses: astral-sh/setup-uv@v6
+      - uses: actions/checkout@v5
+      - uses: astral-sh/setup-uv@v7
         with:
           python-version: ${{ matrix.python-version }}
           enable-cache: true
       - run: uv sync --frozen --extra test
-      - run: uv run pytest -q --ignore=tests/browser
+      - name: Run privilege-boundary unit tests
+        run: sudo --preserve-env=UV_PYTHON,UV_CACHE_DIR env "PATH=$PATH" uv run pytest -q --ignore=tests/browser
       - run: uv run python -m compileall -q src ops tests
 
   browser:
     name: Browser tests
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: astral-sh/setup-uv@v6
+      - uses: actions/checkout@v5
+      - uses: astral-sh/setup-uv@v7
         with:
           python-version: "3.11"
           enable-cache: true

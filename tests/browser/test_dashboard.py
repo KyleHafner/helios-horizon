@@ -655,6 +655,7 @@ def test_config_tab_is_typed_diff_apply_and_restart_aware(page: Page):
     assert "1 change" in page.locator("#config-diff").inner_text()
     page.once("dialog", lambda dialog: dialog.accept())
     page.get_by_role("button", name="Apply changes", exact=True).click()
+    page.get_by_text("Restart required to take effect", exact=False).wait_for(state="visible")
     assert page.get_by_text("Restart required to take effect", exact=False).is_visible()
 
 
