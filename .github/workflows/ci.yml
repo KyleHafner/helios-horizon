@@ -24,9 +24,9 @@ jobs:
           python-version: ${{ matrix.python-version }}
           enable-cache: true
       - run: uv sync --frozen --extra test
-      - name: Run privilege-boundary unit tests
-        run: sudo --preserve-env=UV_PYTHON,UV_CACHE_DIR env "PATH=$PATH" uv run pytest -q --ignore=tests/browser
       - run: uv run python -m compileall -q src ops tests
+      - name: Run privilege-boundary unit tests
+        run: sudo --preserve-env=UV_PYTHON,UV_CACHE_DIR env "PATH=$PATH" PYTHONDONTWRITEBYTECODE=1 uv run pytest -q --ignore=tests/browser
 
   browser:
     name: Browser tests
