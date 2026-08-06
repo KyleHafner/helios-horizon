@@ -38,6 +38,7 @@ from .protocol import (
     ListBackups,
     ListEvents,
     RpcFailure,
+    RpcProvenance,
     RpcRequest,
     RpcResponse,
     RpcSuccess,
@@ -117,10 +118,16 @@ class _TimedApiService:
         self.service = service
         self.timings = timings
 
-    async def call(self, actor: str, action: Any) -> RpcResponse:
+    async def call(
+        self,
+        actor: str,
+        action: Any,
+        *,
+        provenance: RpcProvenance = RpcProvenance.SERVICE,
+    ) -> RpcResponse:
         started = time.monotonic()
         try:
-            return await self.service.call(actor, action)
+            return await self.service.call(actor, action, provenance=provenance)
         finally:
             self.timings.record((time.monotonic() - started) * 1000.0)
 

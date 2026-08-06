@@ -1,6 +1,6 @@
 # Helios Horizon
 
-[![CI](https://github.com/KyleHafner/helios-horizon/actions/workflows/ci.yml/badge.svg)](https://github.com/KyleHafner/helios-horizon/actions/workflows/ci.yml)
+[![CI](https://github.com/VirgoAgario/helios-horizon/actions/workflows/ci.yml/badge.svg)](https://github.com/VirgoAgario/helios-horizon/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
 Helios Horizon is a security-focused control plane for a host that runs one resource-intensive game server at a time. It coordinates Minecraft, Project Zomboid, Terraria, and tModLoader behind one typed controller instead of letting the web process invoke arbitrary shell commands.
@@ -18,6 +18,7 @@ Helios Horizon is a security-focused control plane for a host that runs one reso
 - **Recovery-aware workflows:** verified backups, prepare/confirm restore and world-clone flows, rollback-aware switching, and append-only audit records.
 - **Operator visibility:** SSE status updates, logs, events, metrics, player sessions, TPS/MSPT telemetry, scheduled switches, and idle shutdown.
 - **Deployment hardening:** unprivileged service accounts, systemd sandboxing, fixed writable paths, `NoNewPrivileges`, protected homes, and root-owned runtime locks.
+- **Reference operations surfaces:** sanitized examples for loopback-only RCON console control, save-off/flush/save-on online backups, bounded TPS scraping, fixed-profile LazyMC capability wake, and protected B2 reconciliation.
 
 ## Architecture
 
@@ -69,6 +70,11 @@ uv run --frozen --extra test --python 3.11 pytest -q --ignore=tests/browser
 The files under `config/` and `ops/` are reviewed examples, not a turnkey deployment. A real installation must supply its own service users, paths, SSO/proxy boundary, Crafty token, game-server installation, firewall rules, backups, and restore testing. The web service binds to loopback by default. Never expose it directly to the internet or commit generated configuration and secrets.
 
 See [example deployment guidance](docs/deployment-example.md) before adapting the installer.
+
+The H1/H2/G11 operational contracts are described in the
+[public operations examples](docs/operations-example.md). Those examples use
+synthetic Sunlit profile data, documentation-only addresses, and runtime-only
+secret paths; they are not installed by the baseline example installer.
 
 ## License
 

@@ -11,6 +11,13 @@ Helios Horizon separates an unprivileged operator interface from the process tha
 5. **Adapters** — a bounded Crafty adapter for Minecraft and fixed systemd profile adapters for other servers.
 6. **Profile and runner definitions** — reviewed TOML/JSON files that declare approved units, paths, ports, owners, timeouts, operations, and update strategies.
 
+The optional public operations reference extends this shape with three
+bounded paths: a loopback-only RCON/console transport and online-backup
+quiesce sequence, a fixed-profile LazyMC capability wake path, and a
+fixed-target B2 reconciliation worker. These are documented in
+[operations examples](operations-example.md); they do not make the web tier a
+direct game-process or backup-remote owner.
+
 ## Trust boundaries
 
 ```text
@@ -50,3 +57,11 @@ These stores are intentionally separate so the unprivileged web account does not
 - Destructive actions use prepare/confirm tokens tied to the actor and operation.
 - Queue sizes, request frames, logs, exports, and timeouts are bounded.
 - Exceptions are converted to fixed public errors while internal paths and credentials are redacted.
+- Online backup persistence is allowed only after save-off/flush, immutable
+  staging, verification, and a bounded save-on attempt; a failed quiesce or
+  save-on path fails closed.
+- Capability wake accepts only fixed typed status/wake actions. A wake token
+  cannot select a profile, command, endpoint, or secret.
+- B2 reconciliation plans before applying, verifies exact synthetic manifest
+  identity and remote content, prunes only allowlisted objects, and treats
+  repeated apply as a no-op.

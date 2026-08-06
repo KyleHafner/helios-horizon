@@ -31,6 +31,13 @@ class RpcModel(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
 
 
+class RpcProvenance(StrEnum):
+    """Trusted source classification carried alongside a typed RPC request."""
+
+    SERVICE = "service"
+    WEB_HUMAN = "web-human"
+
+
 class PageOptions(RpcModel):
     cursor: str | None = Field(default=None, max_length=256)
     limit: int = Field(default=100, ge=1, le=500)
@@ -308,6 +315,7 @@ RpcAction: TypeAlias = Annotated[
 class RpcRequest(RpcModel):
     request_id: UUID
     actor: str = Field(pattern=r"^[A-Za-z0-9@._-]{1,128}$")
+    provenance: RpcProvenance = RpcProvenance.SERVICE
     action: RpcAction
 
 
@@ -639,6 +647,7 @@ __all__ = [
     "RpcAction",
     "Command",
     "RpcRequest",
+    "RpcProvenance",
     "RpcResponse",
     "RpcSuccess",
     "RpcFailure",

@@ -40,3 +40,13 @@ jobs:
       - run: uv sync --frozen --extra test
       - run: uv run playwright install --with-deps chromium
       - run: uv run pytest -q tests/browser
+
+  security:
+    name: Secret scan
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - name: Run gitleaks
+        uses: gitleaks/gitleaks-action@ff98106e4c7b2bc287b24eaf42907196329070c7 # v2.3.9
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

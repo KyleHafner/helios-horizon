@@ -8,9 +8,12 @@ from collections import defaultdict
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
+from .tps import TPS_STALE_AFTER_SECONDS
+
 
 _PROFILE_CAPABILITIES: dict[str, dict[str, Any]] = {
     "minecraft": {"player_tracking": "names", "occupancy": True, "tick_telemetry": True},
+    "minecraft-sunlit-cobblemon": {"player_tracking": "names", "occupancy": True, "tick_telemetry": True},
     "terraria-vanilla": {"player_tracking": "names", "occupancy": True, "tick_telemetry": False},
     "terraria-tmod": {"player_tracking": "names", "occupancy": True, "tick_telemetry": False},
     "pz-rising": {"player_tracking": "count", "occupancy": True, "tick_telemetry": False},
@@ -135,7 +138,23 @@ def stats_tps(
         for timestamp, values in sorted(paired.items())
         if "tps" in values and "mspt" in values
     ]
-    return {"window": window, "samples": _downsample(samples)}
+    latest = samples[-1]["ts"] if samples else None
+    stale = True
+    age_seconds = None
+    if latest is not None:
+        try:
+            age_seconds = max(0.0, (current - _parse(latest)).total_seconds())
+            stale = age_seconds > TPS_STALE_AFTER_SECONDS
+        except (TypeError, ValueError, OverflowError):
+            stale = True
+    return {
+        "window": window,
+        "samples": _downsample(samples),
+        "latest_ts": latest,
+        "stale": stale,
+        "state": "unknown" if stale else "ok",
+        "staleness_seconds": age_seconds,
+    }
 
 
 def _session_rows(

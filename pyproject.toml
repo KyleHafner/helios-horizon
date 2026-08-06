@@ -25,8 +25,8 @@ dependencies = [
 ]
 
 [project.urls]
-Repository = "https://github.com/KyleHafner/helios-horizon"
-Issues = "https://github.com/KyleHafner/helios-horizon/issues"
+Repository = "https://github.com/VirgoAgario/helios-horizon"
+Issues = "https://github.com/VirgoAgario/helios-horizon/issues"
 
 [build-system]
 requires = ["hatchling"]

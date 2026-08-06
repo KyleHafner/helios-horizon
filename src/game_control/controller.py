@@ -402,6 +402,9 @@ class Controller:
     @staticmethod
     def _canonical(request: RpcRequest) -> str:
         payload = request.model_dump(mode="json")
+        # Provenance describes the current trusted transport, not durable
+        # request identity. Legacy idempotency rows predate this field.
+        payload.pop("provenance", None)
         action = payload.get("action")
         if isinstance(action, dict) and action.get("kind") == "get_status" and action.get("refresh") is False:
             # Keep the idempotency key stable for requests written before the

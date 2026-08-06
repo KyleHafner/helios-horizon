@@ -31,6 +31,13 @@ def _validate_paths(paths: PathSpec) -> None:
         resolved = path.resolve(strict=False)
         if not any(_within(resolved, root.resolve(strict=False)) for root in roots):
             raise ValueError("profile path escapes data root through symlink")
+    backup_sources = paths.backup_roots or paths.data_roots
+    for path in backup_sources:
+        if not any(_within(path, root) for root in roots):
+            raise ValueError("backup source is outside data roots")
+        resolved = path.resolve(strict=False)
+        if not any(_within(resolved, root.resolve(strict=False)) for root in roots):
+            raise ValueError("backup source escapes data root through symlink")
     backup_resolved = paths.backup_root.resolve(strict=False)
     resolved_roots = tuple(root.resolve(strict=False) for root in roots)
     if any(

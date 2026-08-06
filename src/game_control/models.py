@@ -17,6 +17,7 @@ from pydantic import (
 
 class ProfileId(StrEnum):
     MINECRAFT = "minecraft"
+    MINECRAFT_SUNLIT_COBBLEMON = "minecraft-sunlit-cobblemon"
     PZ_RISING = "pz-rising"
     TERRARIA_VANILLA = "terraria-vanilla"
     TERRARIA_TMOD = "terraria-tmod"
@@ -71,6 +72,13 @@ class NotificationEvent(StrEnum):
     IDLE_STOP = "idle_stop"
 
 
+class BackupDestination(StrEnum):
+    """Reviewed backup destinations; values are safe RPC selectors only."""
+
+    LOCAL = "local"
+    HORIZON_B2 = "horizon-b2"
+
+
 class StrictFrozenModel(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
 
@@ -103,6 +111,7 @@ class ProcessSpec(StrictFrozenModel):
 
 class PathSpec(StrictFrozenModel):
     data_roots: tuple[Path, ...] = Field(min_length=1)
+    backup_roots: tuple[Path, ...] = ()
     mutable_root: Path
     log_files: tuple[Path, ...] = ()
     backup_root: Path
@@ -121,9 +130,10 @@ class PathSpec(StrictFrozenModel):
     def roots_do_not_overlap_unsafely(self):
         if self.backup_root == self.mutable_root or self.mutable_root in self.backup_root.parents:
             raise ValueError("backup_root must be outside mutable_root")
-        all_paths = self.data_roots + self.log_files
-        if len(set(all_paths)) != len(all_paths):
+        if len(set(self.data_roots)) != len(self.data_roots):
             raise ValueError("duplicate profile path")
+        if len(set(self.backup_roots)) != len(self.backup_roots):
+            raise ValueError("duplicate backup source path")
         return self
 
 

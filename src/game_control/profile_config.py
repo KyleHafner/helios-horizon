@@ -45,6 +45,11 @@ WHITELIST: dict[str, tuple[Setting, ...]] = {
         Setting("view-distance", "int", minimum=4, maximum=16), Setting("difficulty", "enum", choices=("peaceful", "easy", "normal", "hard")),
         Setting("pvp", "bool"), Setting("white-list", "bool"),
     ),
+    "minecraft-sunlit-cobblemon": (
+        Setting("motd", "str", maximum_length=59), Setting("max-players", "int", minimum=1, maximum=64),
+        Setting("view-distance", "int", minimum=4, maximum=16), Setting("difficulty", "enum", choices=("peaceful", "easy", "normal", "hard")),
+        Setting("pvp", "bool"), Setting("white-list", "bool"),
+    ),
     "terraria-vanilla": (
         Setting("maxplayers", "int", minimum=1, maximum=16), Setting("motd", "str", maximum_length=120),
         Setting("password", "str", maximum_length=120, secret=True), Setting("secure", "bool"),
@@ -69,6 +74,7 @@ def _path(profile: Any) -> Path:
     profile_id = _id(profile)
     relative = {
         "minecraft": "server.properties",
+        "minecraft-sunlit-cobblemon": "server.properties",
         "terraria-vanilla": "config/serverconfig.txt",
         "terraria-tmod": "config/serverconfig.txt",
         "pz-rising": "Server/servertest.ini",

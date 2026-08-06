@@ -19,6 +19,10 @@ _SAMPLE = re.compile(
     r"(?P<value>[-+]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][-+]?\d+)?|NaN|Inf|-Inf)\s*$"
 )
 _LABEL = re.compile(r'(?P<key>[a-zA-Z_][a-zA-Z0-9_]*)="(?P<value>(?:\\.|[^"])*)"')
+FIXED_EXPORTER_URL = "http://127.0.0.1:19565/metrics"
+MAX_EXPORTER_RESPONSE_BYTES = 1024 * 1024
+TPS_STALE_AFTER_SECONDS = 120
+_TICK_PROFILES = frozenset({"minecraft", "minecraft-sunlit-cobblemon"})
 
 
 def parse_metrics(text: str) -> tuple[float, float] | None:
@@ -74,15 +78,17 @@ class TpsSampler:
         self,
         connection: sqlite3.Connection,
         *,
-        url: str = "http://127.0.0.1:19565/metrics",
+        url: str = FIXED_EXPORTER_URL,
         profile_id: str = "minecraft",
         interval_seconds: float = 30.0,
         backoff_seconds: float = 300.0,
         client: Any | None = None,
         clock: Callable[[], datetime] | None = None,
     ) -> None:
-        if profile_id != "minecraft":
+        if profile_id not in _TICK_PROFILES:
             raise ValueError("Minecraft is the only profile with tick telemetry")
+        if url != FIXED_EXPORTER_URL:
+            raise ValueError("tick telemetry source is not approved")
         self.connection = connection
         self.url = url
         self.profile_id = profile_id
@@ -99,9 +105,18 @@ class TpsSampler:
 
     async def run_once(self, *, now: str | None = None) -> bool:
         try:
-            response = await self._client.get(self.url)
-            response.raise_for_status()
-            parsed = parse_metrics(response.text)
+            async with self._client.stream("GET", self.url) as response:
+                response.raise_for_status()
+                chunks: list[bytes] = []
+                total = 0
+                async for chunk in response.aiter_bytes():
+                    if not isinstance(chunk, bytes):
+                        raise TypeError("exporter response chunk was not bytes")
+                    total += len(chunk)
+                    if total > MAX_EXPORTER_RESPONSE_BYTES:
+                        raise ValueError("exporter response exceeded size limit")
+                    chunks.append(chunk)
+            parsed = parse_metrics(b"".join(chunks).decode("utf-8"))
             if parsed is None:
                 raise ValueError("exporter metrics were not parseable")
             timestamp = now or _iso(self._clock())
@@ -147,4 +162,10 @@ def _iso(value: datetime) -> str:
     return value.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
 
 
-__all__ = ["TpsSampler", "parse_metrics"]
+__all__ = [
+    "FIXED_EXPORTER_URL",
+    "MAX_EXPORTER_RESPONSE_BYTES",
+    "TPS_STALE_AFTER_SECONDS",
+    "TpsSampler",
+    "parse_metrics",
+]

@@ -14,6 +14,10 @@ The checked-in `config/` and `ops/` files show the shape of a hardened deploymen
 8. Validate systemd units with `systemd-analyze verify` before installing them.
 9. Exercise backup creation, verification, restore, rollback, and one-profile-at-a-time slot behavior with disposable data.
 10. Confirm stopped game ports and internal telemetry ports are unreachable from untrusted networks.
+11. If adopting the optional H1/H2/G11 reference, review
+    [operations examples](operations-example.md), replace every example
+    identity and path with locally reviewed values, and keep runtime secrets
+    outside Git.
 
 ## Installer dry run
 
@@ -28,6 +32,11 @@ python3 ops/install.py --check --root "$root" --token-source "$token" --skip-sys
 ```
 
 Do not use `--skip-systemd-verify` for a real installation.
+
+The baseline installer intentionally does not install the H1/H2/G11 reference
+files. They are examples because the corresponding feature implementation,
+service accounts, game installation, RCON server, capability issuer, and B2
+remote must be composed and verified for the target host before packaging.
 
 ## Public-release note
 

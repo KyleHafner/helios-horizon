@@ -118,12 +118,20 @@ def test_restore_valid_archive_stages_and_retains_rollback_until_health(tmp_path
     import game_control.backups as backups
     popens = []
     original_popen = backups.subprocess.Popen
+    original_tarfile_open = backups.tarfile.open
     monkeypatch = pytest.MonkeyPatch()
+    def force_external(*args, **kwargs):
+        mode = kwargs.get("mode", args[1] if len(args) > 1 else "r")
+        if args and isinstance(args[0], Path) and mode == "r:*":
+            raise tarfile.ReadError("exercise the external zstd fallback")
+        return original_tarfile_open(*args, **kwargs)
+
     monkeypatch.setattr(
         backups.subprocess,
         "Popen",
         lambda *args, **kwargs: (popens.append(args[0]), original_popen(*args, **kwargs))[1],
     )
+    monkeypatch.setattr(backups.tarfile, "open", force_external)
 
     result = service.restore(backup.path)
     monkeypatch.undo()

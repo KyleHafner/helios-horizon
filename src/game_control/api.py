@@ -47,6 +47,7 @@ from .protocol import (
     Restart,
     RpcAction,
     RpcFailure,
+    RpcProvenance,
     RpcRequest,
     RpcResponse,
     RpcSuccess,
@@ -322,8 +323,19 @@ class ApiService:
     def __init__(self, rpc: Callable[..., Any]):
         self.rpc = rpc
 
-    async def call(self, actor: str, action: RpcAction) -> RpcResponse:
-        request = RpcRequest(request_id=uuid4(), actor=actor, action=action)
+    async def call(
+        self,
+        actor: str,
+        action: RpcAction,
+        *,
+        provenance: RpcProvenance = RpcProvenance.SERVICE,
+    ) -> RpcResponse:
+        request = RpcRequest(
+            request_id=uuid4(),
+            actor=actor,
+            provenance=provenance,
+            action=action,
+        )
         result = self.rpc(actor, action) if _accepts_two(self.rpc) else self.rpc(request)
         if inspect.isawaitable(result):
             result = await result
@@ -352,7 +364,11 @@ def add_api_routes(
         actor = await auth_dependency(request, response, mutation=mutation)
         action = _action(request.url.path, request.method, profile_id, payload, request)
         try:
-            rpc_response = await service.call(actor, action)
+            rpc_response = await service.call(
+                actor,
+                action,
+                provenance=RpcProvenance.WEB_HUMAN,
+            )
         except Exception:
             return JSONResponse(
                 status_code=503,
