@@ -1,6 +1,6 @@
 # Helios Horizon
 
-[![CI](https://github.com/VirgoAgario/helios-horizon/actions/workflows/ci.yml/badge.svg)](https://github.com/VirgoAgario/helios-horizon/actions/workflows/ci.yml)
+[![CI](https://github.com/KyleHafner/helios-horizon/actions/workflows/ci.yml/badge.svg)](https://github.com/KyleHafner/helios-horizon/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
 Helios Horizon is a security-focused control plane for a host that runs one resource-intensive game server at a time. It coordinates Minecraft, Project Zomboid, Terraria, and tModLoader behind one typed controller instead of letting the web process invoke arbitrary shell commands.
