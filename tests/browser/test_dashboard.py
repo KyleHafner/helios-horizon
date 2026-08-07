@@ -149,6 +149,8 @@ def page(web_server):
                 return route.fulfill(json={"items": [
                     {"timestamp": "2026-07-11T12:00:00Z", "severity": "info", "message": "server ready"},
                     {"timestamp": "2026-07-11T12:01:00Z", "severity": "error", "message": "redacted failure"},
+                    {"timestamp": "2026-07-11T12:01:01Z", "severity": "info", "message": "Thread RCON Client /127.0.0.1 started"},
+                    {"timestamp": "2026-07-11T12:01:01Z", "severity": "info", "message": "Thread RCON Client /127.0.0.1 shutting down"},
                 ], "next_cursor": None})
             if path == "/api/v1/profiles/minecraft/backups":
                 return route.fulfill(json={"items": [
@@ -841,7 +843,7 @@ def test_detail_log_severity_widening_refilters_all_cached_rows(page: Page):
     assert logs.locator(".log-line").count() == 1
     logs.get_by_label("Severity", exact=True).select_option("all")
     assert logs.locator(".log-line").count() == 2
-    assert page.locator("#detail-log-footer").inner_text() == "2 lines · 0 network-noise lines hidden · secrets redacted"
+    assert page.locator("#detail-log-footer").inner_text() == "2 lines · 2 network-noise lines hidden · secrets redacted"
 
 
 def test_malformed_and_unknown_server_hashes_fall_back_to_dashboard(page: Page):
