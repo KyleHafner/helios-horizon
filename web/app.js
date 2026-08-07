@@ -15,6 +15,7 @@ const NOISE_PATTERNS = [
   /Closing TcpSocket/i,
   /\(Anonymous\)\] (Connecting|Closing)/i,
   /Tried to send data to a client after losing connection/i,
+  /Thread RCON Client \/127\.0\.0\.1 (?:started|shutting down)/i,
 ];
 const isNoise = (line) => NOISE_PATTERNS.some((pattern) => pattern.test(line.message || ""));
 
@@ -1330,7 +1331,7 @@ function patchDetail(id) {
   const item = state.logs.get(id);
   const lines = (item?.lines || [])
     .filter((line) => !item?.clearedAt || Date.parse(line.timestamp || 0) > item.clearedAt)
-    .filter((line) => item?.hideNoise !== false || !isNoise(line));
+    .filter((line) => item?.hideNoise === false || !isNoise(line));
   const hidden = (item?.lines || []).filter((line) => !item?.clearedAt || Date.parse(line.timestamp || 0) > item.clearedAt).filter(isNoise).length;
   const consoleOutput = byId("console-output");
   if (consoleOutput && !consoleOutput.matches(":focus-within") && !item?.loading) {
@@ -1576,7 +1577,7 @@ function renderDetailLogs(item) {
   const query = item.query.trim().toLowerCase();
   const matching = item.lines.filter((line) => (!query || String(line.message || "").toLowerCase().includes(query)) && (item.severity === "all" || line.severity === item.severity));
   const hidden = matching.filter(isNoise).length;
-  const lines = matching.filter((line) => item.hideNoise !== false || !isNoise(line));
+  const lines = matching.filter((line) => item.hideNoise === false || !isNoise(line));
   const list = byId("detail-log-list");
   list.replaceChildren();
   lines.forEach((line) => {
