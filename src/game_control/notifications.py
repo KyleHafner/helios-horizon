@@ -7,6 +7,7 @@ toggle those events in the state database.
 
 from __future__ import annotations
 
+import asyncio
 import os
 import sqlite3
 import time
@@ -202,6 +203,42 @@ class NotificationService:
             if self._already_delivered(profile_key, event_obj.value, int(state_generation), channel):
                 continue
             self._post(channel, secret, message)
+            self._record_delivery(profile_key, event_obj.value, int(state_generation), channel)
+            delivered = True
+        if delivered and event_obj is NotificationEvent.LOW_DISK:
+            self._low_disk_sent[profile_key] = now
+        return delivered
+
+    async def send_async(
+        self,
+        profile: Any,
+        event: NotificationEvent | str,
+        state_generation: int,
+        message: str,
+    ) -> bool:
+        """Keep SQLite access on the owner thread while offloading HTTP I/O."""
+        profile_obj = self._get_profile(profile)
+        try:
+            event_obj = event if isinstance(event, NotificationEvent) else NotificationEvent(event)
+        except ValueError as exc:
+            raise SafeError("notification_failed", "notification event is unavailable") from exc
+        profile_key = _profile_id(profile_obj)
+        if not self._enabled(profile_obj, event_obj):
+            return False
+        now = self.clock()
+        if event_obj is NotificationEvent.LOW_DISK:
+            previous = self._low_disk_sent.get(profile_key)
+            if previous is not None and now - previous < self.low_disk_cooldown_seconds:
+                return False
+        delivered = False
+        for channel in CHANNELS:
+            try:
+                secret = self._secret(channel)
+            except SafeError:
+                continue
+            if self._already_delivered(profile_key, event_obj.value, int(state_generation), channel):
+                continue
+            await asyncio.to_thread(self._post, channel, secret, message)
             self._record_delivery(profile_key, event_obj.value, int(state_generation), channel)
             delivered = True
         if delivered and event_obj is NotificationEvent.LOW_DISK:
