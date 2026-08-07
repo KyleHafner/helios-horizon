@@ -140,6 +140,42 @@ async def test_notification_facade_keeps_sqlite_audit_on_event_loop(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_notification_facade_send_keeps_sqlite_on_event_loop(tmp_path):
+    import sqlite3
+
+    profile = _profile(ProfileId.MINECRAFT, AdapterKind.CRAFTY)
+    profile.notification_events = frozenset({NotificationEvent.START})
+    connection = sqlite3.connect(":memory:")
+    connection.executescript(
+        """
+        CREATE TABLE notification_rules(profile_id TEXT, event TEXT, enabled INTEGER,
+                                        PRIMARY KEY(profile_id,event));
+        CREATE TABLE notification_deliveries(
+          id TEXT PRIMARY KEY, profile_id TEXT, event TEXT, state_generation INTEGER,
+          channel TEXT, delivered_at TEXT, error_code TEXT);
+        """
+    )
+    secret_dir = tmp_path / "secrets"
+    secret_dir.mkdir()
+    secret = secret_dir / "discord"
+    secret.write_text("https://discordapp.com/api/webhooks/123/token")
+    secret.chmod(0o600)
+    service = NotificationService(
+        {ProfileId.MINECRAFT.value: profile},
+        secret_dir=secret_dir,
+        database=connection,
+    )
+    main_thread = threading.get_ident()
+    post_threads = []
+    service._post = lambda channel, value, message: post_threads.append(threading.get_ident())
+    facade = _NotificationFacade(service)
+
+    assert await facade.send(ProfileId.MINECRAFT, NotificationEvent.START, 9, "started")
+    assert post_threads and post_threads[0] != main_thread
+    assert connection.execute("SELECT count(*) FROM notification_deliveries").fetchone()[0] == 1
+
+
+@pytest.mark.asyncio
 async def test_backup_state_database_opens_inside_worker(monkeypatch):
     profile = _profile(ProfileId.MINECRAFT, AdapterKind.CRAFTY)
     adapter = _Adapter()

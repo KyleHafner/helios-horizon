@@ -428,7 +428,7 @@ class _NotificationFacade:
         return JobAccepted(job_id=uuid4().hex, state="running")
 
     async def send(self, profile_id: Any, event: Any, state_generation: int, message: str) -> bool:
-        return await asyncio.to_thread(self.service.send, profile_id, event, state_generation, message)
+        return await self.service.send_async(profile_id, event, state_generation, message)
 
 
 class _AuditFacade:
