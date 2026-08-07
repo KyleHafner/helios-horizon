@@ -15,14 +15,14 @@ After proxy authentication, Horizon creates an expiring server-side session. Mut
 
 The FastAPI process runs as an unprivileged account and cannot start services or read game data directly. It sends typed actions to a privileged controller through `/run/game-control/control.sock`. The controller checks Unix peer credentials and maps profile IDs to fixed configuration.
 
-Console commands are bounded printable strings sent only through a profile-specific transport. The transport path and service account are fixed by reviewed code/configuration; the request cannot supply a FIFO or executable path.
+Console commands pass through a controller-owned broker and a profile-specific transport. The transport path, service account, and input bounds are fixed by reviewed code/configuration; the request cannot supply a FIFO, executable path, RCON endpoint, or credential.
 
 The public RCON example is loopback-only (for example
 `127.0.0.1:25575`) and reads its credential from a runtime-only secret
 mount. The password is never accepted from a browser request, command-line
 argument, environment variable, audit record, or backup manifest. The
-console/online-backup sequence uses fixed commands: save-off, flush, one
-bounded snapshot/copy, and save-on in a failure-safe cleanup path.
+online-backup sequence is `save-off -> flush -> copy/verify -> save-on`, with
+save-on attempted from a failure-safe cleanup path.
 
 ## Filesystem and service controls
 
@@ -30,17 +30,25 @@ The example systemd units use narrow writable paths, protected homes/system dire
 
 ## Secret handling
 
-Crafty tokens, proxy credentials, and notification destinations are loaded from protected runtime files. The application redacts common bearer tokens, webhook URLs, cookies, passwords, configured secrets, and private-key blocks before returning log records.
+Proxy credentials, capability tokens, RCON credentials, backup credentials, and notification destinations are loaded from protected runtime files. The application redacts common bearer tokens, webhook URLs, cookies, passwords, configured secrets, and private-key blocks before returning log records.
 
 The repository intentionally excludes live credential files, databases, logs, backups, worlds, inventories, and generated deployment evidence.
 
 The LazyMC reference is a proxy/supervisor boundary, not a Java lifecycle
-owner: its backend is a fixed loopback listener, and its helper can request
-only the fixed capability wake/status operations. The B2 reference uses a
-root-only runtime credential and fixed profile/remote/prefix policy; callers
-cannot supply a remote, key, staging directory, retention count, or archive
-path. See [operations examples](operations-example.md) for the sanitized
-contract.
+owner: its backend is a fixed loopback listener, and its Waker credential can
+request only fixed status/wake operations for the bound Minecraft profile.
+
+Automation uses a separate MCP audience. Observer credentials permit status
+and TPS; Waker credentials permit status and wake. Audience, role, scopes,
+expiry, rate budget, and wake cooldown are all checked independently. Neither
+audience can stop, restart, switch, restore, modify configuration, or issue a
+console command.
+
+The B2 reference uses a root-only runtime credential and fixed
+profile/remote/prefix policy. Application backups are encrypted and reconciled
+to two verified generations; callers cannot supply a remote, key, staging
+directory, retention count, or archive path. See
+[operations examples](operations-example.md) for the sanitized contract.
 
 ## Security limitations
 
