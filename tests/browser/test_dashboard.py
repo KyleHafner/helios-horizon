@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import shutil
 import threading
+from datetime import datetime, timedelta, timezone
 from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import urlparse
@@ -116,7 +117,27 @@ def page(web_server):
             {"id": "terraria-vanilla", "display_name": "Terraria Vanilla", "adapter": "systemd", "operations": ["start", "stop", "restart", "command"]},
             {"id": "future-game", "display_name": "Future Game", "adapter": "systemd", "operations": ["start", "stop", "restart"]},
         ]
-        latest = {"status": status}
+        tps_now = datetime.now(timezone.utc)
+        tps_samples = [
+            {"timestamp": (tps_now - timedelta(seconds=90)).isoformat(), "tps": 19.91, "mspt": 15.2},
+            {"timestamp": (tps_now - timedelta(seconds=45)).isoformat(), "tps": 20.0, "mspt": 12.8},
+            {"timestamp": tps_now.isoformat(), "tps": 20.0, "mspt": 13.1},
+        ]
+        latest = {
+            "status": status,
+            "stats": {
+                "failures": set(),
+                "summary": {
+                    "total_hours": 1,
+                    "unique_players": 1,
+                    "leaderboard": [{"player": "Guest", "hours": 1, "sessions": 1, "last_seen": "2026-07-11T12:00:00Z"}],
+                    "player_tracking": "names",
+                    "occupancy": {"latest": 1, "samples": []},
+                },
+                "heatmap": {"buckets": [[(day + hour) % 4 for hour in range(24)] for day in range(7)]},
+                "tps": {"window": "24h", "samples": tps_samples},
+            },
+        }
 
         def fulfill(route):
             request = route.request
@@ -135,9 +156,13 @@ def page(web_server):
             if path == "/api/v1/profiles":
                 return route.fulfill(json=names)
             if path.endswith("/stats/heatmap"):
-                return route.fulfill(json={"buckets": [[(day + hour) % 4 for hour in range(24)] for day in range(7)]})
+                if "heatmap" in latest["stats"]["failures"]:
+                    return route.fulfill(status=503, json={"detail": "simulated heatmap failure"})
+                return route.fulfill(json=latest["stats"]["heatmap"])
             if path.endswith("/stats/tps"):
-                return route.fulfill(json={"samples": [{"timestamp": "2026-07-11T12:00:00Z", "tps": 20, "mspt": 12}]})
+                if "tps" in latest["stats"]["failures"]:
+                    return route.fulfill(status=503, json={"detail": "simulated TPS failure"})
+                return route.fulfill(json=latest["stats"]["tps"])
             if path == "/api/v1/stream":
                 payload = json.dumps(latest["status"], separators=(",", ":"))
                 return route.fulfill(
@@ -164,15 +189,11 @@ def page(web_server):
                         "unique_players": 0,
                         "leaderboard": [],
                         "player_tracking": "count",
-                        "occupancy": {"latest": 3, "samples": []},
+                        "occupancy": {"latest": 3, "samples": [{"timestamp": tps_now.isoformat(), "count": 3}]},
                     })
-                return route.fulfill(json={
-                    "total_hours": 1,
-                    "unique_players": 1,
-                    "leaderboard": [{"player": "Guest", "hours": 1, "sessions": 1, "last_seen": "2026-07-11T12:00:00Z"}],
-                    "player_tracking": "names",
-                    "occupancy": {"latest": 1, "samples": []},
-                })
+                if "summary" in latest["stats"]["failures"]:
+                    return route.fulfill(status=503, json={"detail": "simulated summary failure"})
+                return route.fulfill(json=latest["stats"]["summary"])
             if path.endswith("/config"):
                 profile_id = path.split("/")[4]
                 if request.method == "POST":
@@ -200,7 +221,7 @@ def page(web_server):
         page.wait_for_selector('[data-profile-id="minecraft"]', timeout=5000)
         page._dashboard_fixture = latest  # type: ignore[attr-defined]
         yield page
-        assert console_errors == []
+        assert [error for error in console_errors if "503 (Service Unavailable)" not in error] == []
         assert page_errors == []
         context.close()
         browser.close()
@@ -665,20 +686,71 @@ def test_stats_are_game_relevant_and_omit_tick_tiles_for_non_minecraft(page: Pag
     base = page.url.split("#")[0]
     page.goto(f"{base}#/servers/minecraft/stats")
     page.wait_for_selector("#detail-view:not([hidden])")
-    assert page.get_by_role("heading", name="Minecraft tick telemetry", exact=True).is_visible()
+    assert page.get_by_role("heading", name="Tick evidence", exact=True).is_visible()
 
     page.goto(f"{base}#/servers/terraria-tmod/stats")
     page.wait_for_selector("#detail-view:not([hidden])")
-    assert not page.get_by_role("heading", name="Minecraft tick telemetry", exact=True).is_visible()
-    assert page.get_by_role("heading", name="Leaderboard", exact=True).is_visible()
+    assert not page.get_by_role("heading", name="Tick evidence", exact=True).is_visible()
+    assert page.get_by_role("heading", name="Player record", exact=True).is_visible()
 
     page.goto(f"{base}#/servers/pz-rising/stats")
     page.wait_for_function("document.querySelector('#detail-title')?.textContent === 'Project Zomboid'")
-    assert not page.get_by_role("heading", name="Minecraft tick telemetry", exact=True).is_visible()
+    assert not page.get_by_role("heading", name="Tick evidence", exact=True).is_visible()
     page.wait_for_selector("#stats-occupancy-block:not([hidden])", timeout=5000)
     assert page.get_by_role("heading", name="Occupancy", exact=True).is_visible()
-    assert page.get_by_text("3 online", exact=True).is_visible()
-    assert not page.get_by_role("heading", name="Leaderboard", exact=True).is_visible()
+    assert page.get_by_text("Stopped · last observed 3 players at", exact=False).is_visible()
+    assert not page.get_by_role("heading", name="Player record", exact=True).is_visible()
+
+
+def test_session_ledger_uses_wall_clock_ranges_and_explicit_tps_evidence(page: Page):
+    page.goto(f"{page.url.split('#')[0]}#/servers/minecraft/stats")
+    page.wait_for_selector("#stats-tps-chart .chart-line", timeout=5000)
+    assert page.get_by_role("heading", name="Session ledger", exact=True).is_visible()
+    assert page.get_by_text("Server running. Current status and historical observations are shown separately.", exact=True).is_visible()
+    assert page.get_by_role("heading", name="Player record", exact=True).is_visible()
+    assert page.get_by_role("heading", name="Tick evidence", exact=True).is_visible()
+    assert page.locator("label[for='stats-window']").inner_text().startswith("Wall-clock range")
+    assert page.locator("#stats-tps-chart .chart-line").count() == 1
+    assert page.locator("#stats-tps-chart .chart-grid").count() == 3
+    assert page.locator("#stats-heatmap .heatmap-axis").count() == 1
+    assert page.locator("#stats-heatmap .heatmap-legend").count() == 1
+
+
+def test_stats_range_selector_only_refreshes_tick_evidence(page: Page):
+    page.goto(f"{page.url.split('#')[0]}#/servers/minecraft/stats")
+    page.wait_for_selector("#stats-tps-chart .chart-line", timeout=5000)
+    requests = []
+    page.on("request", lambda request: requests.append(request.url) if "/stats/" in request.url else None)
+    with page.expect_response(lambda response: response.request.url.endswith("/stats/tps?window=6h"), timeout=5000):
+        page.locator("#stats-window").select_option("6h")
+    assert requests
+    assert all("/stats/tps" in url for url in requests)
+
+
+def test_stats_partial_failures_keep_successful_sections_visible(page: Page):
+    page._dashboard_fixture["stats"]["failures"].add("heatmap")  # type: ignore[attr-defined]
+    page.goto(f"{page.url.split('#')[0]}#/servers/minecraft/stats")
+    page.get_by_text("Player-hours by time of week could not be loaded.", exact=True).wait_for()
+    assert page.get_by_text("Guest", exact=True).is_visible()
+    assert page.locator("#stats-tps-chart .chart-line").count() == 1
+    page._dashboard_fixture["stats"]["failures"].clear()  # type: ignore[attr-defined]
+
+
+def test_tick_evidence_does_not_draw_zero_or_out_of_range_samples(page: Page):
+    stats = page._dashboard_fixture["stats"]  # type: ignore[attr-defined]
+    stats["tps"] = {"window": "24h", "samples": []}
+    page.goto(f"{page.url.split('#')[0]}#/servers/minecraft/stats")
+    page.get_by_text("No tick samples in this wall-clock range.", exact=True).wait_for()
+    assert page.locator("#stats-tps-chart .chart-line").count() == 0
+    assert page.locator("#stats-tps-chart .chart-point").count() == 0
+
+    old = (datetime.now(timezone.utc) - timedelta(days=2)).isoformat()
+    stats["tps"] = {"window": "24h", "samples": [{"timestamp": old, "tps": 20, "mspt": 13}]}
+    page.reload()
+    page.get_by_text("No tick samples in this wall-clock range.", exact=True).wait_for()
+    assert page.get_by_text("LAST OBSERVED 20.00 TPS", exact=True).is_visible()
+    assert page.locator("#stats-tps-chart .chart-line").count() == 0
+    assert page.locator("#stats-tps-chart .chart-point").count() == 0
 
 
 def test_detail_command_hint_matches_available_running_profile(page: Page):

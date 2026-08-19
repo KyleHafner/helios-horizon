@@ -150,31 +150,36 @@
               </section>
               <section class="detail-panel stats-panel" id="panel-stats" role="tabpanel" aria-labelledby="tab-stats" tabindex="0" hidden>
                 <div class="stats-heading">
-                  <div><p class="eyebrow">Player activity</p><h2>Sessions and telemetry</h2></div>
-                  <label class="stats-window">Window <select id="stats-window"><option value="1h">1 hour</option><option value="6h">6 hours</option><option value="24h" selected>24 hours</option></select></label>
+                  <div><p class="eyebrow">Player activity</p><h2>Session ledger</h2><p class="stats-scope-copy" id="stats-scope-copy" aria-live="polite">Server state is changing or unavailable. Historical observations remain available.</p></div>
                 </div>
-                <div class="stats-summary" id="stats-summary" aria-live="polite">
-                  <div><span>Total player-hours</span><strong id="stats-total-hours">—</strong></div>
-                  <div><span>Unique players</span><strong id="stats-unique-players">—</strong></div>
+                <div class="stats-summary" id="stats-summary" role="group" aria-label="Player record summary">
+                  <div><span>Player-hours</span><strong id="stats-total-hours">—</strong><span>Players observed</span><strong id="stats-unique-players">—</strong></div>
                 </div>
                 <div class="stats-sections">
                   <section class="stats-block" aria-labelledby="stats-leaderboard-title">
-                    <div class="stats-block-heading"><h3 id="stats-leaderboard-title">Leaderboard</h3><span class="section-meta" id="stats-leaderboard-meta">—</span></div>
-                    <div class="stats-table-wrap"><table class="stats-table"><thead><tr><th scope="col">Player</th><th scope="col">Hours</th><th scope="col">Sessions</th><th scope="col">Last seen</th></tr></thead><tbody id="stats-leaderboard"><tr><td class="empty-state" colspan="4">No sessions recorded yet.</td></tr></tbody></table></div>
+                    <div class="stats-block-heading"><div><h3 id="stats-leaderboard-title">Player record</h3><span class="section-meta">Last 90 days</span></div><span class="section-meta" id="stats-leaderboard-meta">—</span></div>
+                    <p class="stats-status" id="stats-summary-status" aria-live="polite"></p>
+                    <h4 class="stats-subheading">Players and sessions</h4>
+                    <div class="stats-table-wrap" tabindex="0" aria-label="Players and sessions table"><table class="stats-table"><thead><tr><th scope="col">Player</th><th scope="col">Play time</th><th scope="col">Sessions</th><th scope="col">Last observed</th></tr></thead><tbody id="stats-leaderboard"><tr><td class="empty-state" colspan="4">No player activity recorded in the last 90 days.</td></tr></tbody></table></div>
                   </section>
                   <section class="stats-block" aria-labelledby="stats-heatmap-title">
-                    <div class="stats-block-heading"><h3 id="stats-heatmap-title">Activity heatmap</h3><span class="section-meta">UTC · last 90 days</span></div>
-                    <div class="heatmap-grid" id="stats-heatmap" aria-label="Player-hours by UTC day and hour"></div>
+                    <div class="stats-block-heading"><div><h3 id="stats-heatmap-title">Player-hours by time of week</h3><p class="stats-note">Cumulative player-hours over the last 90 days, grouped by UTC weekday and hour.</p></div></div>
+                    <p class="stats-status" id="stats-heatmap-status" aria-live="polite"></p>
+                    <div class="heatmap-grid" id="stats-heatmap" tabindex="0" role="region" aria-label="Player-hours by UTC weekday and hour"></div>
                   </section>
                   <section class="stats-block" id="stats-occupancy-block" aria-labelledby="stats-occupancy-title" hidden>
                     <div class="stats-block-heading"><div><h3 id="stats-occupancy-title">Occupancy</h3><p class="stats-note" id="stats-occupancy-note">Count-based occupancy; player names are not available for this game.</p></div><strong id="stats-occupancy-current">—</strong></div>
                   </section>
                   <section class="stats-block stats-tps-block" aria-labelledby="stats-tps-title">
-                    <div class="stats-block-heading"><div><h3 id="stats-tps-title">Minecraft tick telemetry</h3><p class="stats-note" id="stats-tps-note">Loading tick samples…</p></div><div class="stats-tps-values"><strong id="stats-tps-current">—</strong><span id="stats-mspt-current">—</span></div></div>
-                    <svg id="stats-tps-chart" class="stats-tps-chart" viewBox="0 0 520 180" role="img" aria-label="Minecraft TPS and MSPT chart">
-                      <line class="chart-axis" x1="42" y1="12" x2="42" y2="150"></line><line class="chart-axis" x1="42" y1="150" x2="510" y2="150"></line>
-                      <text class="chart-ymax" x="38" y="16" text-anchor="end">20 TPS</text><text class="chart-ymid" x="38" y="84" text-anchor="end">10 TPS</text><text x="38" y="154" text-anchor="end">0</text><text class="chart-x0" x="42" y="172">—</text><text class="chart-x1" x="510" y="172" text-anchor="end">—</text>
-                      <g class="tps-chart-lines"><polyline class="chart-line" points="42,150 510,150"></polyline></g>
+                    <div class="stats-block-heading"><div><h3 id="stats-tps-title">Tick evidence</h3><p class="stats-note" id="stats-tps-note">Loading tick samples…</p><p class="stats-note">Gaps mean no telemetry was observed. They do not identify stopped time.</p></div><div class="stats-tps-values"><label class="stats-window" for="stats-window">Wall-clock range<select id="stats-window"><option value="1h">Last 1 hour</option><option value="6h">Last 6 hours</option><option value="24h" selected>Last 24 hours</option></select></label><strong id="stats-tps-current">—</strong><span id="stats-mspt-current">—</span></div></div>
+                    <p class="stats-status" id="stats-tps-status" aria-live="polite"></p>
+                    <p class="stats-note">MSPT shows tick headroom; 50 ms/tick is the budget required to sustain 20 TPS.</p>
+                    <svg id="stats-tps-chart" class="stats-tps-chart" viewBox="0 0 520 190" role="img" aria-label="Minecraft TPS observations over the selected wall-clock range">
+                      <rect class="chart-healthy-band" x="48" y="16" width="456" height="14" rx="3"></rect>
+                      <line class="chart-grid" x1="48" y1="16" x2="504" y2="16"></line><line class="chart-grid" x1="48" y1="80" x2="504" y2="80"></line><line class="chart-grid" x1="48" y1="144" x2="504" y2="144"></line>
+                      <line class="chart-axis" x1="48" y1="16" x2="48" y2="144"></line><line class="chart-axis" x1="48" y1="144" x2="504" y2="144"></line>
+                      <text class="chart-ymax" x="42" y="20" text-anchor="end">20</text><text class="chart-ymid" x="42" y="84" text-anchor="end">10</text><text x="42" y="148" text-anchor="end">0</text><text class="chart-unit" x="48" y="10">TPS</text><text class="chart-x0" x="48" y="174">—</text><text class="chart-x1" x="504" y="174" text-anchor="end">—</text>
+                      <g class="tps-chart-areas"></g><g class="tps-chart-lines"></g><g class="tps-chart-points"></g>
                     </svg>
                   </section>
                 </div>

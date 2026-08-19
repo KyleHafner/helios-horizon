@@ -49,7 +49,7 @@ const state = {
   metricSamples: new Map(),
   schedules: null,
   benchmarks: new Map(),
-  detail: { id: null, tab: "console", backups: [], statsTimer: null, statsRequest: 0, benchmarkTimer: null },
+  detail: { id: null, tab: "console", backups: [], statsTimer: null, statsRequest: 0, statsTpsRequest: 0, benchmarkTimer: null },
   configRestartRequired: new Map(),
   lastGeneration: 0,
   loadFailed: false,
@@ -1040,7 +1040,30 @@ function renderStatsSummary(summary) {
   byId("stats-unique-players").textContent = Number.isFinite(unique) ? String(unique) : "—";
   byId("stats-leaderboard-meta").textContent = Number.isFinite(unique) ? `${unique} player${unique === 1 ? "" : "s"}` : "—";
   const latest = Number(summary?.occupancy?.latest);
-  byId("stats-occupancy-current").textContent = Number.isFinite(latest) ? `${latest} online` : "Unavailable";
+  const status = state.statuses.get(state.detail.id) || {};
+  const currentCount = status.players_online == null ? NaN : Number(status.players_online);
+  const latestSample = Array.isArray(summary?.occupancy?.samples) ? summary.occupancy.samples.at(-1) : null;
+  const latestTs = summary?.occupancy?.latest_ts || summary?.occupancy?.timestamp || summary?.occupancy?.ts || latestSample?.timestamp || latestSample?.ts;
+  const parsed = latestTs ? Date.parse(latestTs) : NaN;
+  const localized = Number.isFinite(parsed) ? new Date(parsed).toLocaleString() : null;
+  if (status.state === "stopped" && Number.isFinite(latest) && localized) {
+    byId("stats-occupancy-current").textContent = `Stopped · last observed ${latest} players at ${localized}`;
+  } else if (status.state === "running" && Number.isFinite(currentCount)) {
+    byId("stats-occupancy-current").textContent = `ONLINE NOW · ${currentCount} players`;
+  } else if (Number.isFinite(latest) && localized) {
+    byId("stats-occupancy-current").textContent = `LAST OBSERVED OCCUPANCY · ${latest} players at ${localized}`;
+  } else {
+    byId("stats-occupancy-current").textContent = "Historical occupancy is unavailable.";
+  }
+}
+
+function renderStatsHeader(id) {
+  const value = state.statuses.get(id)?.state;
+  byId("stats-scope-copy").textContent = value === "stopped"
+    ? "Server stopped by design. Historical observations remain available."
+    : value === "running"
+      ? "Server running. Current status and historical observations are shown separately."
+      : "Server state is changing or unavailable. Historical observations remain available.";
 }
 
 function renderStatsLeaderboard(rows) {
@@ -1051,7 +1074,7 @@ function renderStatsLeaderboard(rows) {
     const cell = document.createElement("td");
     cell.className = "empty-state";
     cell.colSpan = 4;
-    cell.textContent = "No sessions recorded yet.";
+    cell.textContent = "No player activity recorded in the last 90 days.";
     row.append(cell);
     body.append(row);
     return;
@@ -1075,6 +1098,18 @@ function renderStatsHeatmap(result) {
   const buckets = Array.isArray(result?.buckets) ? result.buckets : [];
   const values = buckets.flatMap((row) => Array.isArray(row) ? row.map(Number) : []).filter(Number.isFinite);
   const maximum = Math.max(0, ...values);
+  const axis = document.createElement("div");
+  axis.className = "heatmap-row heatmap-axis";
+  const zone = document.createElement("span");
+  zone.className = "heatmap-label";
+  zone.textContent = "UTC";
+  axis.append(zone);
+  for (let hour = 0; hour < 24; hour += 1) {
+    const label = document.createElement("span");
+    label.textContent = hour % 6 === 0 ? String(hour).padStart(2, "0") : "";
+    axis.append(label);
+  }
+  grid.append(axis);
   HEATMAP_LABELS.forEach((label, day) => {
     const row = document.createElement("div");
     row.className = "heatmap-row";
@@ -1086,25 +1121,37 @@ function renderStatsHeatmap(result) {
       const value = Number(buckets[day]?.[hour]) || 0;
       const cell = document.createElement("span");
       cell.className = "heatmap-cell";
+      cell.tabIndex = 0;
       cell.style.setProperty("--heat", maximum ? String(Math.min(1, value / maximum)) : "0");
-      cell.title = `${label} ${String(hour).padStart(2, "0")}:00 UTC · ${value.toFixed(2)} player-hours`;
+      cell.title = `${label} ${String(hour).padStart(2, "0")}:00 UTC · ${value.toFixed(2)} player-hours · last 90 days`;
       cell.setAttribute("aria-label", cell.title);
       row.append(cell);
     }
     grid.append(row);
   });
+  const legend = document.createElement("div");
+  legend.className = "heatmap-legend";
+  legend.innerHTML = '<span>Less player time</span><i style="--heat: .12"></i><i style="--heat: .35"></i><i style="--heat: .65"></i><i style="--heat: 1"></i><span>More player time</span>';
+  grid.append(legend);
 }
 
 function renderStatsTpsUnavailable(message) {
-  byId("stats-tps-note").textContent = message;
+  byId("stats-tps-note").textContent = "";
   byId("stats-tps-current").textContent = "—";
   byId("stats-mspt-current").textContent = "—";
   const lines = byId("stats-tps-chart")?.querySelector(".tps-chart-lines");
-  if (lines) {
-    lines.replaceChildren();
-    const line = document.createElementNS("http://www.w3.org/2000/svg", "polyline");
-    line.classList.add("chart-line"); line.setAttribute("points", "42,150 510,150"); lines.append(line);
-  }
+  byId("stats-tps-chart")?.querySelector(".tps-chart-areas")?.replaceChildren();
+  byId("stats-tps-chart")?.querySelector(".tps-chart-points")?.replaceChildren();
+  if (lines) lines.replaceChildren();
+  byId("stats-tps-status").textContent = message;
+  const hours = STATS_WINDOWS[byId("stats-window")?.value] || 24;
+  const end = Date.now();
+  const start = end - hours * 60 * 60 * 1000;
+  const fmt = (time) => new Date(time).toLocaleString([], hours >= 24
+    ? { weekday: "short", hour: "numeric", minute: "2-digit" }
+    : { hour: "numeric", minute: "2-digit" });
+  byId("stats-tps-chart").querySelector(".chart-x0").textContent = fmt(start);
+  byId("stats-tps-chart").querySelector(".chart-x1").textContent = fmt(end);
 }
 
 function renderStatsUnavailable(message) {
@@ -1121,38 +1168,42 @@ function renderStatsUnavailable(message) {
 function renderStatsTps(result) {
   const note = byId("stats-tps-note");
   const samples = (Array.isArray(result?.samples) ? result.samples : [])
-    .map((sample) => ({ ...sample, time: Date.parse(sample.ts), tps: Number(sample.tps), mspt: Number(sample.mspt) }))
+    .map((sample) => ({ ...sample, time: Date.parse(sample.ts || sample.timestamp), tps: Number(sample.tps), mspt: Number(sample.mspt) }))
     .filter((sample) => Number.isFinite(sample.time) && Number.isFinite(sample.tps) && Number.isFinite(sample.mspt))
     .sort((a, b) => a.time - b.time);
   const latest = samples.at(-1);
-  const stale = result?.stale === true || result?.state === "unknown";
-  byId("stats-tps-current").textContent = latest && !stale ? `${Math.min(20, latest.tps).toFixed(2)} TPS` : "—";
-  byId("stats-mspt-current").textContent = latest && !stale ? `${latest.mspt.toFixed(2)} ms/tick` : "—";
-  note.textContent = stale
-    ? (latest ? "Tick telemetry is stale; current values are unknown." : "No fresh tick samples recorded yet.")
-    : `${samples.length} samples · ${result.window || "selected window"}`;
+  const hours = STATS_WINDOWS[byId("stats-window").value] || 24;
+  const domainEnd = Date.now();
+  const domainStart = domainEnd - hours * 60 * 60 * 1000;
+  const visible = samples.filter((sample) => sample.time >= domainStart && sample.time <= domainEnd);
+  const latestApi = result?.latest_ts ? Date.parse(result.latest_ts) : NaN;
+  const stale = result?.stale === true || result?.state === "unknown" || (latest && domainEnd - latest.time > 120000);
+  const firstText = samples[0] ? new Date(samples[0].time).toLocaleString() : "—";
+  const lastText = latest ? new Date(latest.time).toLocaleString() : "—";
+  const clusters = visible.reduce((count, sample, index) => count + (index === 0 || sample.time - visible[index - 1].time > 120000 ? 1 : 0), 0);
+  byId("stats-tps-current").textContent = latest ? `${stale ? "LAST OBSERVED " : "CURRENT "}${Math.min(20, latest.tps).toFixed(2)} TPS` : "—";
+  byId("stats-mspt-current").textContent = latest ? `${latest.mspt.toFixed(2)} ms/tick` : "—";
+  note.textContent = !latest ? "" : stale
+    ? `Observed ${new Date(Number.isFinite(latestApi) ? latestApi : latest.time).toLocaleString()} · current tick telemetry is unknown.`
+    : `${samples.length} returned samples · first ${firstText} · last ${lastText} · ${clusters} observed clusters`;
+  byId("stats-tps-status").textContent = visible.length ? "" : "No tick samples in this wall-clock range.";
   const svg = byId("stats-tps-chart");
   const group = svg?.querySelector(".tps-chart-lines");
+  const areas = svg?.querySelector(".tps-chart-areas");
+  const points = svg?.querySelector(".tps-chart-points");
   if (!svg || !group) return;
   group.replaceChildren();
-  svg.querySelector(".chart-ymax").textContent = "20 TPS";
-  svg.querySelector(".chart-ymid").textContent = "10 TPS";
-  if (!samples.length) {
-    const line = document.createElementNS("http://www.w3.org/2000/svg", "polyline");
-    line.classList.add("chart-line"); line.setAttribute("points", "42,150 510,150"); group.append(line);
-    svg.querySelector(".chart-x0").textContent = "—"; svg.querySelector(".chart-x1").textContent = "—";
-    return;
-  }
-  const hours = STATS_WINDOWS[byId("stats-window").value] || 24;
-  const end = Date.now();
-  const start = end - hours * 60 * 60 * 1000;
-  const inWindow = samples.filter((sample) => sample.time >= start && sample.time <= end);
-  const visible = inWindow.length ? inWindow : samples;
-  const domainStart = start;
-  const domainEnd = end;
-  const intervals = visible.slice(1).map((sample, index) => sample.time - visible[index].time).filter((value) => value > 0).sort((a, b) => a - b);
-  const median = intervals.length ? intervals[Math.floor(intervals.length / 2)] : 60_000;
-  const gapLimit = Math.max(1, median * 2);
+  areas?.replaceChildren();
+  points?.replaceChildren();
+  svg.querySelector(".chart-ymax").textContent = "20";
+  svg.querySelector(".chart-ymid").textContent = "10";
+  const fmt = (time) => new Date(time).toLocaleString([], hours >= 24
+    ? { weekday: "short", hour: "numeric", minute: "2-digit" }
+    : { hour: "numeric", minute: "2-digit" });
+  svg.querySelector(".chart-x0").textContent = fmt(domainStart);
+  svg.querySelector(".chart-x1").textContent = fmt(domainEnd);
+  if (!samples.length) return;
+  const gapLimit = 120000;
   const segments = [];
   let segment = [];
   visible.forEach((sample, index) => {
@@ -1160,17 +1211,25 @@ function renderStatsTps(result) {
     segment.push(sample);
   });
   if (segment.length) segments.push(segment);
-  const x = (time) => 42 + Math.min(1, Math.max(0, (time - domainStart) / (domainEnd - domainStart))) * 468;
-  const y = (value) => 150 - Math.min(20, Math.max(0, value)) / 20 * 138;
+  const x = (time) => 48 + Math.min(1, Math.max(0, (time - domainStart) / Math.max(1, domainEnd - domainStart))) * 456;
+  const y = (value) => 144 - Math.min(20, Math.max(0, value)) / 20 * 128;
   segments.forEach((items) => {
-    const line = document.createElementNS("http://www.w3.org/2000/svg", "polyline");
-    line.classList.add("chart-line");
-    line.setAttribute("points", items.map((sample) => `${x(sample.time).toFixed(1)},${y(sample.tps).toFixed(1)}`).join(" "));
-    group.append(line);
+    const coords = items.map((sample) => `${x(sample.time).toFixed(1)},${y(sample.tps).toFixed(1)}`);
+    if (items.length > 1) {
+      const line = document.createElementNS("http://www.w3.org/2000/svg", "polyline");
+      line.classList.add("chart-line");
+      line.setAttribute("points", coords.join(" "));
+      group.append(line);
+    }
+    if (points && items.length === 1) {
+      const point = document.createElementNS("http://www.w3.org/2000/svg", "circle");
+      point.classList.add("chart-point");
+      point.setAttribute("cx", x(items[0].time).toFixed(1));
+      point.setAttribute("cy", y(items[0].tps).toFixed(1));
+      point.setAttribute("r", "3");
+      points.append(point);
+    }
   });
-  const fmt = (time) => new Date(time).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
-  svg.querySelector(".chart-x0").textContent = fmt(domainStart);
-  svg.querySelector(".chart-x1").textContent = fmt(domainEnd);
 }
 
 async function loadStats(id) {
@@ -1178,20 +1237,37 @@ async function loadStats(id) {
   const request = ++state.detail.statsRequest;
   if (!STATS_PROFILES.has(id)) { renderStatsUnavailable("Player stats not available for this game."); return; }
   const base = `/api/v1/profiles/${encodeURIComponent(id)}/stats`;
-  const window = byId("stats-window")?.value || "24h";
+  renderStatsHeader(id);
+  const tpsBlock = byId("stats-tps-title").closest(".stats-tps-block");
+  tpsBlock.hidden = !TICK_PROFILES.has(id);
+  const jobs = [
+    api(`${base}/summary?days=90`).then((summary) => {
+      if (request === state.detail.statsRequest) {
+        renderStatsSummary(summary);
+        renderStatsLeaderboard(summary.leaderboard);
+        byId("stats-summary-status").textContent = "";
+      }
+    }).catch(() => { if (request === state.detail.statsRequest) byId("stats-summary-status").textContent = "Player summary could not be loaded."; }),
+    api(`${base}/heatmap?days=90`).then((heatmap) => {
+      if (request === state.detail.statsRequest) {
+        renderStatsHeatmap(heatmap);
+        byId("stats-heatmap-status").textContent = "";
+      }
+    }).catch(() => { if (request === state.detail.statsRequest) byId("stats-heatmap-status").textContent = "Player-hours by time of week could not be loaded."; }),
+  ];
+  if (TICK_PROFILES.has(id)) jobs.push(loadStatsTps(id));
+  await Promise.allSettled(jobs);
+}
+
+async function loadStatsTps(id) {
+  if (!id || state.detail.tab !== "stats" || !TICK_PROFILES.has(id)) return;
+  const request = ++state.detail.statsTpsRequest;
+  const selected = byId("stats-window")?.value || "24h";
   try {
-    const requests = [api(`${base}/summary?days=90`), api(`${base}/heatmap?days=90`)];
-    if (TICK_PROFILES.has(id)) requests.push(api(`${base}/tps?window=${encodeURIComponent(window)}`));
-    const [summary, heatmap, tps] = await Promise.all(requests);
-    if (request !== state.detail.statsRequest || state.detail.id !== id) return;
-    renderStatsSummary(summary); renderStatsLeaderboard(summary.leaderboard); renderStatsHeatmap(heatmap);
-    const tpsBlock = byId("stats-tps-title").closest(".stats-tps-block");
-    tpsBlock.hidden = !TICK_PROFILES.has(id);
-    if (TICK_PROFILES.has(id)) renderStatsTps(tps);
-  } catch (error) {
-    if (request !== state.detail.statsRequest) return;
-    renderStatsUnavailable(error.message || "Stats unavailable.");
-    notify(error.message || "Stats unavailable.");
+    const tps = await api(`/api/v1/profiles/${encodeURIComponent(id)}/stats/tps?window=${encodeURIComponent(selected)}`);
+    if (request === state.detail.statsTpsRequest && state.detail.id === id && state.detail.tab === "stats") renderStatsTps(tps);
+  } catch {
+    if (request === state.detail.statsTpsRequest && state.detail.id === id && state.detail.tab === "stats") renderStatsTpsUnavailable("Tick evidence could not be loaded.");
   }
 }
 
@@ -1434,6 +1510,7 @@ function patchDetail(id) {
   const operationSet = new Set(profile.operations || []);
   byId("tab-benchmarks").hidden = !operationSet.has("benchmark");
   if (state.detail.tab === "benchmarks") validateBenchmarkForm();
+  if (state.detail.tab === "stats") renderStatsHeader(id);
   const running = current === "running";
   const transitional = ["starting", "stopping"].includes(current);
   byId("detail-start").hidden = running || transitional;
@@ -2021,7 +2098,7 @@ function setupDetail() {
   byId("detail-log-query").addEventListener("input", () => { const item = state.logs.get(state.detail.id); if (item) { item.query = byId("detail-log-query").value; renderDetailLogs(item); } });
   byId("detail-log-severity").addEventListener("change", () => { const item = state.logs.get(state.detail.id); if (item) { item.severity = byId("detail-log-severity").value; renderDetailLogs(item); } });
   byId("detail-log-pause").addEventListener("click", () => { const item = state.logs.get(state.detail.id); if (item) { item.paused = !item.paused; byId("detail-log-pause").textContent = item.paused ? "Resume live logs" : "Pause live logs"; } });
-  byId("stats-window").addEventListener("change", () => { if (state.detail.tab === "stats") loadStats(state.detail.id); });
+  byId("stats-window").addEventListener("change", () => { if (state.detail.tab === "stats") loadStatsTps(state.detail.id); });
   byId("benchmark-form")?.addEventListener("submit", runBenchmark);
   byId("benchmark-baseline")?.addEventListener("change", validateBenchmarkForm);
   byId("benchmark-candidate")?.addEventListener("change", validateBenchmarkForm);
