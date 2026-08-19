@@ -107,6 +107,9 @@ def test_web_app_serves_dashboard_assets():
     assert stylesheet.headers["content-type"].startswith("text/css")
     assert ".active-slot" in stylesheet.text
     assert 'id="conn-state"' in index.text
+    assert 'id="tab-benchmarks"' in index.text
+    assert "function renderBenchmarks" in script.text
+    assert ".benchmark-verdict" in stylesheet.text
 
 
 def test_production_origin_allows_authenticated_mutation():

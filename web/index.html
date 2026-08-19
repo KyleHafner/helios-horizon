@@ -61,6 +61,7 @@
           <p class="eyebrow">active slot</p>
           <h2 id="active-slot-title">Nothing is running</h2>
           <p id="active-slot-summary" aria-live="polite"></p>
+          <p class="automation-summary" id="automation-summary"><span class="automation-summary-label">Automation</span><span class="automation-summary-value" id="automation-summary-text">No scheduled switches</span></p>
           <a class="manage-link active-manage" id="active-manage" href="#/servers/minecraft/console">Manage →</a>
         </div>
         <dl class="slot-metrics">
@@ -109,6 +110,7 @@
             <button role="tab" id="tab-stats" data-detail-tab="stats" aria-controls="panel-stats" aria-selected="false" tabindex="-1">Stats</button>
             <button role="tab" id="tab-logs" data-detail-tab="logs" aria-controls="panel-logs" aria-selected="false" tabindex="-1">Logs</button>
             <button role="tab" id="tab-backups" data-detail-tab="backups" aria-controls="panel-backups" aria-selected="false" tabindex="-1">Backups</button>
+            <button role="tab" id="tab-benchmarks" data-detail-tab="benchmarks" aria-controls="panel-benchmarks" aria-selected="false" tabindex="-1">Benchmarks</button>
             <button role="tab" id="tab-config" data-detail-tab="config" aria-controls="panel-config" aria-selected="false" tabindex="-1">Config</button>
           </div>
           <div class="detail-grid">
@@ -192,6 +194,34 @@
                 <ol class="backup-list" id="backup-list"><li class="empty-state">No backups loaded.</li></ol>
                 <p class="detail-footer">Backup schedule and retention are managed by the profile.</p>
               </section>
+              <section class="detail-panel benchmark-panel" id="panel-benchmarks" role="tabpanel" aria-labelledby="tab-benchmarks" tabindex="0" hidden>
+                <div class="benchmark-heading">
+                  <div><p class="eyebrow">Fresh-JVM A/B</p><h2>SwagBench tuning lab</h2><p class="field-hint">Runs only while the shared game slot is idle. Horizon compares identical pack, heap, seed, scenario, and load conditions.</p></div>
+                  <span class="benchmark-verdict" id="benchmark-verdict" data-verdict="unavailable">Unavailable</span>
+                </div>
+                <form class="benchmark-form" id="benchmark-form">
+                  <label for="benchmark-baseline">Baseline preset</label>
+                  <select id="benchmark-baseline" required></select>
+                  <label for="benchmark-candidate">Candidate preset</label>
+                  <select id="benchmark-candidate" required></select>
+                  <button class="button button-primary" id="benchmark-run" type="submit">Run comparison</button>
+                  <p class="field-hint" id="benchmark-status" aria-live="polite">Loading benchmark configuration…</p>
+                </form>
+                <section class="stats-block benchmark-latest" aria-labelledby="benchmark-latest-title">
+                  <div class="stats-block-heading"><div><h3 id="benchmark-latest-title">Latest evidence</h3><p class="stats-note" id="benchmark-latest-meta">No completed comparison.</p></div></div>
+                  <dl class="benchmark-diagnostics" id="benchmark-diagnostics">
+                    <div><dt>Candidate bottleneck</dt><dd id="benchmark-bottleneck">—</dd></div>
+                    <div><dt>Leak signal</dt><dd id="benchmark-leak">—</dd></div>
+                    <div><dt>Load target</dt><dd id="benchmark-load">—</dd></div>
+                    <div><dt>Median process time</dt><dd id="benchmark-duration">—</dd></div>
+                  </dl>
+                  <div class="benchmark-table-wrap"><table class="stats-table benchmark-table"><thead><tr><th scope="col">Metric</th><th scope="col">Baseline</th><th scope="col">Candidate</th><th scope="col">Delta</th><th scope="col">Verdict</th></tr></thead><tbody id="benchmark-metrics"><tr><td class="empty-state" colspan="5">No benchmark metrics recorded.</td></tr></tbody></table></div>
+                </section>
+                <section class="stats-block" aria-labelledby="benchmark-history-title">
+                  <div class="stats-block-heading"><h3 id="benchmark-history-title">Run history</h3><span class="section-meta">Last 20</span></div>
+                  <ol class="benchmark-history" id="benchmark-history"><li class="empty-state">No benchmark runs recorded.</li></ol>
+                </section>
+              </section>
               <section class="detail-panel" id="panel-config" role="tabpanel" aria-labelledby="tab-config" tabindex="0" hidden>
                 <dl class="config-list" id="config-summary"></dl>
                 <form class="settings-panel idle-stop-settings" id="idle-stop-form">
@@ -209,6 +239,19 @@
                   <p class="detail-footer" id="config-status" aria-live="polite">No changes applied.</p>
                 </form>
                 <details class="config-reference"><summary>Raw file reference</summary><p class="detail-footer">The raw profile-owned file remains read-only here. Only the typed settings above can be changed.</p></details>
+                <section class="schedule-settings" aria-labelledby="schedules-title">
+                  <div class="section-heading schedule-heading"><div><p class="eyebrow">automation</p><h2 id="schedules-title">Schedules</h2></div><span class="section-meta">live reload</span></div>
+                  <p class="field-hint schedule-note">Scheduled switches use the normal controller flow and skip when players are online. Disabled entries remain saved but will not fire.</p>
+                  <div class="schedule-list" id="schedule-list"><p class="empty-state">Loading schedules…</p></div>
+                  <form class="schedule-add" id="schedule-form">
+                    <label for="schedule-cron">Cron</label>
+                    <input id="schedule-cron" name="cron" type="text" required maxlength="128" placeholder="0 20 * * 5" autocomplete="off">
+                    <label for="schedule-profile">Profile</label>
+                    <select id="schedule-profile" name="profile" required></select>
+                    <button class="button button-small button-quiet" type="submit">Add schedule</button>
+                    <p class="field-hint" id="schedule-status" aria-live="polite"></p>
+                  </form>
+                </section>
               </section>
             </div>
             <aside class="detail-rail" aria-label="Live server summary">
@@ -355,7 +398,7 @@
           <label for="restore-backup-id">Backup ID</label><input id="restore-backup-id" required pattern="(?:[A-Za-z0-9_]|-){1,128}">
           <label for="restore-confirm-text">Type the profile name to confirm</label><input id="restore-confirm-text" autocomplete="off" required>
         </div>
-        <div class="dialog-actions sticky-actions"><button class="button button-quiet" value="cancel">Cancel</button><button class="button button-danger" id="restore-confirm" value="default" disabled>Restore backup</button></div>
+        <div class="dialog-actions sticky-actions"><button class="button button-quiet" value="cancel" formnovalidate>Cancel</button><button class="button button-danger" id="restore-confirm" value="default" disabled>Restore backup</button></div>
       </form>
     </dialog>
 

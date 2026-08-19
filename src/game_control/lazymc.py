@@ -11,6 +11,7 @@ Java process or issues a stop/restart action.
 from __future__ import annotations
 
 import json
+import os
 import time
 import urllib.error
 import urllib.request
@@ -25,6 +26,7 @@ CAPABILITY_WAKE_URL = "http://127.0.0.1:8444/api/v1/capability/wake"
 CAPABILITY_STATUS_URL = "http://127.0.0.1:8444/api/v1/capability/status"
 CAPABILITY_AUDIENCE = "lazymc"
 WAKE_TOKEN_CREDENTIAL = Path("/run/credentials/lazymc-minecraft.service/wake-token")
+SYSTEMD_CREDENTIAL_ROOT = Path("/run/credentials")
 REQUEST_TIMEOUT_SECONDS = 5.0
 STARTUP_GRACE_SECONDS = 600.0
 POLL_INTERVAL_SECONDS = 2.0
@@ -38,11 +40,24 @@ class LazyWakeError(Exception):
         self.retryable = retryable
 
 
-def load_waker_token(path: Path = WAKE_TOKEN_CREDENTIAL) -> str:
-    if Path(path) != WAKE_TOKEN_CREDENTIAL:
+def wake_token_credential() -> Path:
+    """Return this unit's systemd-provided wake-token path, fail closed."""
+    directory = os.environ.get("CREDENTIALS_DIRECTORY")
+    if not directory:
+        return WAKE_TOKEN_CREDENTIAL
+    credential_dir = Path(directory)
+    if not credential_dir.is_absolute() or credential_dir.parent != SYSTEMD_CREDENTIAL_ROOT:
+        raise LazyWakeError("systemd credential directory is not approved", retryable=False)
+    return credential_dir / "wake-token"
+
+
+def load_waker_token(path: Path | None = None) -> str:
+    approved_path = wake_token_credential()
+    token_path = approved_path if path is None else Path(path)
+    if token_path != approved_path:
         raise LazyWakeError("wake credential path is not approved", retryable=False)
     try:
-        token = Path(path).read_text(encoding="utf-8")
+        token = token_path.read_text(encoding="utf-8")
     except OSError as exc:
         raise LazyWakeError("wake credential is unavailable", retryable=False) from exc
     token = token.strip()
@@ -178,7 +193,7 @@ class LazyWakeClient:
             self.sleep(RUNNING_POLL_INTERVAL_SECONDS)
 
 
-def run_wake_hook(*, token_path: Path = WAKE_TOKEN_CREDENTIAL) -> int:
+def run_wake_hook(*, token_path: Path | None = None) -> int:
     try:
         client = LazyWakeClient(load_waker_token(token_path))
         client.wake_and_wait()
@@ -200,4 +215,5 @@ __all__ = [
     "WAKE_TOKEN_CREDENTIAL",
     "load_waker_token",
     "run_wake_hook",
+    "wake_token_credential",
 ]

@@ -62,8 +62,27 @@ _STATE_TABLES = (
         profile_id TEXT NOT NULL,
         created_at TEXT NOT NULL CHECK (is_rfc3339_timestamp(created_at) = 1),
         size_bytes INTEGER NOT NULL,
-        verified INTEGER NOT NULL,
-        protected INTEGER NOT NULL
+        verified INTEGER NOT NULL CHECK (verified IN (0, 1)),
+        protected INTEGER NOT NULL CHECK (protected IN (0, 1))
+    )
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS backup_protections (
+        backup_id TEXT NOT NULL REFERENCES backups(id) ON DELETE RESTRICT,
+        profile_id TEXT NOT NULL,
+        destination_id TEXT NOT NULL CHECK (destination_id IN ('horizon-b2')),
+        backup_class TEXT NOT NULL CHECK (backup_class IN ('application', 'full-lxc')),
+        remote_key TEXT NOT NULL,
+        local_sha256 TEXT NOT NULL,
+        local_verified INTEGER NOT NULL CHECK (local_verified IN (0, 1)),
+        upload_state TEXT NOT NULL CHECK (upload_state IN ('not_started', 'pending', 'succeeded', 'failed')),
+        remote_verified INTEGER NOT NULL CHECK (remote_verified IN (0, 1)),
+        comparison_state TEXT NOT NULL CHECK (comparison_state IN ('not_started', 'pending', 'verified', 'failed')),
+        prune_state TEXT NOT NULL CHECK (prune_state IN ('not_started', 'pending', 'succeeded', 'failed', 'deleted')),
+        updated_at TEXT NOT NULL CHECK (is_rfc3339_timestamp(updated_at) = 1),
+        error_code TEXT,
+        PRIMARY KEY (backup_id, destination_id, backup_class),
+        UNIQUE (remote_key)
     )
     """,
     """
@@ -121,6 +140,21 @@ _STATE_TABLES = (
         metric TEXT NOT NULL CHECK (metric IN ('tps', 'mspt', 'players') OR metric LIKE 'perf.%'),
         ts TEXT NOT NULL CHECK (is_rfc3339_timestamp(ts) = 1),
         value REAL NOT NULL
+    )
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS benchmark_runs (
+        id TEXT PRIMARY KEY,
+        profile_id TEXT NOT NULL,
+        baseline_preset TEXT NOT NULL,
+        candidate_preset TEXT NOT NULL,
+        state TEXT NOT NULL CHECK (state IN ('running', 'succeeded', 'failed')),
+        created_at TEXT NOT NULL CHECK (is_rfc3339_timestamp(created_at) = 1),
+        finished_at TEXT CHECK (finished_at IS NULL OR is_rfc3339_timestamp(finished_at) = 1),
+        overall_verdict TEXT CHECK (overall_verdict IS NULL OR overall_verdict IN ('better', 'worse', 'mixed', 'inconclusive')),
+        summary_json TEXT,
+        artifact_path TEXT,
+        error_code TEXT
     )
     """,
 )
@@ -185,7 +219,10 @@ def _migrate_state(connection: sqlite3.Connection) -> None:
     ).fetchone()[0] or ""
     if "OR metric LIKE 'perf.%'" not in metric_sql:
         connection.execute("ALTER TABLE metric_samples RENAME TO metric_samples_legacy")
-        connection.execute(_STATE_TABLES[-1])
+        metric_statement = next(
+            statement for statement in _STATE_TABLES if "CREATE TABLE IF NOT EXISTS metric_samples" in statement
+        )
+        connection.execute(metric_statement)
         connection.execute(
             "INSERT INTO metric_samples(profile_id, metric, ts, value) "
             "SELECT profile_id, metric, ts, value FROM metric_samples_legacy"
@@ -240,7 +277,15 @@ def _migrate_state(connection: sqlite3.Connection) -> None:
         "CREATE INDEX IF NOT EXISTS idx_metric_samples"
         " ON metric_samples(profile_id, metric, ts)"
     )
-    connection.execute("PRAGMA user_version = 2")
+    connection.execute(
+        "CREATE INDEX IF NOT EXISTS idx_backup_protections_scope"
+        " ON backup_protections(profile_id, destination_id, backup_class, remote_verified, comparison_state)"
+    )
+    connection.execute(
+        "CREATE INDEX IF NOT EXISTS idx_benchmark_runs_profile"
+        " ON benchmark_runs(profile_id, created_at DESC)"
+    )
+    connection.execute("PRAGMA user_version = 3")
 
 
 def prune_metric_samples(

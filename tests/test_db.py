@@ -34,12 +34,14 @@ def test_state_database_migrates_with_append_only_operational_tables(tmp_path: P
         "jobs",
         "confirmations",
         "backups",
+        "backup_protections",
         "notification_rules",
         "notification_deliveries",
         "updates",
         "rpc_idempotency",
         "player_sessions",
         "metric_samples",
+        "benchmark_runs",
     }
     assert set(db.connection.execute("select name from sqlite_master where type='table'").fetchall()) == {
         (name,) for name in expected
@@ -67,7 +69,49 @@ def test_fresh_jobs_schema_has_integer_completion_sequence(tmp_path: Path, monke
         for row in db.connection.execute("PRAGMA table_info(jobs)")
     }
     assert columns["completion_seq"].upper() == "INTEGER"
-    assert db.connection.execute("PRAGMA user_version").fetchone()[0] == 2
+    assert db.connection.execute("PRAGMA user_version").fetchone()[0] == 3
+    db.close()
+
+
+def test_backup_protection_schema_rejects_orphans_invalid_states_and_duplicate_keys(
+    tmp_path: Path, monkeypatch
+):
+    directory = tmp_path / "state"
+    _chmod_tree(directory)
+    path = directory / "state.db"
+    monkeypatch.setattr(state_db_module, "STATE_DB_PATH", path)
+    db = StateDatabase.open(path)
+    timestamp = "2026-08-05T00:00:00+00:00"
+    with pytest.raises(sqlite3.IntegrityError):
+        db.connection.execute(
+            "INSERT INTO backup_protections(backup_id,profile_id,destination_id,backup_class,remote_key,"
+            "local_sha256,local_verified,upload_state,remote_verified,comparison_state,prune_state,updated_at) "
+            "VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
+            ("missing", "minecraft-sunlit-cobblemon", "horizon-b2", "application", "helios/horizon/app/minecraft-sunlit-cobblemon/x.tar.zst", "sha", 1, "succeeded", 1, "verified", "succeeded", timestamp),
+        )
+    db.connection.execute(
+        "INSERT INTO backups(id,profile_id,created_at,size_bytes,verified,protected) VALUES(?,?,?,?,?,?)",
+        ("b1", "minecraft-sunlit-cobblemon", timestamp, 1, 1, 0),
+    )
+    db.connection.execute(
+        "INSERT INTO backups(id,profile_id,created_at,size_bytes,verified,protected) VALUES(?,?,?,?,?,?)",
+        ("b2", "minecraft-sunlit-cobblemon", timestamp, 1, 1, 0),
+    )
+    values = ("b1", "minecraft-sunlit-cobblemon", "horizon-b2", "application", "helios/horizon/app/minecraft-sunlit-cobblemon/x.tar.zst", "sha", 1, "succeeded", 1, "verified", "succeeded", timestamp)
+    db.connection.execute(
+        "INSERT INTO backup_protections(backup_id,profile_id,destination_id,backup_class,remote_key,"
+        "local_sha256,local_verified,upload_state,remote_verified,comparison_state,prune_state,updated_at) "
+        "VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
+        values,
+    )
+    with pytest.raises(sqlite3.IntegrityError):
+        db.connection.execute(
+            "INSERT INTO backup_protections(backup_id,profile_id,destination_id,backup_class,remote_key,"
+            "local_sha256,local_verified,upload_state,remote_verified,comparison_state,prune_state,updated_at) "
+            "VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
+            ("b2", "minecraft-sunlit-cobblemon", "horizon-b2", "application", values[4], "sha", 1, "bogus", 1, "verified", "succeeded", timestamp),
+        )
+    db.close()
 
 
 def test_legacy_jobs_migration_backfills_absolute_chronological_completion_sequence(
@@ -132,7 +176,7 @@ def test_legacy_jobs_migration_backfills_absolute_chronological_completion_seque
     assert db.connection.execute(
         "SELECT id,completion_seq FROM jobs ORDER BY completion_seq"
     ).fetchall() == [("row-c", 1), ("row-a", 2), ("row-b", 3)]
-    assert db.connection.execute("PRAGMA user_version").fetchone()[0] == 2
+    assert db.connection.execute("PRAGMA user_version").fetchone()[0] == 3
     db.close()
 
     reopened = StateDatabase.open(path)
@@ -159,6 +203,7 @@ def test_state_audit_and_events_are_append_only(tmp_path: Path, monkeypatch):
         db.connection.execute("update events set message='bad' where id='e1'")
     with pytest.raises(sqlite3.IntegrityError):
         db.connection.execute("delete from audit where id='a1'")
+    db.close()
 
 
 def test_insert_or_replace_cannot_rewrite_events_or_audit(tmp_path: Path, monkeypatch):
@@ -187,6 +232,7 @@ def test_insert_or_replace_cannot_rewrite_events_or_audit(tmp_path: Path, monkey
         )
     assert db.connection.execute("select message from events where id='e1'").fetchone()[0] == "original"
     assert db.connection.execute("select detail from audit where id='a1'").fetchone()[0] == "original"
+    db.close()
 
 
 def test_state_database_rejects_non_rfc3339_timestamp(tmp_path: Path, monkeypatch):
@@ -199,6 +245,7 @@ def test_state_database_rejects_non_rfc3339_timestamp(tmp_path: Path, monkeypatc
             "insert into events (id, timestamp, code, message) values (?, ?, ?, ?)",
             ("bad", "2026-07-11 12:00:00", "started", "bad"),
         )
+    db.close()
 
 
 def test_state_migration_rolls_back_partial_ddl(tmp_path: Path, monkeypatch):
@@ -231,6 +278,7 @@ def test_state_accepts_arbitrary_rfc3339_secfrac(tmp_path: Path, monkeypatch):
         "insert into events (id, timestamp, code, message) values (?, ?, ?, ?)",
         ("fractional", "2026-07-11T12:00:00.123456789+00:00", "started", "ok"),
     )
+    db.close()
 
 
 def test_web_database_isolated_and_idempotent(tmp_path: Path, monkeypatch):
@@ -305,6 +353,7 @@ def test_web_accepts_arbitrary_rfc3339_secfrac(tmp_path: Path, monkeypatch):
             "2026-07-11T13:00:00.123456789Z",
         ),
     )
+    db.close()
 
 
 def test_database_rejects_unapproved_paths_and_permissions(tmp_path: Path):

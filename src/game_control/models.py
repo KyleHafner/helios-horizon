@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import ipaddress
 from enum import StrEnum
 from pathlib import Path
 from typing import Literal
@@ -56,6 +57,14 @@ class OperationName(StrEnum):
     CLONE_TARGET = "clone_target"
     UPDATE_CHECK = "update_check"
     UPDATE_APPLY = "update_apply"
+    BENCHMARK = "benchmark"
+
+
+class BackupDestination(StrEnum):
+    """Reviewed backup destinations; values are safe RPC selectors only."""
+
+    LOCAL = "local"
+    HORIZON_B2 = "horizon-b2"
 
 
 class NotificationEvent(StrEnum):
@@ -70,13 +79,6 @@ class NotificationEvent(StrEnum):
     UPDATE_COMPLETE = "update_complete"
     UPDATE_FAILURE = "update_failure"
     IDLE_STOP = "idle_stop"
-
-
-class BackupDestination(StrEnum):
-    """Reviewed backup destinations; values are safe RPC selectors only."""
-
-    LOCAL = "local"
-    HORIZON_B2 = "horizon-b2"
 
 
 class StrictFrozenModel(BaseModel):
@@ -154,19 +156,16 @@ class UpdateSpec(StrictFrozenModel):
     )
     version_command: tuple[str, ...] = ()
 
-    @field_validator("download_url")
-    @classmethod
-    def secure_download_url(cls, value: AnyHttpUrl | None) -> AnyHttpUrl | None:
-        if value is not None and value.scheme != "https" and value.host not in {
-            "127.0.0.1",
-            "localhost",
-            "::1",
-        }:
-            raise ValueError("external release downloads require HTTPS")
-        return value
-
     @model_validator(mode="after")
     def fields_match_kind(self):
+        if self.download_url is not None and self.download_url.scheme == "http":
+            host = self.download_url.host
+            try:
+                local_http = ipaddress.ip_address(host).is_loopback
+            except ValueError:
+                local_http = host.lower() == "localhost"
+            if not local_http:
+                raise ValueError("release update URLs require HTTPS")
         if self.kind == "manual" and any(
             (
                 self.app_id,

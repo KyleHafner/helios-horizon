@@ -23,8 +23,9 @@ from .adapters.systemd import SystemdAdapter
 from .profile import ProfileRegistry
 from .slot import ReservationStore, SlotInspector
 from .state_db import StateDatabase, STATE_DB_PATH
-from .models import AdapterKind
+from .models import AdapterKind, HealthState
 from .service_wiring import build_service_seams
+from .rcon import RCON_HOST, RCON_PASSWORD_PATH, RCON_PORT, RconClient
 from .schedule import parse_schedule
 from .protocol import (
     MAX_REQUEST_BYTES,
@@ -168,13 +169,20 @@ class UnixRpcServer:
     ) -> None:
         sock = writer.get_extra_info("socket")
         request_id = UUID(int=0)
+        request_kind = "unknown"
+        actor = "unknown"
         try:
             if sock is None:
                 raise PermissionError("peer socket unavailable")
             _pid, uid, gid = self.peer_credentials(sock)
             if not self.authorize_peer(uid, gid):
                 response = failure(request_id, ErrorCode.UNAUTHORIZED_PEER, "unauthorized peer")
-                await self._write(writer, response_json(response))
+                await self._write(
+                    writer,
+                    response_json(response),
+                    request_kind="unauthorized_peer",
+                    actor=actor,
+                )
                 return
             try:
                 data = await asyncio.wait_for(
@@ -182,20 +190,37 @@ class UnixRpcServer:
                 )
             except (asyncio.LimitOverrunError, asyncio.IncompleteReadError, asyncio.TimeoutError) as exc:
                 response = failure(request_id, ErrorCode.INVALID_REQUEST, "invalid request")
-                await self._write(writer, response_json(response))
+                await self._write(
+                    writer,
+                    response_json(response),
+                    request_kind="invalid_request",
+                    actor=actor,
+                )
                 return
             if len(data) > MAX_REQUEST_BYTES:
                 response = failure(request_id, ErrorCode.INVALID_REQUEST, "request too large")
-                await self._write(writer, response_json(response))
+                await self._write(
+                    writer,
+                    response_json(response),
+                    request_kind="invalid_request",
+                    actor=actor,
+                )
                 return
             try:
                 request = parse_request_line(data)
                 request_id = request.request_id
+                request_kind = request.action.kind
+                actor = request.actor
             except ValueError:
                 response = failure(request_id, ErrorCode.INVALID_REQUEST, "invalid request")
             else:
                 response = await self.controller.execute(request)
-            await self._write(writer, response_json(response))
+            await self._write(
+                writer,
+                response_json(response),
+                request_kind=request_kind,
+                actor=actor,
+            )
         except Exception:
             incident = os.urandom(8).hex()
             _LOG.exception("socket incident %s", incident)
@@ -215,9 +240,18 @@ class UnixRpcServer:
                 pass
 
     @staticmethod
-    async def _write(writer: asyncio.StreamWriter, data: bytes) -> None:
-        writer.write(data)
-        await asyncio.wait_for(writer.drain(), timeout=WRITE_TIMEOUT_SECONDS)
+    async def _write(
+        writer: asyncio.StreamWriter,
+        data: bytes,
+        *,
+        request_kind: str,
+        actor: str,
+    ) -> None:
+        try:
+            writer.write(data)
+            await asyncio.wait_for(writer.drain(), timeout=WRITE_TIMEOUT_SECONDS)
+        except (BrokenPipeError, ConnectionResetError):
+            _LOG.warning("RPC peer disconnected while writing %s for actor %s", request_kind, actor)
 
 
 RpcServer = UnixRpcServer
@@ -259,9 +293,27 @@ def build_controller(config_path: str | os.PathLike[str] = ROOT_CONFIG) -> Contr
         }
     if not isinstance(crafty_cfg, dict):
         raise RuntimeError("invalid Crafty configuration")
+    rcon_config = config.get("rcon", {})
+    if not isinstance(rcon_config, dict):
+        raise RuntimeError("invalid RCON configuration")
+    rcon_host = rcon_config.get("host", RCON_HOST)
+    rcon_port = rcon_config.get("port", RCON_PORT)
+    rcon_password_path = Path(rcon_config.get("password_path", RCON_PASSWORD_PATH))
+    if not isinstance(rcon_host, str) or isinstance(rcon_port, bool) or not isinstance(rcon_port, int):
+        raise RuntimeError("invalid RCON configuration")
+    rcon_kwargs = {"host": rcon_host, "port": rcon_port, "password_path": rcon_password_path}
+    if any(
+        (
+            rcon_kwargs["host"] != RCON_HOST,
+            rcon_kwargs["port"] != RCON_PORT,
+            rcon_kwargs["password_path"] != RCON_PASSWORD_PATH,
+        )
+    ):
+        raise RuntimeError("RCON endpoint is not approved")
     adapters = {}
     crafty = None
     secret_values: list[str] = []
+    sunlit_rcon = None
     for profile in registry:
         if profile.adapter is AdapterKind.CRAFTY:
             if crafty is None:
@@ -278,7 +330,11 @@ def build_controller(config_path: str | os.PathLike[str] = ROOT_CONFIG) -> Contr
                 )
             adapters[profile.id] = crafty
         else:
-            adapters[profile.id] = SystemdAdapter()
+            if profile.id.value == "minecraft-sunlit-cobblemon":
+                sunlit_rcon = RconClient(**rcon_kwargs)
+                adapters[profile.id] = SystemdAdapter(rcon=sunlit_rcon)
+            else:
+                adapters[profile.id] = SystemdAdapter()
     inspector = SlotInspector()
 
     async def await_free_slot(timeout_seconds: float = 30.0):
@@ -286,6 +342,13 @@ def build_controller(config_path: str | os.PathLike[str] = ROOT_CONFIG) -> Contr
 
     async def await_ready(profile):
         adapter = adapters[profile.id]
+        if profile.adapter is AdapterKind.SYSTEMD:
+            return await _await_systemd_profile_ready(
+                services.status,
+                inspector,
+                profile,
+                profile.health_timeout_seconds,
+            )
         deadline = asyncio.get_running_loop().time() + profile.health_timeout_seconds
         while True:
             try:
@@ -306,6 +369,9 @@ def build_controller(config_path: str | os.PathLike[str] = ROOT_CONFIG) -> Contr
     stats_config = config.get("stats", {})
     if not isinstance(stats_config, dict):
         raise RuntimeError("invalid stats configuration")
+    benchmark_config = config.get("benchmark")
+    if benchmark_config is not None and not isinstance(benchmark_config, list):
+        raise RuntimeError("invalid benchmark configuration")
     services = build_service_seams(
         registry,
         adapters,
@@ -313,6 +379,7 @@ def build_controller(config_path: str | os.PathLike[str] = ROOT_CONFIG) -> Contr
         inspector,
         secret_values=tuple(secret_values),
         stats_config=stats_config,
+        benchmark_config=benchmark_config,
     )
     if services.session_store is not None:
         services.session_store.recover(now=datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"))
@@ -328,6 +395,7 @@ def build_controller(config_path: str | os.PathLike[str] = ROOT_CONFIG) -> Contr
         boot_profile=boot_profile,
         boot_autostart=boot_autostart,
         schedules=schedules,
+        schedule_config_path=config_file,
     )
 
 
@@ -349,6 +417,54 @@ async def _await_free_slot(
         await asyncio.sleep(min(poll_interval, remaining))
 
 
+async def _await_systemd_profile_ready(
+    status_service,
+    inspector: SlotInspector,
+    profile,
+    timeout_seconds: float,
+    *,
+    poll_interval: float = 0.25,
+) -> bool:
+    """Require slot, process identity, health, and listeners before lease release."""
+
+    deadline = asyncio.get_running_loop().time() + max(0.0, timeout_seconds)
+    expected_profile = getattr(profile.id, "value", profile.id)
+    while True:
+        try:
+            snapshot = status_service.snapshot()
+            if inspect.isawaitable(snapshot):
+                snapshot = await snapshot
+            status = next(
+                item
+                for item in snapshot.profiles
+                if getattr(getattr(item, "profile_id", None), "value", getattr(item, "profile_id", None))
+                == expected_profile
+            )
+            slot = inspector.observe()
+            if inspect.isawaitable(slot):
+                slot = await slot
+            owner = getattr(getattr(slot, "owner", None), "value", getattr(slot, "owner", None))
+            health = getattr(getattr(status, "health", None), "value", getattr(status, "health", None))
+            pid = getattr(status, "pid", None)
+            if (
+                owner == expected_profile
+                and not bool(getattr(slot, "inconsistent", False))
+                and isinstance(pid, int)
+                and not isinstance(pid, bool)
+                and pid > 0
+                and getattr(slot, "pid", None) == pid
+                and health == HealthState.HEALTHY.value
+                and getattr(status, "required_ports_ready", False) is True
+            ):
+                return True
+        except Exception:
+            pass
+        remaining = deadline - asyncio.get_running_loop().time()
+        if remaining <= 0:
+            return False
+        await asyncio.sleep(min(poll_interval, remaining))
+
+
 async def serve() -> None:
     controller = build_controller()
     server = UnixRpcServer(controller)
@@ -358,14 +474,27 @@ async def serve() -> None:
     tps_sampler = getattr(controller.services, "tps_sampler", None)
 
     async def minecraft_running() -> bool:
+        minecraft_id = (
+            "minecraft-sunlit-cobblemon"
+            if any(
+                getattr(getattr(item, "id", None), "value", getattr(item, "id", None))
+                == "minecraft-sunlit-cobblemon"
+                for item in controller.profiles
+            )
+            else "minecraft"
+        )
         inspector = controller.slot_inspector
         if inspector is not None:
             slot = inspector.observe()
             owner = getattr(slot, "owner", None)
-            if getattr(owner, "value", owner) != "minecraft":
+            if getattr(owner, "value", owner) != minecraft_id:
                 return False
         profile = next(
-            (item for item in controller.profiles if getattr(getattr(item, "id", None), "value", getattr(item, "id", None)) == "minecraft"),
+            (
+                item
+                for item in controller.profiles
+                if getattr(getattr(item, "id", None), "value", getattr(item, "id", None)) == minecraft_id
+            ),
             None,
         )
         if profile is None:

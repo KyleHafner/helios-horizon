@@ -13,10 +13,11 @@ from enum import StrEnum
 from typing import Annotated, Any, Literal, TypeAlias
 from uuid import UUID
 
-from pydantic import BaseModel, ConfigDict, Field, TypeAdapter, ValidationError, field_validator
+from pydantic import BaseModel, ConfigDict, Field, StrictBool, TypeAdapter, ValidationError, field_validator, model_validator
 
 from .models import (
     AdapterKind,
+    BackupDestination,
     HealthState,
     NotificationEvent,
     ObservedState,
@@ -116,10 +117,63 @@ class GetProfileConfig(RpcModel):
     profile_id: ProfileId
 
 
+class GetBenchmarks(RpcModel):
+    kind: Literal["get_benchmarks"]
+    profile_id: ProfileId
+
+
+class RunBenchmark(RpcModel):
+    kind: Literal["run_benchmark"]
+    profile_id: ProfileId
+    baseline_preset: str = Field(pattern=r"^[a-z0-9][a-z0-9_-]{0,31}$")
+    candidate_preset: str = Field(pattern=r"^[a-z0-9][a-z0-9_-]{0,31}$")
+
+    @model_validator(mode="after")
+    def presets_must_differ(self):
+        if self.baseline_preset == self.candidate_preset:
+            raise ValueError("baseline and candidate presets must differ")
+        return self
+
+
 class SetProfileConfig(RpcModel):
     kind: Literal["set_profile_config"]
     profile_id: ProfileId
     changes: dict[str, Any] = Field(min_length=1, max_length=16)
+
+
+class ScheduleSpec(RpcModel):
+    cron: str = Field(min_length=9, max_length=128)
+    profile: ProfileId
+    enabled: StrictBool = True
+    backup_destination: BackupDestination | None = None
+
+    @field_validator("cron")
+    @classmethod
+    def validate_cron_text(cls, value: str) -> str:
+        if any(ord(character) < 0x20 or ord(character) == 0x7F for character in value):
+            raise ValueError("cron contains a control character")
+        return value.strip()
+
+
+class GetSchedules(RpcModel):
+    kind: Literal["get_schedules"]
+
+
+class SetSchedules(RpcModel):
+    kind: Literal["set_schedules"]
+    entries: tuple[ScheduleSpec, ...] = Field(max_length=64)
+
+
+class ScheduleView(RpcModel):
+    cron: str
+    profile: ProfileId
+    next_fire: datetime | None
+    enabled: bool = True
+    backup_destination: BackupDestination | None = None
+
+
+class ScheduleResponse(RpcModel):
+    schedules: tuple[ScheduleView, ...]
 
 
 class ProfileConfigEntry(RpcModel):
@@ -136,6 +190,53 @@ class ProfileConfigResponse(RpcModel):
     settings: tuple[ProfileConfigEntry, ...]
     changed: tuple[str, ...] = ()
     restart_required: tuple[str, ...] = ()
+
+
+class BenchmarkPresetView(RpcModel):
+    id: str = Field(pattern=r"^[a-z0-9][a-z0-9_-]{0,31}$")
+    label: str = Field(min_length=1, max_length=64)
+
+
+class BenchmarkMetricView(RpcModel):
+    name: str = Field(pattern=r"^[A-Za-z0-9_.-]{1,128}$")
+    baseline_median: float = Field(alias="baselineMedian")
+    candidate_median: float = Field(alias="candidateMedian")
+    delta: float
+    delta_percent: float = Field(alias="deltaPercent")
+    ci_low: float = Field(alias="ciLow")
+    ci_high: float = Field(alias="ciHigh")
+    verdict: Literal["better", "worse", "inconclusive"]
+
+
+class BenchmarkDiagnosticsView(RpcModel):
+    dominant_bottleneck: str | None = Field(default=None, alias="dominantBottleneck", pattern=r"^[A-Za-z0-9_.-]{1,64}$")
+    leak_suspected: bool | None = Field(default=None, alias="leakSuspected")
+    post_gc_slope_bytes_per_minute_median: float | None = Field(default=None, alias="postGcSlopeBytesPerMinuteMedian")
+    load_reached_target: bool | None = Field(default=None, alias="loadReachedTarget")
+    peak_connected_clients_median: float | None = Field(default=None, alias="peakConnectedClientsMedian", ge=0)
+    process_duration_seconds_median: float | None = Field(default=None, alias="processDurationSecondsMedian", ge=0)
+
+
+class BenchmarkRunSummary(RpcModel):
+    id: str = Field(pattern=r"^[A-Za-z0-9_-]{1,128}$")
+    profile_id: ProfileId
+    baseline_preset: str = Field(pattern=r"^[a-z0-9][a-z0-9_-]{0,31}$")
+    candidate_preset: str = Field(pattern=r"^[a-z0-9][a-z0-9_-]{0,31}$")
+    state: Literal["running", "succeeded", "failed"]
+    created_at: datetime
+    finished_at: datetime | None
+    overall_verdict: Literal["better", "worse", "mixed", "inconclusive"] | None
+    metrics: tuple[BenchmarkMetricView, ...] = Field(default=(), max_length=64)
+    baseline_diagnostics: BenchmarkDiagnosticsView | None = None
+    candidate_diagnostics: BenchmarkDiagnosticsView | None = None
+    error_code: str | None = Field(default=None, pattern=r"^[a-z0-9_]{1,64}$")
+
+
+class BenchmarkOverview(RpcModel):
+    profile_id: ProfileId
+    available: bool
+    presets: tuple[BenchmarkPresetView, ...] = Field(max_length=16)
+    runs: tuple[BenchmarkRunSummary, ...] = Field(max_length=20)
 
 
 class ListAudit(RpcModel):
@@ -218,6 +319,7 @@ class CreateBackup(RpcModel):
     kind: Literal["create_backup"]
     profile_id: ProfileId
     protected: bool = False
+    destination: BackupDestination = BackupDestination.LOCAL
 
 
 class PrepareRestore(RpcModel):
@@ -286,7 +388,11 @@ RpcAction: TypeAlias = Annotated[
     | GetStatsHeatmap
     | GetStatsTps
     | GetProfileConfig
+    | GetBenchmarks
+    | RunBenchmark
     | SetProfileConfig
+    | GetSchedules
+    | SetSchedules
     | ListAudit
     | Start
     | Stop
@@ -332,6 +438,7 @@ class ErrorCode(StrEnum):
     BACKUP_FAILED = "backup_failed"
     RESTORE_FAILED = "restore_failed"
     UPDATE_FAILED = "update_failed"
+    BENCHMARK_FAILED = "benchmark_failed"
     CONFIRMATION_EXPIRED = "confirmation_expired"
     CONFIRMATION_MISMATCH = "confirmation_mismatch"
     REQUEST_ID_CONFLICT = "request_id_conflict"
@@ -561,6 +668,8 @@ RpcResult: TypeAlias = (
     | UpdateStatus
     | NotificationConfig
     | ProfileConfigResponse
+    | BenchmarkOverview
+    | ScheduleResponse
     | dict[str, Any]
 )
 
@@ -647,7 +756,6 @@ __all__ = [
     "RpcAction",
     "Command",
     "RpcRequest",
-    "RpcProvenance",
     "RpcResponse",
     "RpcSuccess",
     "RpcFailure",
@@ -672,6 +780,11 @@ __all__ = [
     "GetStatsTps",
     "GetProfileConfig",
     "SetProfileConfig",
+    "GetSchedules",
+    "SetSchedules",
+    "ScheduleSpec",
+    "ScheduleView",
+    "ScheduleResponse",
     "AuditSummary",
     "AuditPage",
     "JobAccepted",

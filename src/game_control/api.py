@@ -33,7 +33,11 @@ from .protocol import (
     GetStatsSummary,
     GetStatsTps,
     GetProfileConfig,
+    GetBenchmarks,
     SetProfileConfig,
+    GetSchedules,
+    ScheduleSpec,
+    SetSchedules,
     ListAudit,
     ListBackups,
     ListEvents,
@@ -45,6 +49,7 @@ from .protocol import (
     PrepareUpdate,
     PrepareWorldClone,
     Restart,
+    RunBenchmark,
     RpcAction,
     RpcFailure,
     RpcProvenance,
@@ -58,7 +63,7 @@ from .protocol import (
     SwitchOptions,
     TestNotification,
 )
-from .models import NotificationEvent, ProfileId
+from .models import BackupDestination, NotificationEvent, ProfileId
 
 
 class StrictBody(BaseModel):
@@ -79,6 +84,7 @@ class ConfirmBody(StrictBody):
 
 class BackupBody(StrictBody):
     protected: bool = False
+    destination: BackupDestination = BackupDestination.LOCAL
 
 
 class RestoreBody(StrictBody):
@@ -111,6 +117,22 @@ class IdleStopBody(StrictBody):
         return value
 
 
+class SchedulesBody(StrictBody):
+    entries: tuple[ScheduleSpec, ...] = Field(max_length=64)
+
+
+class BenchmarkBody(StrictBody):
+    baseline_preset: str = Field(pattern=r"^[a-z0-9][a-z0-9_-]{0,31}$")
+    candidate_preset: str = Field(pattern=r"^[a-z0-9][a-z0-9_-]{0,31}$")
+
+    @field_validator("candidate_preset")
+    @classmethod
+    def presets_differ(cls, value: str, info):
+        if value == info.data.get("baseline_preset"):
+            raise ValueError("baseline and candidate presets must differ")
+        return value
+
+
 ROUTE_ACTIONS: dict[str, type] = {
     "GET /api/v1/status": GetStatus,
     "GET /api/v1/profiles": GetProfiles,
@@ -121,6 +143,8 @@ ROUTE_ACTIONS: dict[str, type] = {
     "GET /api/v1/profiles/{profile_id}/stats/heatmap": GetStatsHeatmap,
     "GET /api/v1/profiles/{profile_id}/stats/tps": GetStatsTps,
     "GET /api/v1/profiles/{profile_id}/config": GetProfileConfig,
+    "GET /api/v1/profiles/{profile_id}/benchmarks": GetBenchmarks,
+    "GET /api/v1/schedules": GetSchedules,
     "GET /api/v1/events": ListEvents,
     "GET /api/v1/audit": ListAudit,
     "POST /api/v1/profiles/{profile_id}/start": Start,
@@ -148,6 +172,8 @@ ROUTE_ACTIONS: dict[str, type] = {
     "PATCH /api/v1/profiles/{profile_id}/idle-stop": SetIdleStop,
     "POST /api/v1/profiles/{profile_id}/notifications/test": TestNotification,
     "POST /api/v1/profiles/{profile_id}/config": SetProfileConfig,
+    "POST /api/v1/profiles/{profile_id}/benchmarks": RunBenchmark,
+    "POST /api/v1/schedules": SetSchedules,
     "POST /api/v1/notifications/test": TestNotification,
 }
 
@@ -229,8 +255,21 @@ def _action(path: str, method: str, profile_id: ProfileId | None, payload: Mappi
             if payload:
                 raise HTTPException(422, "invalid request")
             return GetProfileConfig(kind="get_profile_config", profile_id=profile_id)
+        if action_type is GetBenchmarks:
+            if payload:
+                raise HTTPException(422, "invalid request")
+            return GetBenchmarks(kind="get_benchmarks", profile_id=profile_id)
+        if action_type is RunBenchmark:
+            body = BenchmarkBody.model_validate(payload)
+            return RunBenchmark(kind="run_benchmark", profile_id=profile_id, **body.model_dump())
+        if action_type is GetSchedules:
+            if payload:
+                raise HTTPException(422, "invalid request")
+            return GetSchedules(kind="get_schedules")
         if action_type is SetProfileConfig:
             return SetProfileConfig(kind="set_profile_config", profile_id=profile_id, changes=payload.get("changes", {}))
+        if action_type is SetSchedules:
+            return SetSchedules(kind="set_schedules", entries=SchedulesBody.model_validate(payload).entries)
         if action_type is ListAudit:
             return ListAudit(kind="list_audit", page=_page(request))
         if action_type is Start:
@@ -447,6 +486,14 @@ def add_api_routes(
     @router.get("/profiles/{profile_id}/config")
     async def profile_config(profile_id: ProfileId, request: Request, response: Response):
         return await invoke(request, response, profile_id=profile_id, payload={})
+
+    @router.get("/profiles/{profile_id}/benchmarks")
+    async def benchmarks(profile_id: ProfileId, request: Request, response: Response):
+        return await invoke(request, response, profile_id=profile_id, payload={})
+
+    @router.get("/schedules")
+    async def schedules(request: Request, response: Response):
+        return await invoke(request, response, profile_id=None, payload={})
 
     async def mutation(request: Request, response: Response, profile_id: ProfileId | None = None):
         try:

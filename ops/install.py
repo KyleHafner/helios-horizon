@@ -23,6 +23,7 @@ TMPFILES = PACKAGE_ROOT / "ops/tmpfiles/game-control.conf"
 SLOT_RUNNER = PACKAGE_ROOT / "ops/bin/game-slot-run"
 CONSOLE_STOPPER = PACKAGE_ROOT / "ops/bin/game-console-stop"
 CONSOLE_COMMAND = PACKAGE_ROOT / "ops/bin/game-console-command"
+BENCHMARK_IMPORT = PACKAGE_ROOT / "ops/bin/horizon-benchmark-import"
 ROOT_CONFIG = PACKAGE_ROOT / "config/game-control.toml"
 
 
@@ -51,6 +52,7 @@ class Installer:
         files[self.target("/usr/local/libexec/game-slot-run")] = (SLOT_RUNNER, 0o755)
         files[self.target("/usr/local/libexec/game-console-stop")] = (CONSOLE_STOPPER, 0o755)
         files[self.target("/usr/local/libexec/game-console-command")] = (CONSOLE_COMMAND, 0o755)
+        files[self.target("/usr/local/libexec/horizon-benchmark-import")] = (BENCHMARK_IMPORT, 0o755)
         files[self.target("/etc/game-control/game-control.toml")] = (ROOT_CONFIG, 0o600)
         return files
 

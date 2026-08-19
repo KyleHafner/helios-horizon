@@ -17,6 +17,7 @@ from typing import Any, Mapping
 from uuid import uuid4
 
 from .backups import BackupService, RestoreService
+from .benchmarks import BenchmarkService, parse_benchmark_plans
 from .errors import SafeError
 from .health import HealthChecker
 from .logs import LogService
@@ -563,6 +564,7 @@ class ServiceSeams:
         notifications: Any,
         audit: Any,
         profiles: Any,
+        benchmarks: Any,
         session_store: Any | None = None,
         tps_sampler: Any | None = None,
     ):
@@ -574,6 +576,7 @@ class ServiceSeams:
         self.notifications = notifications
         self.audit = audit
         self.profiles = profiles
+        self.benchmarks = benchmarks
         self.session_store = session_store
         self.tps_sampler = tps_sampler
 
@@ -587,6 +590,7 @@ def build_service_seams(
     secret_dir: str | Path = DEFAULT_SECRET_DIR,
     secret_values: tuple[str, ...] = (),
     stats_config: Mapping[str, Any] | None = None,
+    benchmark_config: Any = None,
 ) -> ServiceSeams:
     profile_items = tuple(profiles)
     profile_map = {_key(profile): profile for profile in profile_items}
@@ -661,6 +665,13 @@ def build_service_seams(
         backup_service=backup_services.get(ProfileId.TERRARIA_VANILLA.value),
         stopped_check=lambda *_: True,
     )
+    benchmark_service = BenchmarkService(
+        parse_benchmark_plans(benchmark_config),
+        database=state_db,
+        adapters=adapter_map,
+        profiles=profile_map,
+        slot_inspector=slot_inspector,
+    )
     return ServiceSeams(
         status=_StatusFacade(status_service),
         logs=logs,
@@ -670,6 +681,7 @@ def build_service_seams(
         notifications=_NotificationFacade(notification),
         audit=_AuditFacade(state_db),
         profiles=_ProfilesFacade(profile_map),
+        benchmarks=benchmark_service,
         session_store=session_store,
         tps_sampler=tps_sampler,
     )

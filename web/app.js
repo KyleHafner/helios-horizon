@@ -47,7 +47,9 @@ const state = {
   logs: new Map(),
   cpuSamples: new Map(),
   metricSamples: new Map(),
-  detail: { id: null, tab: "console", backups: [], statsTimer: null, statsRequest: 0 },
+  schedules: null,
+  benchmarks: new Map(),
+  detail: { id: null, tab: "console", backups: [], statsTimer: null, statsRequest: 0, benchmarkTimer: null },
   configRestartRequired: new Map(),
   lastGeneration: 0,
   loadFailed: false,
@@ -268,9 +270,9 @@ function createCard(id) {
     </dl>
     <p class="card-reason" role="note"></p>
     <div class="card-actions">
-      <button class="button button-small action-start" type="button"></button>
-      <button class="button button-small button-quiet action-stop" type="button"></button>
-      <button class="button button-small button-quiet action-restart" type="button"></button>
+      <button class="button button-small action-start" type="button">Start</button>
+      <button class="button button-small button-quiet action-stop" type="button">Stop</button>
+      <button class="button button-small button-quiet action-restart" type="button">Restart</button>
       <button class="button button-small button-quiet action-switch" data-action="switch" type="button">Switch</button>
       <a class="button button-small button-quiet manage-link" href="#server">Manage →</a>
     </div>`;
@@ -566,6 +568,7 @@ async function load() {
     populateNotificationProfiles();
     renderCards();
     applyStatus(status);
+    try { await loadSchedules(); } catch { renderAutomationSummary(null); }
     populateTargets();
     populateNotificationProfiles();
     connectStream();
@@ -907,6 +910,7 @@ function wireDialogForms() {
   byId("restore-confirm-text").addEventListener("input", () => { byId("restore-confirm").disabled = byId("restore-confirm-text").value.trim().toLowerCase() !== profileLabel(state.restoreProfile).toLowerCase() || !byId("restore-backup-id").value.trim(); });
   byId("restore-backup-id").addEventListener("input", () => { byId("restore-confirm-text").dispatchEvent(new Event("input")); });
   byId("restore-form").addEventListener("submit", async (event) => {
+    if (event.submitter?.value === "cancel") { closeDialog(byId("restore-dialog")); return; }
     event.preventDefault();
     const id = state.restoreProfile;
     try {
@@ -1014,7 +1018,8 @@ function renderMetricChart(svgId, samples, { unit = "", formatValue = (value) =>
   svg.querySelector(".chart-x1").textContent = samples.length ? fmt(samples[samples.length - 1].t) : "—";
 }
 
-const STATS_PROFILES = new Set(["minecraft", "terraria-vanilla", "terraria-tmod", "pz-rising"]);
+const STATS_PROFILES = new Set(["minecraft", "minecraft-sunlit-cobblemon", "terraria-vanilla", "terraria-tmod", "pz-rising"]);
+const TICK_PROFILES = new Set(["minecraft", "minecraft-sunlit-cobblemon"]);
 const STATS_WINDOWS = { "1h": 1, "6h": 6, "24h": 24 };
 const HEATMAP_LABELS = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"];
 
@@ -1120,9 +1125,12 @@ function renderStatsTps(result) {
     .filter((sample) => Number.isFinite(sample.time) && Number.isFinite(sample.tps) && Number.isFinite(sample.mspt))
     .sort((a, b) => a.time - b.time);
   const latest = samples.at(-1);
-  byId("stats-tps-current").textContent = latest ? `${Math.min(20, latest.tps).toFixed(2)} TPS` : "—";
-  byId("stats-mspt-current").textContent = latest ? `${latest.mspt.toFixed(2)} ms/tick` : "—";
-  note.textContent = samples.length ? `${samples.length} samples · ${result.window || "selected window"}` : "No tick samples recorded yet.";
+  const stale = result?.stale === true || result?.state === "unknown";
+  byId("stats-tps-current").textContent = latest && !stale ? `${Math.min(20, latest.tps).toFixed(2)} TPS` : "—";
+  byId("stats-mspt-current").textContent = latest && !stale ? `${latest.mspt.toFixed(2)} ms/tick` : "—";
+  note.textContent = stale
+    ? (latest ? "Tick telemetry is stale; current values are unknown." : "No fresh tick samples recorded yet.")
+    : `${samples.length} samples · ${result.window || "selected window"}`;
   const svg = byId("stats-tps-chart");
   const group = svg?.querySelector(".tps-chart-lines");
   if (!svg || !group) return;
@@ -1173,13 +1181,13 @@ async function loadStats(id) {
   const window = byId("stats-window")?.value || "24h";
   try {
     const requests = [api(`${base}/summary?days=90`), api(`${base}/heatmap?days=90`)];
-    if (id === "minecraft") requests.push(api(`${base}/tps?window=${encodeURIComponent(window)}`));
+    if (TICK_PROFILES.has(id)) requests.push(api(`${base}/tps?window=${encodeURIComponent(window)}`));
     const [summary, heatmap, tps] = await Promise.all(requests);
     if (request !== state.detail.statsRequest || state.detail.id !== id) return;
     renderStatsSummary(summary); renderStatsLeaderboard(summary.leaderboard); renderStatsHeatmap(heatmap);
     const tpsBlock = byId("stats-tps-title").closest(".stats-tps-block");
-    tpsBlock.hidden = id !== "minecraft";
-    if (id === "minecraft") renderStatsTps(tps);
+    tpsBlock.hidden = !TICK_PROFILES.has(id);
+    if (TICK_PROFILES.has(id)) renderStatsTps(tps);
   } catch (error) {
     if (request !== state.detail.statsRequest) return;
     renderStatsUnavailable(error.message || "Stats unavailable.");
@@ -1191,6 +1199,141 @@ function startStatsRefresh(id) {
   clearStatsTimer();
   loadStats(id);
   state.detail.statsTimer = window.setInterval(() => loadStats(id), 60000);
+}
+
+function clearBenchmarkTimer() {
+  if (state.detail.benchmarkTimer) window.clearTimeout(state.detail.benchmarkTimer);
+  state.detail.benchmarkTimer = null;
+}
+
+function benchmarkValue(name, value) {
+  const number = Number(value);
+  if (!Number.isFinite(number)) return "—";
+  if (name.endsWith("Nanos")) return `${(number / 1_000_000).toFixed(3)} ms`;
+  if (name.includes("Bytes")) {
+    const units = ["B", "KiB", "MiB", "GiB"];
+    let amount = Math.abs(number); let index = 0;
+    while (amount >= 1024 && index < units.length - 1) { amount /= 1024; index += 1; }
+    return `${number < 0 ? "−" : ""}${amount.toFixed(index ? 2 : 0)} ${units[index]}`;
+  }
+  if (name.includes("Utilization") || name.includes("CpuLoad")) return `${(number * 100).toFixed(2)}%`;
+  if (name.endsWith("PauseMs")) return `${number.toFixed(3)} ms`;
+  return Number.isInteger(number) ? String(number) : number.toFixed(3);
+}
+
+function benchmarkDelta(metric) {
+  const percent = Number(metric?.delta_percent);
+  if (!Number.isFinite(percent)) return "—";
+  const prefix = percent > 0 ? "+" : "";
+  return `${prefix}${(percent * 100).toFixed(2)}%`;
+}
+
+function validateBenchmarkForm() {
+  const id = state.detail.id;
+  const overview = id ? state.benchmarks.get(id) : null;
+  const baseline = byId("benchmark-baseline")?.value;
+  const candidate = byId("benchmark-candidate")?.value;
+  const status = detailStatus(id);
+  const slotIdle = !slotOwnerId();
+  const stopped = ["stopped", "failed", "blocked", "unknown"].includes(status.state);
+  const runningJob = overview?.runs?.some((run) => run.state === "running");
+  const enabled = Boolean(overview?.available && baseline && candidate && baseline !== candidate && slotIdle && stopped && !runningJob);
+  byId("benchmark-run").disabled = !enabled;
+  if (!overview?.available) byId("benchmark-status").textContent = "SwagBench is not configured for this profile.";
+  else if (runningJob) byId("benchmark-status").textContent = "A fresh-JVM comparison is running. Horizon will refresh this evidence automatically.";
+  else if (!slotIdle || !stopped) byId("benchmark-status").textContent = "Stop all game profiles and leave the shared slot idle before benchmarking.";
+  else if (baseline === candidate) byId("benchmark-status").textContent = "Choose two different root-owned JVM presets.";
+  else byId("benchmark-status").textContent = "Ready. Each arm starts in a fresh JVM; production remains stopped.";
+}
+
+function renderBenchmarks(id, overview) {
+  state.benchmarks.set(id, overview);
+  const baseline = byId("benchmark-baseline");
+  const candidate = byId("benchmark-candidate");
+  const priorBaseline = baseline.value;
+  const priorCandidate = candidate.value;
+  baseline.replaceChildren(); candidate.replaceChildren();
+  (overview.presets || []).forEach((preset) => {
+    for (const select of [baseline, candidate]) {
+      const option = document.createElement("option"); option.value = preset.id; option.textContent = preset.label; select.append(option);
+    }
+  });
+  if ([...baseline.options].some((option) => option.value === priorBaseline)) baseline.value = priorBaseline;
+  if ([...candidate.options].some((option) => option.value === priorCandidate)) candidate.value = priorCandidate;
+  else if (candidate.options.length > 1) candidate.selectedIndex = 1;
+
+  const runs = Array.isArray(overview.runs) ? overview.runs : [];
+  const latest = runs.find((run) => run.state === "succeeded");
+  const verdict = byId("benchmark-verdict");
+  verdict.dataset.verdict = latest?.overall_verdict || (overview.available ? "inconclusive" : "unavailable");
+  verdict.textContent = latest?.overall_verdict || (overview.available ? "No verdict" : "Unavailable");
+  byId("benchmark-latest-meta").textContent = latest
+    ? `${latest.baseline_preset} → ${latest.candidate_preset} · ${new Date(latest.finished_at || latest.created_at).toLocaleString()}`
+    : "No completed comparison.";
+  const diagnostics = latest?.candidate_diagnostics;
+  byId("benchmark-bottleneck").textContent = diagnostics?.dominant_bottleneck || "—";
+  byId("benchmark-leak").textContent = diagnostics?.leak_suspected == null ? "—" : diagnostics.leak_suspected ? "Suspected" : "Not detected";
+  byId("benchmark-load").textContent = diagnostics?.load_reached_target == null ? "—" : diagnostics.load_reached_target ? `Reached · ${Number(diagnostics.peak_connected_clients_median || 0).toFixed(0)} clients` : "Not reached";
+  byId("benchmark-duration").textContent = Number.isFinite(Number(diagnostics?.process_duration_seconds_median)) ? `${Number(diagnostics.process_duration_seconds_median).toFixed(1)} s` : "—";
+  const metrics = byId("benchmark-metrics"); metrics.replaceChildren();
+  (latest?.metrics || []).forEach((metric) => {
+    const row = document.createElement("tr");
+    const name = document.createElement("th"); name.scope = "row"; name.textContent = metric.name;
+    const left = document.createElement("td"); left.textContent = benchmarkValue(metric.name, metric.baseline_median);
+    const right = document.createElement("td"); right.textContent = benchmarkValue(metric.name, metric.candidate_median);
+    const delta = document.createElement("td"); delta.textContent = benchmarkDelta(metric);
+    const metricVerdict = document.createElement("td"); metricVerdict.textContent = metric.verdict;
+    row.append(name, left, right, delta, metricVerdict); metrics.append(row);
+  });
+  if (!metrics.children.length) {
+    const row = document.createElement("tr"); const empty = document.createElement("td"); empty.className = "empty-state"; empty.colSpan = 5; empty.textContent = "No benchmark metrics recorded."; row.append(empty); metrics.append(row);
+  }
+  const history = byId("benchmark-history"); history.replaceChildren();
+  runs.forEach((run) => {
+    const row = document.createElement("li");
+    const label = document.createElement("strong"); label.textContent = `${run.baseline_preset} → ${run.candidate_preset}`;
+    const stateNode = document.createElement("span"); stateNode.textContent = run.overall_verdict || run.state;
+    const time = document.createElement("time"); time.textContent = new Date(run.finished_at || run.created_at).toLocaleString();
+    row.append(label, stateNode, time); history.append(row);
+  });
+  if (!history.children.length) { const empty = document.createElement("li"); empty.className = "empty-state"; empty.textContent = "No benchmark runs recorded."; history.append(empty); }
+  validateBenchmarkForm();
+}
+
+async function loadBenchmarks(id) {
+  if (!id || state.detail.tab !== "benchmarks") return;
+  clearBenchmarkTimer();
+  try {
+    const overview = await api(`/api/v1/profiles/${encodeURIComponent(id)}/benchmarks`);
+    if (state.detail.id !== id || state.detail.tab !== "benchmarks") return;
+    renderBenchmarks(id, overview);
+    if ((overview.runs || []).some((run) => run.state === "running")) {
+      state.detail.benchmarkTimer = window.setTimeout(() => loadBenchmarks(id), 5000);
+    }
+  } catch (error) {
+    byId("benchmark-status").textContent = error.message || "Benchmark evidence is unavailable.";
+    byId("benchmark-run").disabled = true;
+  }
+}
+
+async function runBenchmark(event) {
+  event.preventDefault();
+  const id = state.detail.id;
+  if (!id || byId("benchmark-run").disabled) return;
+  byId("benchmark-run").disabled = true;
+  byId("benchmark-status").textContent = "Submitting the fresh-JVM comparison…";
+  try {
+    const result = await api(`/api/v1/profiles/${encodeURIComponent(id)}/benchmarks`, {
+      method: "POST",
+      body: JSON.stringify({ baseline_preset: byId("benchmark-baseline").value, candidate_preset: byId("benchmark-candidate").value }),
+    });
+    byId("benchmark-status").textContent = `Benchmark ${result.job_id || "job"} accepted. Production starts remain blocked until it finishes.`;
+    notify(`SwagBench comparison accepted for ${profileLabel(id)}.`);
+    state.detail.benchmarkTimer = window.setTimeout(() => loadBenchmarks(id), 1500);
+  } catch (error) {
+    byId("benchmark-status").textContent = error.message || "Benchmark request failed.";
+    validateBenchmarkForm();
+  }
 }
 
 function detailProfile(id) {
@@ -1241,9 +1384,12 @@ function renderCommandCatalog(id) {
 }
 
 function setDetailTab(tab) {
-  const allowed = ["console", "metrics", "stats", "logs", "backups", "config"];
-  const next = allowed.includes(tab) ? tab : "console";
+  const allowed = ["console", "metrics", "stats", "logs", "backups", "benchmarks", "config"];
+  const requested = allowed.includes(tab) ? tab : "console";
+  const supportsBenchmark = new Set(detailProfile(state.detail.id)?.operations || []).has("benchmark");
+  const next = requested === "benchmarks" && !supportsBenchmark ? "console" : requested;
   clearStatsTimer();
+  clearBenchmarkTimer();
   state.detail.tab = next;
   document.querySelectorAll("[data-detail-tab]").forEach((button) => {
     const selected = button.dataset.detailTab === next;
@@ -1253,10 +1399,11 @@ function setDetailTab(tab) {
   document.querySelectorAll("#detail-view [role=tabpanel]").forEach((panel) => { panel.hidden = panel.id !== `panel-${next}`; });
   if (next === "logs" || next === "console") loadDetailLogs(state.detail.id);
   if (next === "backups") loadBackups(state.detail.id);
+  if (next === "benchmarks") loadBenchmarks(state.detail.id);
   if (next === "config") renderConfig(state.detail.id);
   if (next === "stats") {
     const tpsBlock = byId("stats-tps-title")?.closest(".stats-tps-block");
-    if (tpsBlock) tpsBlock.hidden = state.detail.id !== "minecraft";
+    if (tpsBlock) tpsBlock.hidden = !TICK_PROFILES.has(state.detail.id);
     startStatsRefresh(state.detail.id);
   }
 }
@@ -1285,6 +1432,8 @@ function patchDetail(id) {
   badge.className = `status-badge ${stateClass(current)}`;
   badge.querySelector(".status-text").textContent = statusLabel(current);
   const operationSet = new Set(profile.operations || []);
+  byId("tab-benchmarks").hidden = !operationSet.has("benchmark");
+  if (state.detail.tab === "benchmarks") validateBenchmarkForm();
   const running = current === "running";
   const transitional = ["starting", "stopping"].includes(current);
   byId("detail-start").hidden = running || transitional;
@@ -1401,6 +1550,8 @@ async function renderConfig(id) {
       const row = document.createElement("div");
       const label = document.createElement("label"); label.textContent = setting.key;
       const input = setting.type === "enum" ? document.createElement("select") : document.createElement("input");
+      input.id = `config-${String(setting.key).replace(/[^a-zA-Z0-9_-]/g, "-")}`;
+      label.htmlFor = input.id;
       if (setting.type === "enum") (setting.bounds?.choices || []).forEach((choice) => { const option = document.createElement("option"); option.value = choice; option.textContent = choice; input.append(option); });
       else input.type = setting.type === "bool" ? "checkbox" : setting.secret ? "password" : setting.type === "int" ? "number" : "text";
       input.dataset.configKey = setting.key;
@@ -1414,6 +1565,143 @@ async function renderConfig(id) {
     });
     updateConfigDiff();
   } catch (error) { byId("config-diff").textContent = error.message || "Config unavailable."; }
+  await renderSchedules();
+}
+
+function renderScheduleProfiles() {
+  const select = byId("schedule-profile");
+  if (!select) return;
+  const selected = select.value;
+  select.replaceChildren();
+  [...state.profiles.values()].forEach((profile) => {
+    const option = document.createElement("option");
+    option.value = profile.id;
+    option.textContent = profile.display_name || profileLabel(profile.id);
+    select.append(option);
+  });
+  if (selected && [...select.options].some((option) => option.value === selected)) select.value = selected;
+}
+
+function scheduleDateLabel(value, compact = false) {
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) return "unknown";
+  if (compact) {
+    const weekday = date.toLocaleDateString(undefined, { weekday: "short" });
+    const hours = String(date.getHours()).padStart(2, "0");
+    const minutes = String(date.getMinutes()).padStart(2, "0");
+    return `${weekday} ${hours}:${minutes} local`;
+  }
+  return date.toLocaleDateString(undefined, { weekday: "short", month: "short", day: "numeric", year: "numeric" });
+}
+
+function renderAutomationSummary(items) {
+  const text = byId("automation-summary-text");
+  if (!text) return;
+  if (!Array.isArray(items)) { text.textContent = "Schedules unavailable"; return; }
+  const soonest = items
+    .filter((item) => item?.enabled !== false && item.next_fire && !Number.isNaN(new Date(item.next_fire).getTime()))
+    .sort((left, right) => new Date(left.next_fire) - new Date(right.next_fire))[0];
+  text.textContent = soonest
+    ? `Next: ${profileLabel(soonest.profile)} ${scheduleDateLabel(soonest.next_fire, true)}`
+    : "No scheduled switches";
+}
+
+function renderScheduleRows(items) {
+  const list = byId("schedule-list");
+  list.replaceChildren();
+  if (!items.length) {
+    const empty = document.createElement("p"); empty.className = "empty-state"; empty.textContent = "No scheduled switches."; list.append(empty); return;
+  }
+  items.forEach((item, index) => {
+    const enabled = item.enabled !== false;
+    const row = document.createElement("div"); row.className = `schedule-row${enabled ? "" : " is-disabled"}`; row.dataset.scheduleRow = String(index); row.dataset.enabled = String(enabled);
+    const copy = document.createElement("div"); copy.className = "schedule-copy";
+    const cron = document.createElement("code"); cron.textContent = item.cron;
+    const profile = document.createElement("strong"); profile.textContent = profileLabel(item.profile);
+    const next = document.createElement("span"); next.className = "schedule-state"; next.textContent = enabled ? `next: ${scheduleDateLabel(item.next_fire)}` : "Disabled · no next fire";
+    copy.append(cron, profile, next);
+    const actions = document.createElement("div"); actions.className = "schedule-actions";
+    const toggle = document.createElement("button"); toggle.className = "button button-small button-quiet schedule-toggle"; toggle.type = "button"; toggle.setAttribute("role", "switch"); toggle.setAttribute("aria-checked", String(enabled)); toggle.textContent = enabled ? "Enabled" : "Disabled"; toggle.setAttribute("aria-label", `${enabled ? "Disable" : "Enable"} schedule for ${profileLabel(item.profile)} at ${item.cron}`);
+    toggle.dataset.scheduleToggle = String(index);
+    toggle.addEventListener("click", () => toggleSchedule(index, item, toggle));
+    const remove = document.createElement("button"); remove.className = "button button-small button-danger"; remove.type = "button"; remove.dataset.scheduleRemove = String(index); remove.textContent = "Remove"; remove.setAttribute("aria-label", `Remove schedule for ${profileLabel(item.profile)} at ${item.cron}`);
+    remove.addEventListener("click", () => removeSchedule(index, item));
+    actions.append(toggle, remove); row.append(copy, actions); list.append(row);
+  });
+}
+
+async function renderSchedules() {
+  renderScheduleProfiles();
+  try {
+    state.detail.schedules = await loadSchedules();
+    renderScheduleRows(state.detail.schedules);
+    byId("schedule-status").textContent = "Schedules are active without a slotd restart.";
+  } catch (error) {
+    byId("schedule-list").replaceChildren();
+    const message = document.createElement("p"); message.className = "empty-state"; message.textContent = error.message || "Schedules unavailable."; byId("schedule-list").append(message);
+    byId("schedule-status").textContent = "Schedules could not be loaded.";
+  }
+}
+
+async function loadSchedules() {
+  const response = await api("/api/v1/schedules");
+  state.schedules = Array.isArray(response.schedules) ? response.schedules : [];
+  renderAutomationSummary(state.schedules);
+  return state.schedules;
+}
+
+async function replaceSchedules(entries, confirmation) {
+  if (!window.confirm(confirmation)) return false;
+  const response = await api("/api/v1/schedules", { method: "POST", body: JSON.stringify({ entries }) });
+  state.detail.schedules = Array.isArray(response.schedules) ? response.schedules : [];
+  state.schedules = state.detail.schedules;
+  renderAutomationSummary(state.schedules);
+  renderScheduleRows(state.detail.schedules);
+  byId("schedule-status").textContent = "Schedule changes applied live.";
+  return true;
+}
+
+async function addSchedule(event) {
+  event.preventDefault();
+  const cron = byId("schedule-cron").value.trim();
+  const profile = byId("schedule-profile").value;
+  if (!cron || !profile) return;
+  const entries = [...(state.detail.schedules || []).map(({ cron: value, profile: id, enabled }) => ({ cron: value, profile: id, enabled: enabled !== false })), { cron, profile, enabled: true }];
+  try {
+    const changed = await replaceSchedules(entries, `Add schedule ${cron} for ${profileLabel(profile)}?`);
+    if (changed) {
+      byId("schedule-cron").value = "";
+      byId("schedule-cron").focus();
+    }
+  } catch (error) { byId("schedule-status").textContent = error.message || "Schedule update failed."; }
+}
+
+async function removeSchedule(index, item) {
+  const entries = (state.detail.schedules || []).filter((_, candidate) => candidate !== index).map(({ cron, profile, enabled }) => ({ cron, profile, enabled: enabled !== false }));
+  const nextFocusIndex = Math.min(index, entries.length - 1);
+  try {
+    const changed = await replaceSchedules(entries, `Remove schedule ${item.cron} for ${profileLabel(item.profile)}?`);
+    if (changed) {
+      const next = nextFocusIndex >= 0 ? byId("schedule-list").querySelectorAll("[data-schedule-remove]")[nextFocusIndex] : null;
+      (next || byId("schedule-cron")).focus();
+    }
+  }
+  catch (error) { byId("schedule-status").textContent = error.message || "Schedule update failed."; }
+}
+
+async function toggleSchedule(index, item, control) {
+  const enabled = item.enabled !== false;
+  const nextEnabled = !enabled;
+  const entries = (state.detail.schedules || []).map(({ cron, profile, enabled: current }) => ({ cron, profile, enabled: current !== false }));
+  entries[index].enabled = nextEnabled;
+  try {
+    const changed = await replaceSchedules(entries, `${nextEnabled ? "Enable" : "Disable"} schedule ${item.cron} for ${profileLabel(item.profile)}?`);
+    if (changed) {
+      byId("schedule-status").textContent = `Schedule ${nextEnabled ? "enabled" : "disabled"} for ${profileLabel(item.profile)}.`;
+      const next = byId("schedule-list").querySelectorAll("[data-schedule-toggle]")[index];
+      (next || control).focus();
+    }
+  } catch (error) { byId("schedule-status").textContent = error.message || "Schedule update failed."; }
 }
 
 async function applyConfig(event) {
@@ -1651,6 +1939,7 @@ function route() {
     showView("detail"); patchDetail(state.detail.id); setDetailTab(parsed.tab);
   } else {
     clearStatsTimer();
+    clearBenchmarkTimer();
     state.detail.id = null;
     showView(parsed.view);
     if (parsed.view === "backups") renderAggregateBackups();
@@ -1665,7 +1954,11 @@ function route() {
 
 function setupDetail() {
   document.querySelectorAll("[data-detail-tab]").forEach((button) => {
-    button.addEventListener("click", () => { if (state.detail.id) window.location.hash = detailTabUrl(state.detail.id, button.dataset.detailTab).slice(1); });
+    button.addEventListener("click", () => {
+      if (!state.detail.id) return;
+      setDetailTab(button.dataset.detailTab);
+      window.location.hash = detailTabUrl(state.detail.id, button.dataset.detailTab).slice(1);
+    });
     button.addEventListener("keydown", (event) => {
       if (!["ArrowRight", "ArrowDown", "ArrowLeft", "ArrowUp", "Home", "End"].includes(event.key)) return;
       event.preventDefault();
@@ -1729,7 +2022,11 @@ function setupDetail() {
   byId("detail-log-severity").addEventListener("change", () => { const item = state.logs.get(state.detail.id); if (item) { item.severity = byId("detail-log-severity").value; renderDetailLogs(item); } });
   byId("detail-log-pause").addEventListener("click", () => { const item = state.logs.get(state.detail.id); if (item) { item.paused = !item.paused; byId("detail-log-pause").textContent = item.paused ? "Resume live logs" : "Pause live logs"; } });
   byId("stats-window").addEventListener("change", () => { if (state.detail.tab === "stats") loadStats(state.detail.id); });
+  byId("benchmark-form")?.addEventListener("submit", runBenchmark);
+  byId("benchmark-baseline")?.addEventListener("change", validateBenchmarkForm);
+  byId("benchmark-candidate")?.addEventListener("change", validateBenchmarkForm);
   byId("config-form")?.addEventListener("submit", applyConfig);
+  byId("schedule-form")?.addEventListener("submit", addSchedule);
   byId("detail-noise-toggle").addEventListener("change", (event) => { const item = state.logs.get(state.detail.id); if (item) { item.hideNoise = event.currentTarget.checked; renderDetailLogs(item); patchDetail(state.detail.id); } });
   window.setInterval(() => {
     const id = state.detail.id;
@@ -1759,12 +2056,12 @@ function paletteCommands() {
   addNavigation("audit", "Go to Audit", "#/audit", "log review security");
   addNavigation("settings", "Go to Settings", "#/settings", "preferences notifications performance");
 
-  const tabLabels = { console: "Console", metrics: "Metrics", stats: "Stats", logs: "Logs", backups: "Backups", config: "Config" };
+  const tabLabels = { console: "Console", metrics: "Metrics", stats: "Stats", logs: "Logs", backups: "Backups", benchmarks: "Benchmarks", config: "Config" };
   const owner = slotOwnerId();
   profileOrder().forEach((id) => {
     const profile = detailProfile(id);
     const display = profile.display_name || id;
-    Object.entries(tabLabels).forEach(([tab, tabLabel]) => addNavigation(
+    Object.entries(tabLabels).filter(([tab]) => tab !== "benchmarks" || new Set(profile.operations || []).has("benchmark")).forEach(([tab, tabLabel]) => addNavigation(
       `${id}-${tab}`,
       `${display} / ${tabLabel}`,
       paletteRoute(id, tab),

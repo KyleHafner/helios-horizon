@@ -18,12 +18,16 @@ from game_control.models import (
 )
 from game_control.protocol import (
     ConfirmForceStop,
+    ConfirmSwitch,
     GetStatus,
     JobAccepted,
     PrepareForceStop,
+    PrepareSwitch,
     RpcRequest,
+    RunBenchmark,
     Start,
     Stop,
+    SwitchOptions,
 )
 
 
@@ -89,12 +93,68 @@ def test_dispatch_is_exhaustive() -> None:
     assert dispatch_is_exhaustive()
 
 
+@pytest.mark.asyncio
+async def test_benchmark_is_accepted_as_background_job_and_blocks_profile_start(tmp_path):
+    profile = _profile().model_copy(
+        update={"operations": frozenset({OperationName.START, OperationName.BENCHMARK})}
+    )
+    release = asyncio.Event()
+    started = asyncio.Event()
+
+    class Benchmarks:
+        async def prove_idle(self, _profile_id):
+            return None
+
+        def prepare(self, _action, _job_id):
+            return None
+
+        async def run(self, _action, _job_id):
+            started.set()
+            await release.wait()
+
+        def fail(self, _job_id, _code):
+            raise AssertionError("successful benchmark must not fail")
+
+    controller = Controller.for_testing(tmp_path)
+    controller.profiles = {profile.id: profile}
+    controller.services = SimpleNamespace(benchmarks=Benchmarks())
+    action = RunBenchmark(
+        kind="run_benchmark",
+        profile_id=profile.id,
+        baseline_preset="current",
+        candidate_preset="candidate",
+    )
+    response = await controller.execute(
+        RpcRequest(request_id=uuid4(), actor="operator", action=action)
+    )
+    assert response.ok and response.result.state == "accepted"
+    await started.wait()
+
+    blocked = await controller.execute(
+        RpcRequest(
+            request_id=uuid4(),
+            actor="operator",
+            action=Start(kind="start", profile_id=profile.id),
+        )
+    )
+    assert not blocked.ok
+    assert blocked.error.code.value == "invalid_state"
+
+    tasks = tuple(controller._background_tasks)
+    release.set()
+    await asyncio.gather(*tasks)
+    state = controller._db().execute(
+        "SELECT state FROM jobs WHERE id=?", (response.result.job_id,)
+    ).fetchone()[0]
+    assert state == "succeeded"
+
+
 def test_controller_deduplicates_exact_replay(tmp_path) -> None:
     controller = Controller.for_testing(tmp_path)
     request = RpcRequest.model_validate(
         {
             "request_id": str(uuid4()),
-            "actor": "operator",
+            "actor": "swag",
             "action": {"kind": "get_status"},
         }
     )
@@ -170,10 +230,10 @@ def test_request_id_conflict_is_rejected(tmp_path) -> None:
     controller = Controller.for_testing(tmp_path)
     request_id = uuid4()
     first = RpcRequest.model_validate(
-        {"request_id": str(request_id), "actor": "operator", "action": {"kind": "get_status"}}
+        {"request_id": str(request_id), "actor": "swag", "action": {"kind": "get_status"}}
     )
     second = RpcRequest.model_validate(
-        {"request_id": str(request_id), "actor": "operator", "action": {"kind": "get_profiles"}}
+        {"request_id": str(request_id), "actor": "swag", "action": {"kind": "get_profiles"}}
     )
     controller.execute_sync(first)
     response = controller.execute_sync(second)
@@ -194,7 +254,7 @@ async def test_concurrent_same_request_id_runs_one_side_effect(tmp_path) -> None
         await_ready=lambda _profile: True,
     )
     request = RpcRequest.model_validate({
-        "request_id": str(uuid4()), "actor": "operator",
+        "request_id": str(uuid4()), "actor": "swag",
         "action": {"kind": "start", "profile_id": "minecraft"},
     })
     responses = await asyncio.gather(controller.execute(request), controller.execute(request))
@@ -215,12 +275,12 @@ async def test_confirmation_rejects_intervening_generation(tmp_path) -> None:
         operation_lock_factory=Lock,
     )
     prepared = await controller.execute(RpcRequest.model_validate({
-        "request_id": str(uuid4()), "actor": "operator",
+        "request_id": str(uuid4()), "actor": "swag",
         "action": {"kind": "prepare_force_stop", "profile_id": "minecraft"},
     }))
     controller._bump_generation()
     response = await controller.execute(RpcRequest.model_validate({
-        "request_id": str(uuid4()), "actor": "operator",
+        "request_id": str(uuid4()), "actor": "swag",
         "action": {"kind": "confirm_force_stop", "confirmation_id": prepared.result.confirmation_id},
     }))
     assert not response.ok and response.error.code.value == "confirmation_mismatch"
@@ -267,7 +327,7 @@ async def test_adapter_is_called_without_operation_lock(tmp_path) -> None:
         RpcRequest.model_validate(
             {
                 "request_id": str(uuid4()),
-                "actor": "operator",
+                "actor": "swag",
                 "action": {"kind": "start", "profile_id": "minecraft"},
             }
         )
@@ -299,7 +359,7 @@ async def test_start_cleans_lease_when_job_intent_fails(tmp_path) -> None:
     with pytest.raises(_ControllerFailure):
         await controller._start(
             Start(kind="start", profile_id=ProfileId.MINECRAFT),
-            "operator",
+            "swag",
             uuid4(),
         )
     assert renewal.done() and renewal.cancelled()
@@ -361,7 +421,7 @@ async def test_switch_honors_options_and_stops_source_before_target(tmp_path) ->
         RpcRequest.model_validate(
             {
                 "request_id": str(uuid4()),
-                "actor": "operator",
+                "actor": "swag",
                 "action": {
                     "kind": "prepare_switch",
                     "current_profile_id": "minecraft",
@@ -379,7 +439,7 @@ async def test_switch_honors_options_and_stops_source_before_target(tmp_path) ->
         RpcRequest.model_validate(
             {
                 "request_id": str(uuid4()),
-                "actor": "operator",
+                "actor": "swag",
                 "action": {
                     "kind": "confirm_switch",
                     "confirmation_id": prepared.result.confirmation_id,
@@ -389,9 +449,9 @@ async def test_switch_honors_options_and_stops_source_before_target(tmp_path) ->
     )
     assert confirmed.ok
     assert events == [
-        ("backup", ProfileId.MINECRAFT, True),
         ("stop", ProfileId.MINECRAFT),
         ("force", ProfileId.MINECRAFT),
+        ("backup", ProfileId.MINECRAFT, True),
         ("start", ProfileId.TERRARIA_VANILLA),
     ]
     assert free_budgets == [source.stop_timeout_seconds]
@@ -453,7 +513,7 @@ async def test_switch_rollback_waits_for_free_proof_after_lease_transfer(tmp_pat
         RpcRequest.model_validate(
             {
                 "request_id": str(uuid4()),
-                "actor": "operator",
+                "actor": "swag",
                 "action": {
                     "kind": "prepare_switch",
                     "current_profile_id": "minecraft",
@@ -467,7 +527,7 @@ async def test_switch_rollback_waits_for_free_proof_after_lease_transfer(tmp_pat
         RpcRequest.model_validate(
             {
                 "request_id": str(uuid4()),
-                "actor": "operator",
+                "actor": "swag",
                 "action": {
                     "kind": "confirm_switch",
                     "confirmation_id": prepared.result.confirmation_id,
@@ -493,10 +553,70 @@ async def test_switch_rollback_waits_for_free_proof_after_lease_transfer(tmp_pat
 
 
 @pytest.mark.asyncio
+async def test_switch_failure_preserves_typed_error_when_renewal_cleanup_raises(tmp_path) -> None:
+    source = _profile()
+    target = source.model_copy(
+        update={
+            "id": ProfileId.TERRARIA_VANILLA,
+            "display_name": "Terraria",
+            "operations": frozenset({OperationName.START, OperationName.STOP}),
+        }
+    )
+
+    class Adapter(_Adapter):
+        pass
+
+    async def faulty_renewal():
+        try:
+            await asyncio.sleep(3600)
+        except asyncio.CancelledError:
+            raise BlockingIOError("reservation ownership changed")
+
+    controller = Controller(
+        profiles={ProfileId.MINECRAFT: source, ProfileId.TERRARIA_VANILLA: target},
+        adapters={ProfileId.MINECRAFT: Adapter(), ProfileId.TERRARIA_VANILLA: Adapter()},
+        operation_lock_factory=lambda: _MemoryLock(),
+        await_free_slot=lambda: True,
+        await_ready=lambda _profile: False,
+    )
+    controller._lease_renewal = lambda _lease: asyncio.create_task(faulty_renewal())
+
+    prepared = await controller.execute(
+        RpcRequest.model_validate(
+            {
+                "request_id": str(uuid4()),
+                "actor": "swag",
+                "action": {
+                    "kind": "prepare_switch",
+                    "current_profile_id": "minecraft",
+                    "target_profile_id": "terraria-vanilla",
+                    "options": {"rollback_on_failure": False},
+                },
+            }
+        )
+    )
+    response = await controller.execute(
+        RpcRequest.model_validate(
+            {
+                "request_id": str(uuid4()),
+                "actor": "swag",
+                "action": {
+                    "kind": "confirm_switch",
+                    "confirmation_id": prepared.result.confirmation_id,
+                },
+            }
+        )
+    )
+
+    assert not response.ok
+    assert response.error.code.value == "health_failed"
+
+
+@pytest.mark.asyncio
 async def test_reconcile_startup_resolves_stale_pending_claim(tmp_path) -> None:
     controller = Controller.for_testing(tmp_path)
     request_id = uuid4()
-    canonical = '{"action":{"kind":"get_status"},"actor":"operator","request_id":"' + str(request_id) + '"}'
+    canonical = '{"action":{"kind":"get_status"},"actor":"swag","request_id":"' + str(request_id) + '"}'
     controller._db().execute(
         "INSERT INTO rpc_idempotency(request_id,canonical_request,response,status,created_at) VALUES (?,?,?,?,?)",
         (str(request_id), canonical, "", "pending", "2024-01-01T00:00:00Z"),
@@ -505,7 +625,7 @@ async def test_reconcile_startup_resolves_stale_pending_claim(tmp_path) -> None:
     await controller.reconcile_startup()
     response = await controller.execute(
         RpcRequest.model_validate(
-            {"request_id": str(request_id), "actor": "operator", "action": {"kind": "get_status"}}
+            {"request_id": str(request_id), "actor": "swag", "action": {"kind": "get_status"}}
         )
     )
     assert not response.ok
@@ -710,20 +830,20 @@ async def test_slot_conflict_and_confirmation_rejection_are_audited(tmp_path) ->
         RpcRequest.model_validate(
             {
                 "request_id": str(uuid4()),
-                "actor": "operator",
+                "actor": "swag",
                 "action": {"kind": "start", "profile_id": "minecraft"},
             }
         )
     )
     assert not response.ok and response.error.code.value == "slot_conflict"
     assert controller._db().execute(
-        "SELECT 1 FROM audit WHERE actor='operator' AND result='rejected' AND error_code='slot_conflict'"
+        "SELECT 1 FROM audit WHERE actor='swag' AND result='rejected' AND error_code='slot_conflict'"
     ).fetchone()
     mismatch = await controller.execute(
         RpcRequest.model_validate(
             {
                 "request_id": str(uuid4()),
-                "actor": "operator",
+                "actor": "swag",
                 "action": {
                     "kind": "confirm_force_stop",
                     "confirmation_id": "x" * 32,
@@ -733,7 +853,7 @@ async def test_slot_conflict_and_confirmation_rejection_are_audited(tmp_path) ->
     )
     assert not mismatch.ok
     assert controller._db().execute(
-        "SELECT 1 FROM audit WHERE actor='operator' AND result='rejected' AND error_code='confirmation_mismatch'"
+        "SELECT 1 FROM audit WHERE actor='swag' AND result='rejected' AND error_code='confirmation_mismatch'"
     ).fetchone()
 
 
@@ -779,7 +899,616 @@ async def test_prepare_operations_require_profile_gates(tmp_path) -> None:
     for action in actions:
         response = await controller.execute(
             RpcRequest.model_validate(
-                {"request_id": str(uuid4()), "actor": "operator", "action": action}
+                {"request_id": str(uuid4()), "actor": "swag", "action": action}
             )
         )
         assert not response.ok and response.error.code.value == "invalid_request"
+
+
+@pytest.mark.asyncio
+async def test_start_slot_conflict_finishes_accepted_job_as_failed(tmp_path) -> None:
+    profile = _profile()
+    controller = Controller(
+        profiles={profile.id: profile},
+        adapters={profile.id: _Adapter()},
+        operation_lock_factory=_MemoryLock,
+        await_free_slot=lambda: False,
+    )
+
+    with pytest.raises(_ControllerFailure, match="slot is occupied"):
+        await controller._start(Start(kind="start", profile_id=profile.id), "test", uuid4())
+
+    assert controller._db().execute(
+        "SELECT operation,state,detail FROM jobs ORDER BY created_at DESC LIMIT 1"
+    ).fetchone() == ("start", "failed", "slot is occupied")
+
+
+@pytest.mark.asyncio
+async def test_start_async_readiness_failure_finishes_job(tmp_path) -> None:
+    profile = _profile()
+
+    async def not_ready(_profile):
+        return False
+
+    controller = Controller(
+        profiles={profile.id: profile},
+        adapters={profile.id: _Adapter()},
+        operation_lock_factory=_MemoryLock,
+        await_free_slot=lambda: True,
+        await_ready=not_ready,
+    )
+
+    with pytest.raises(_ControllerFailure, match="start failed"):
+        await controller._start(Start(kind="start", profile_id=profile.id), "test", uuid4())
+
+    assert controller._db().execute(
+        "SELECT operation,state,detail FROM jobs ORDER BY created_at DESC LIMIT 1"
+    ).fetchone() == ("start", "failed", "start failed")
+
+
+@pytest.mark.asyncio
+async def test_start_timeout_finishes_job_with_retryable_timeout(tmp_path) -> None:
+    profile = _profile()
+
+    async def times_out(_profile):
+        raise asyncio.TimeoutError
+
+    controller = Controller(
+        profiles={profile.id: profile},
+        adapters={profile.id: _Adapter()},
+        operation_lock_factory=_MemoryLock,
+        await_free_slot=lambda: True,
+        await_ready=times_out,
+    )
+
+    with pytest.raises(_ControllerFailure) as exc_info:
+        await controller._start(Start(kind="start", profile_id=profile.id), "test", uuid4())
+
+    assert exc_info.value.code.value == "start_timeout"
+    assert controller._db().execute(
+        "SELECT operation,state,detail FROM jobs ORDER BY created_at DESC LIMIT 1"
+    ).fetchone() == ("start", "failed", "start timed out")
+
+
+@pytest.mark.asyncio
+async def test_stop_timeout_finishes_job_with_grace_timeout(tmp_path) -> None:
+    class TimeoutAdapter(_Adapter):
+        async def graceful_stop(self, profile):
+            raise asyncio.TimeoutError
+
+    profile = _profile()
+    controller = Controller(
+        profiles={profile.id: profile},
+        adapters={profile.id: TimeoutAdapter()},
+        operation_lock_factory=_MemoryLock,
+    )
+
+    with pytest.raises(_ControllerFailure, match="graceful stop timed out"):
+        await controller._stop(Stop(kind="stop", profile_id=profile.id), "test", uuid4())
+
+    assert controller._db().execute(
+        "SELECT operation,state,detail FROM jobs ORDER BY created_at DESC LIMIT 1"
+    ).fetchone() == ("stop", "failed", "graceful stop timed out")
+
+
+@pytest.mark.asyncio
+async def test_reserve_fallback_seam_keeps_check_and_reserve_under_lock(tmp_path) -> None:
+    class Store:
+        def __init__(self):
+            self.calls = []
+
+        def read(self):
+            self.calls.append("read")
+            return None
+
+        def reserve(self, profile_id, lease_id, ttl):
+            self.calls.append((profile_id, lease_id, ttl))
+
+    profile = _profile()
+    store = Store()
+    controller = Controller(
+        profiles={profile.id: profile},
+        reservation_store=store,
+        operation_lock_factory=_MemoryLock,
+    )
+
+    lease = await controller._reserve(profile, "start", "operation")
+
+    assert lease[0:2] == (profile.id, "operation")
+    assert store.calls == ["read", (profile.id, "operation", 30.0)]
+
+
+@pytest.mark.asyncio
+async def test_reserve_atomic_seam_falls_back_without_generation_keyword(tmp_path) -> None:
+    class Store:
+        def __init__(self):
+            self.calls = []
+
+        def reserve_if_available(self, *args, **kwargs):
+            self.calls.append((args, kwargs))
+            if kwargs:
+                raise TypeError("legacy reservation seam")
+
+    profile = _profile()
+    store = Store()
+    controller = Controller(
+        profiles={profile.id: profile},
+        reservation_store=store,
+        operation_lock_factory=_MemoryLock,
+    )
+
+    lease = await controller._reserve(profile, "start", "operation")
+
+    assert lease[0:2] == (profile.id, "operation")
+    assert len(store.calls) == 2
+
+
+@pytest.mark.asyncio
+async def test_reserve_fallback_rejects_another_profile_owner(tmp_path) -> None:
+    class Store:
+        def read(self):
+            return SimpleNamespace(profile_id=ProfileId.TERRARIA_VANILLA)
+
+        def reserve(self, *_args):
+            raise AssertionError("must not reserve over another owner")
+
+    profile = _profile()
+    controller = Controller(
+        profiles={profile.id: profile},
+        reservation_store=Store(),
+        operation_lock_factory=_MemoryLock,
+    )
+
+    with pytest.raises(_ControllerFailure) as exc_info:
+        await controller._reserve(profile, "start", "operation")
+
+    assert exc_info.value.code.value == "slot_conflict"
+
+
+@pytest.mark.asyncio
+async def test_clear_reservation_exercises_owned_clear_and_path_cleanup(tmp_path) -> None:
+    profile = ProfileId.MINECRAFT
+    lease = (profile, "operation", 0)
+
+    class Releaser:
+        def __init__(self):
+            self.args = None
+
+        async def release_if_owned(self, *args):
+            self.args = args
+
+    releaser = Releaser()
+    controller = Controller.for_testing(tmp_path)
+    controller.reservation_store = releaser
+    await controller._clear_reservation(lease)
+    assert releaser.args == lease
+
+    class Clearer:
+        def __init__(self):
+            self.cleared = False
+
+        async def clear(self):
+            self.cleared = True
+
+    clearer = Clearer()
+    controller.reservation_store = clearer
+    await controller._clear_reservation()
+    assert clearer.cleared
+
+    reservation_path = tmp_path / "reservation"
+    reservation_path.write_text("lease")
+    controller.reservation_store = SimpleNamespace(reservation_path=reservation_path)
+    await controller._clear_reservation()
+    assert not reservation_path.exists()
+
+
+@pytest.mark.asyncio
+async def test_clear_reservation_ignores_path_unlink_failure(tmp_path, monkeypatch) -> None:
+    reservation_path = tmp_path / "reservation"
+    reservation_path.write_text("lease")
+    controller = Controller.for_testing(tmp_path)
+    controller.reservation_store = SimpleNamespace(reservation_path=reservation_path)
+
+    def fail_unlink(self, *, missing_ok=False):
+        raise OSError("filesystem unavailable")
+
+    monkeypatch.setattr(Path, "unlink", fail_unlink)
+    await controller._clear_reservation()
+
+
+@pytest.mark.asyncio
+async def test_switch_timeout_without_force_preserves_typed_error(tmp_path) -> None:
+    source = _profile()
+    target = source.model_copy(update={"id": ProfileId.TERRARIA_VANILLA, "display_name": "Terraria"})
+
+    class Adapter(_Adapter):
+        async def graceful_stop(self, profile):
+            if profile.id is ProfileId.MINECRAFT:
+                raise asyncio.TimeoutError
+
+    controller = Controller(
+        profiles={source.id: source, target.id: target},
+        adapters={source.id: Adapter(), target.id: Adapter()},
+        operation_lock_factory=_MemoryLock,
+        await_free_slot=lambda: True,
+        await_ready=lambda _profile: True,
+    )
+    prepared = await controller._prepare_switch(
+        PrepareSwitch(
+            kind="prepare_switch",
+            current_profile_id=source.id,
+            target_profile_id=target.id,
+            options=SwitchOptions(force_after_timeout=False, rollback_on_failure=False),
+        ),
+        "test",
+        uuid4(),
+    )
+
+    with pytest.raises(_ControllerFailure) as exc_info:
+        await controller._confirm_switch(
+            ConfirmSwitch(kind="confirm_switch", confirmation_id=prepared.confirmation_id),
+            "test",
+            uuid4(),
+        )
+
+    assert exc_info.value.code.value == "grace_timeout"
+
+
+@pytest.mark.asyncio
+async def test_switch_async_target_readiness_rolls_back_successfully(tmp_path) -> None:
+    source = _profile()
+    target = source.model_copy(update={"id": ProfileId.TERRARIA_VANILLA, "display_name": "Terraria"})
+    events = []
+
+    class Adapter(_Adapter):
+        async def graceful_stop(self, profile):
+            events.append(("stop", profile.id))
+
+        async def start(self, profile):
+            events.append(("start", profile.id))
+
+    class Store:
+        def reserve_if_available(self, *_args, **_kwargs):
+            return None
+
+        async def transfer_if_owned(self, profile, operation_id, generation, target, rollback_id):
+            del operation_id, generation, rollback_id
+            events.append(("transfer", profile, target))
+            return None
+
+        def release_if_owned(self, *_args):
+            return None
+
+    async def ready(profile):
+        return profile.id is ProfileId.MINECRAFT
+
+    controller = Controller(
+        profiles={source.id: source, target.id: target},
+        adapters={source.id: Adapter(), target.id: Adapter()},
+        reservation_store=Store(),
+        operation_lock_factory=_MemoryLock,
+        await_free_slot=lambda: True,
+        await_ready=ready,
+    )
+    prepared = await controller._prepare_switch(
+        PrepareSwitch(
+            kind="prepare_switch",
+            current_profile_id=source.id,
+            target_profile_id=target.id,
+            options=SwitchOptions(rollback_on_failure=True),
+        ),
+        "test",
+        uuid4(),
+    )
+
+    with pytest.raises(_ControllerFailure, match="switch failed"):
+        await controller._confirm_switch(
+            ConfirmSwitch(kind="confirm_switch", confirmation_id=prepared.confirmation_id),
+            "test",
+            uuid4(),
+        )
+
+    assert events == [
+        ("stop", source.id),
+        ("start", target.id),
+        ("stop", target.id),
+        ("transfer", target.id, source.id),
+        ("start", source.id),
+    ]
+    assert controller._db().execute(
+        "SELECT 1 FROM events WHERE code='rollback_succeeded'"
+    ).fetchone()
+    assert ("transfer", target.id, source.id) in events
+
+
+@pytest.mark.asyncio
+async def test_start_with_free_retry_retries_controller_busy_exit(tmp_path) -> None:
+    class BusyStart(Exception):
+        returncode = 75
+
+    class Adapter(_Adapter):
+        def __init__(self):
+            super().__init__()
+            self.attempts = 0
+
+        async def start(self, profile):
+            self.attempts += 1
+            if self.attempts == 1:
+                raise BusyStart
+
+    profile = _profile()
+    adapter = Adapter()
+    controller = Controller(
+        profiles={profile.id: profile},
+        adapters={profile.id: adapter},
+        operation_lock_factory=_MemoryLock,
+        await_free_slot=lambda: True,
+    )
+
+    await controller._start_with_free_retry(profile)
+
+    assert adapter.attempts == 2
+
+
+@pytest.mark.asyncio
+async def test_switch_fails_when_slot_never_becomes_free(tmp_path) -> None:
+    source = _profile()
+    target = source.model_copy(update={"id": ProfileId.TERRARIA_VANILLA, "display_name": "Terraria"})
+    controller = Controller(
+        profiles={source.id: source, target.id: target},
+        adapters={source.id: _Adapter(), target.id: _Adapter()},
+        operation_lock_factory=_MemoryLock,
+        await_free_slot=lambda: False,
+        await_ready=lambda _profile: True,
+    )
+    prepared = await controller._prepare_switch(
+        PrepareSwitch(
+            kind="prepare_switch",
+            current_profile_id=source.id,
+            target_profile_id=target.id,
+            options=SwitchOptions(rollback_on_failure=False),
+        ),
+        "test",
+        uuid4(),
+    )
+
+    with pytest.raises(_ControllerFailure) as exc_info:
+        await controller._confirm_switch(
+            ConfirmSwitch(kind="confirm_switch", confirmation_id=prepared.confirmation_id),
+            "test",
+            uuid4(),
+        )
+
+    assert exc_info.value.code.value == "slot_conflict"
+
+
+@pytest.mark.asyncio
+async def test_switch_records_failed_rollback_when_source_is_not_ready(tmp_path) -> None:
+    source = _profile()
+    target = source.model_copy(update={"id": ProfileId.TERRARIA_VANILLA, "display_name": "Terraria"})
+    controller = Controller(
+        profiles={source.id: source, target.id: target},
+        adapters={source.id: _Adapter(), target.id: _Adapter()},
+        operation_lock_factory=_MemoryLock,
+        await_free_slot=lambda: True,
+        await_ready=lambda _profile: False,
+    )
+    prepared = await controller._prepare_switch(
+        PrepareSwitch(
+            kind="prepare_switch",
+            current_profile_id=source.id,
+            target_profile_id=target.id,
+            options=SwitchOptions(rollback_on_failure=True),
+        ),
+        "test",
+        uuid4(),
+    )
+
+    with pytest.raises(_ControllerFailure, match="switch failed"):
+        await controller._confirm_switch(
+            ConfirmSwitch(kind="confirm_switch", confirmation_id=prepared.confirmation_id),
+            "test",
+            uuid4(),
+        )
+
+    assert controller._db().execute(
+        "SELECT 1 FROM events WHERE code='rollback_failed'"
+    ).fetchone()
+
+
+@pytest.mark.asyncio
+async def test_start_with_free_retry_reports_slot_conflict_if_retry_stays_busy(tmp_path) -> None:
+    class BusyStart(Exception):
+        returncode = 75
+
+    class Adapter(_Adapter):
+        async def start(self, profile):
+            raise BusyStart
+
+    profile = _profile()
+    controller = Controller(
+        profiles={profile.id: profile},
+        adapters={profile.id: Adapter()},
+        operation_lock_factory=_MemoryLock,
+        await_free_slot=lambda: False,
+    )
+
+    with pytest.raises(_ControllerFailure, match="slot did not become free"):
+        await controller._start_with_free_retry(profile)
+
+
+@pytest.mark.asyncio
+async def test_start_with_free_retry_renews_lease_for_second_attempt(tmp_path) -> None:
+    class BusyStart(Exception):
+        returncode = 75
+
+    class Adapter(_Adapter):
+        def __init__(self):
+            super().__init__()
+            self.attempts = 0
+
+        async def start(self, profile):
+            self.attempts += 1
+            if self.attempts == 1:
+                raise BusyStart
+
+    profile = _profile()
+    adapter = Adapter()
+    controller = Controller(
+        profiles={profile.id: profile},
+        adapters={profile.id: adapter},
+        operation_lock_factory=_MemoryLock,
+        await_free_slot=lambda: True,
+    )
+    renewal = asyncio.create_task(asyncio.Event().wait())
+
+    try:
+        await controller._start_with_free_retry(profile, renewal)
+    finally:
+        renewal.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await renewal
+
+    assert adapter.attempts == 2
+
+
+@pytest.mark.asyncio
+async def test_force_stop_failure_finishes_job_as_failed(tmp_path) -> None:
+    class FailingForceStop(_Adapter):
+        async def force_stop(self, profile):
+            raise RuntimeError("force stop failed")
+
+    profile = _profile().model_copy(
+        update={"operations": frozenset({OperationName.START, OperationName.STOP, OperationName.FORCE_STOP})}
+    )
+    controller = Controller(
+        profiles={profile.id: profile},
+        adapters={profile.id: FailingForceStop()},
+        operation_lock_factory=_MemoryLock,
+    )
+    prepared = await controller._prepare_force_stop(
+        PrepareForceStop(kind="prepare_force_stop", profile_id=profile.id), "test", uuid4()
+    )
+
+    with pytest.raises(_ControllerFailure, match="force stop failed"):
+        await controller._confirm_force_stop(
+            ConfirmForceStop(kind="confirm_force_stop", confirmation_id=prepared.confirmation_id),
+            "test",
+            uuid4(),
+        )
+
+    assert controller._db().execute(
+        "SELECT operation,state,detail FROM jobs ORDER BY created_at DESC LIMIT 1"
+    ).fetchone() == ("force_stop", "failed", "force stop failed")
+
+
+@pytest.mark.asyncio
+async def test_await_lease_without_renewal_runs_work(tmp_path) -> None:
+    controller = Controller.for_testing(tmp_path)
+
+    async def immediate():
+        return "done"
+
+    assert await controller._await_lease(immediate(), None) == "done"
+
+
+@pytest.mark.asyncio
+async def test_confirmation_consumption_and_expiry_are_rejected(tmp_path) -> None:
+    now = datetime(2024, 1, 1, tzinfo=timezone.utc)
+    profile = _profile().model_copy(
+        update={"operations": frozenset({OperationName.START, OperationName.STOP, OperationName.FORCE_STOP})}
+    )
+    controller = Controller(
+        profiles={profile.id: profile},
+        adapters={profile.id: _Adapter()},
+        operation_lock_factory=_MemoryLock,
+        clock=lambda: now,
+    )
+
+    consumed = await controller._prepare_force_stop(
+        PrepareForceStop(kind="prepare_force_stop", profile_id=profile.id), "test", uuid4()
+    )
+    await controller._consume_confirmation("test", "force_stop", consumed.confirmation_id)
+    with pytest.raises(_ControllerFailure, match="already consumed"):
+        await controller._consume_confirmation("test", "force_stop", consumed.confirmation_id)
+
+    expired = await controller._prepare_force_stop(
+        PrepareForceStop(kind="prepare_force_stop", profile_id=profile.id), "test", uuid4()
+    )
+    controller._clock = lambda: now + timedelta(minutes=6)
+    with pytest.raises(_ControllerFailure, match="confirmation expired"):
+        await controller._consume_confirmation("test", "force_stop", expired.confirmation_id)
+
+
+@pytest.mark.asyncio
+async def test_reconcile_startup_marks_jobs_and_reconciles_slot_observation(tmp_path) -> None:
+    profile = _profile()
+
+    class Registry(dict):
+        @property
+        def profiles(self):
+            return tuple(self.values())
+
+    class Reservation:
+        def __init__(self):
+            self.reconciled = False
+
+        async def reconcile(self):
+            self.reconciled = True
+            return True
+
+    class Adapter(_Adapter):
+        async def observe(self, profile):
+            raise RuntimeError("observation failed")
+
+        async def start(self, profile):
+            raise RuntimeError("boot start failed")
+
+    class Inspector:
+        def __init__(self):
+            self.observed = 0
+
+        def observe(self):
+            self.observed += 1
+
+    reservation = Reservation()
+    inspector = Inspector()
+    controller = Controller(
+        profiles=Registry({profile.id: profile}),
+        reservation_store=reservation,
+        adapters={profile.id: Adapter()},
+        operation_lock_factory=_MemoryLock,
+        slot_inspector=inspector,
+        await_free_slot=lambda: True,
+        await_ready=lambda _profile: True,
+        boot_profile=profile.id.value,
+        boot_autostart=True,
+    )
+    controller._db().execute(
+        "INSERT INTO jobs(id,profile_id,operation,state,created_at,detail) VALUES (?,?,?,?,?,?)",
+        ("pending", profile.id.value, "start", "accepted", "2024-01-01T00:00:00Z", ""),
+    )
+    controller._db().execute(
+        "CREATE TABLE benchmark_runs("
+        "id TEXT PRIMARY KEY,profile_id TEXT NOT NULL,baseline_preset TEXT NOT NULL,"
+        "candidate_preset TEXT NOT NULL,state TEXT NOT NULL,created_at TEXT NOT NULL,"
+        "finished_at TEXT,error_code TEXT)"
+    )
+    controller._db().execute(
+        "INSERT INTO benchmark_runs(id,profile_id,baseline_preset,candidate_preset,state,created_at) "
+        "VALUES (?,?,?,?,?,?)",
+        ("bench-pending", profile.id.value, "current", "candidate", "running", "2024-01-01T00:00:00Z"),
+    )
+    controller._db().commit()
+
+    await controller.reconcile_startup()
+
+    assert reservation.reconciled
+    assert inspector.observed == 1
+    assert controller._boot_autostart_attempted
+    assert controller._db().execute(
+        "SELECT state,detail FROM jobs WHERE id='pending'"
+    ).fetchone() == ("failed", "controller restarted")
+    assert controller._db().execute(
+        "SELECT state,error_code FROM benchmark_runs WHERE id='bench-pending'"
+    ).fetchone() == ("failed", "controller_restarted")
