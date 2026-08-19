@@ -16,6 +16,12 @@ module = importlib.util.module_from_spec(spec)
 loader.exec_module(module)
 
 
+def test_installed_helper_uses_horizon_virtualenv():
+    assert UTILITY_PATH.read_text(encoding="utf-8").startswith(
+        "#!/opt/game-control/.venv/bin/python\n"
+    )
+
+
 def _db(path: Path) -> None:
     db = sqlite3.connect(path)
     db.execute("CREATE TABLE benchmark_runs(id TEXT PRIMARY KEY,profile_id TEXT NOT NULL,baseline_preset TEXT NOT NULL,candidate_preset TEXT NOT NULL,state TEXT NOT NULL,created_at TEXT NOT NULL,finished_at TEXT,overall_verdict TEXT,summary_json TEXT,artifact_path TEXT,error_code TEXT)")
