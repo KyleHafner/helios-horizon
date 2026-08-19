@@ -38,7 +38,7 @@ jobs:
           python-version: "3.11"
           enable-cache: true
       - run: uv sync --frozen --extra test
-      - run: uv run playwright install --with-deps chromium
+      - run: uv run playwright install chromium
       - run: uv run pytest -q tests/browser
 
   security:
