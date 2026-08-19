@@ -14,6 +14,7 @@ from typing import Any
 
 from game_control.benchmarks import _summary_models
 from game_control.models import ProfileId
+from game_control.state_db import _is_rfc3339_timestamp
 
 
 class ImportError(RuntimeError):
@@ -102,6 +103,9 @@ def import_campaign(input_path: str | os.PathLike[str], database_path: str | os.
         raise ImportError("campaign input exceeds the bounded 256 KiB limit")
     run_id, values = _load(source)
     connection = sqlite3.connect(database, timeout=5.0)
+    connection.create_function(
+        "is_rfc3339_timestamp", 1, _is_rfc3339_timestamp, deterministic=True
+    )
     try:
         _validate_db(connection)
         connection.execute("BEGIN IMMEDIATE")

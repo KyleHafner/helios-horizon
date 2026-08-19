@@ -24,7 +24,10 @@ def test_installed_helper_uses_horizon_virtualenv():
 
 def _db(path: Path) -> None:
     db = sqlite3.connect(path)
-    db.execute("CREATE TABLE benchmark_runs(id TEXT PRIMARY KEY,profile_id TEXT NOT NULL,baseline_preset TEXT NOT NULL,candidate_preset TEXT NOT NULL,state TEXT NOT NULL,created_at TEXT NOT NULL,finished_at TEXT,overall_verdict TEXT,summary_json TEXT,artifact_path TEXT,error_code TEXT)")
+    db.create_function(
+        "is_rfc3339_timestamp", 1, module._is_rfc3339_timestamp, deterministic=True
+    )
+    db.execute("CREATE TABLE benchmark_runs(id TEXT PRIMARY KEY,profile_id TEXT NOT NULL,baseline_preset TEXT NOT NULL,candidate_preset TEXT NOT NULL,state TEXT NOT NULL,created_at TEXT NOT NULL CHECK (is_rfc3339_timestamp(created_at) = 1),finished_at TEXT CHECK (finished_at IS NULL OR is_rfc3339_timestamp(finished_at) = 1),overall_verdict TEXT,summary_json TEXT,artifact_path TEXT,error_code TEXT)")
     db.commit(); db.close(); path.chmod(0o600)
 
 
