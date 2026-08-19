@@ -8,7 +8,7 @@ from pathlib import Path
 from urllib.parse import urlparse
 
 import pytest
-from playwright.sync_api import Page, sync_playwright
+from playwright.sync_api import Page, expect, sync_playwright
 
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -588,7 +588,7 @@ def test_mobile_drawer_and_server_group_are_keyboard_accessible(page: Page):
     assert page.locator("#server-nav").get_attribute("hidden") is not None
     page.get_by_role("button", name="Close navigation").click()
     assert drawer.get_attribute("aria-hidden") == "true"
-    assert page.locator("#drawer-overlay").get_attribute("hidden") is not None
+    expect(page.locator("#drawer-overlay")).to_be_hidden()
     assert page.evaluate("document.activeElement === document.querySelector('#menu-toggle')")
     burger.click()
     page.locator("#drawer-overlay").click(position={"x": 350, "y": 12})
@@ -789,10 +789,11 @@ def test_breakpoint_crossing_resynchronizes_sidebar_state(page: Page):
     page.get_by_role("button", name="Settings").click()
     assert page.get_by_role("heading", name="Settings").is_visible()
     page.set_viewport_size({"width": 390, "height": 844})
-    page.wait_for_timeout(50)
-    assert sidebar.get_attribute("aria-hidden") == "true"
-    assert sidebar.get_attribute("inert") == ""
-    assert page.get_by_role("button", name="Open navigation").get_attribute("aria-expanded") == "false"
+    expect(sidebar).to_have_attribute("aria-hidden", "true")
+    expect(sidebar).to_have_attribute("inert", "")
+    expect(page.get_by_role("button", name="Open navigation")).to_have_attribute(
+        "aria-expanded", "false"
+    )
 
 
 def test_desktop_shell_uses_internal_main_scrolling(page: Page):
