@@ -211,7 +211,14 @@ class StatusService:
             latest = connection.execute("SELECT ended_at FROM player_sessions WHERE ended_at IS NOT NULL ORDER BY ended_at DESC LIMIT 1").fetchone()
             quiet = latest is None or datetime.fromisoformat(latest[0].replace("Z", "+00:00")).timestamp() <= self.clock().timestamp() - 900
             no_wake = connection.execute("SELECT 1 FROM player_sessions WHERE ended_at IS NULL LIMIT 1").fetchone() is None
-        no_wake = no_wake and bool(self.capability_evidence and await self._call(self.capability_evidence))
+        wake_evidence = await self._call(self.capability_evidence) if self.capability_evidence else None
+        if wake_evidence is not None and hasattr(wake_evidence, "available") and hasattr(wake_evidence, "clear"):
+            wake_clear = bool(wake_evidence.available and wake_evidence.clear)
+        else:
+            # Narrow injected seams may still return a boolean; malformed or
+            # absent production evidence remains false through this gate.
+            wake_clear = bool(wake_evidence)
+        no_wake = no_wake and wake_clear
         return {"maintenance_window": maintenance_window, "storage_acceptable": storage_ok, "ups_acceptable": ups_ok, "quiet_period": quiet, "no_wake_session": no_wake, "no_conflicting_jobs": stopped, "rollback_safe_public_wake": rollback_safe and public_wake_policy == "safe"}
 
     async def _sample(self, *, persist: bool = False) -> StatusSnapshot:

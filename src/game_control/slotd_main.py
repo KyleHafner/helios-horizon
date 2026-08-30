@@ -402,6 +402,7 @@ def build_controller(config_path: str | os.PathLike[str] = ROOT_CONFIG) -> Contr
             else:
                 adapters[profile.id] = SystemdAdapter()
     inspector = SlotInspector()
+    reservation_store = ReservationStore(reservation_path=reservation_path)
 
     async def await_free_slot(timeout_seconds: float = 30.0):
         return await _await_free_slot(inspector, timeout_seconds)
@@ -448,13 +449,14 @@ def build_controller(config_path: str | os.PathLike[str] = ROOT_CONFIG) -> Contr
         sunlit_online_backup=SunlitRconTransport(sunlit_rcon) if sunlit_rcon is not None else None,
         benchmark_config=benchmark_config,
         rcon_telemetry=rcon_telemetry,
+        reservation_store=reservation_store,
     )
     if services.session_store is not None:
         services.session_store.recover(now=datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"))
     return Controller(
         profiles=registry,
         state_db=state_db,
-        reservation_store=ReservationStore(reservation_path=reservation_path),
+        reservation_store=reservation_store,
         adapters=adapters,
         services=services,
         slot_inspector=inspector,

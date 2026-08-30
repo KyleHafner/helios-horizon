@@ -30,6 +30,7 @@ from uuid import uuid4
 from .backups import B2CommandTransport, B2ProtectionService, BackupService, RestoreService
 from .alert_policy import PerformanceAlertEvaluator
 from .benchmarks import BenchmarkService, parse_benchmark_plans
+from .capability_evidence import RootWakeSafetyEvidence
 from .errors import SafeError
 from .health import HealthChecker
 from .logs import LogService
@@ -117,32 +118,6 @@ def _isolated_database(database: Any) -> Any | None:
 def _close_database(database: Any | None) -> None:
     if database is not None and hasattr(database, "close"):
         database.close()
-
-
-def _capability_wake_clear(path: str = "/var/lib/game-control-web/web.db") -> bool:
-    """Read-only, fail-closed wake capability evidence."""
-    fd = None
-    try:
-        fd = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
-        info = os.fstat(fd)
-        parent = os.stat(str(Path(path).parent), follow_symlinks=False)
-        if not stat.S_ISDIR(parent.st_mode) or parent.st_uid != 0 or stat.S_IMODE(parent.st_mode) != 0o700:
-            return False
-        if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1 or stat.S_IMODE(info.st_mode) & 0o077 or info.st_size > 64 * 1024 * 1024:
-            return False
-        connection = sqlite3.connect(f"file:{path}?mode=ro", uri=True, timeout=0.2)
-        connection.execute("PRAGMA query_only=ON")
-        connection.execute("PRAGMA busy_timeout=200")
-        row = connection.execute("SELECT 1 FROM capability_requests WHERE action_kind='wake' AND status='pending' LIMIT 1").fetchone()
-        after = os.fstat(fd)
-        connection.close()
-        return row is None and (after.st_dev, after.st_ino, after.st_uid, after.st_gid, after.st_size) == (info.st_dev, info.st_ino, info.st_uid, info.st_gid, info.st_size)
-    except (OSError, sqlite3.Error):
-        return False
-    finally:
-        if fd is not None:
-            try: os.close(fd)
-            except OSError: pass
 
 
 def _prometheus_ups_provider(config: Mapping[str, Any] | None) -> Callable[[], bool]:
@@ -1196,6 +1171,7 @@ def build_service_seams(
     benchmark_config: Any = None,
     telemetry_db: Any | None = None,
     rcon_telemetry: PersistentRconTelemetry | None = None,
+    reservation_store: Any | None = None,
 ) -> ServiceSeams:
     opened_here = telemetry_db is None
     telemetry_db_owned = False
@@ -1214,7 +1190,7 @@ def build_service_seams(
             b2_transport=b2_transport, sunlit_online_backup=sunlit_online_backup,
             benchmark_config=benchmark_config, telemetry_db=telemetry_db,
             telemetry_db_owned=telemetry_db_owned,
-            rcon_telemetry=rcon_telemetry,
+            rcon_telemetry=rcon_telemetry, reservation_store=reservation_store,
         )
     except BaseException:
         if opened_here and telemetry_db is not None and hasattr(telemetry_db, "close"):
@@ -1237,6 +1213,7 @@ def _build_service_seams_impl(
     telemetry_db: Any | None = None,
     telemetry_db_owned: bool = False,
     rcon_telemetry: PersistentRconTelemetry | None = None,
+    reservation_store: Any | None = None,
 ) -> ServiceSeams:
     profile_items = tuple(profiles)
     profile_map = {_key(profile): profile for profile in profile_items}
@@ -1306,7 +1283,7 @@ def _build_service_seams_impl(
         session_store=session_store,
         generation=lambda: _generation(state_db),
         telemetry_db=telemetry_db,
-        capability_evidence=_capability_wake_clear,
+        capability_evidence=RootWakeSafetyEvidence(state_db, reservation_store),
         ups_health=_prometheus_ups_provider(stats.get("benchmark_ups")),
         storage_paths=("/srv/game-servers", "/var/lib/game-control"),
     )
