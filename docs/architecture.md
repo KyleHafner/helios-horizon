@@ -115,14 +115,26 @@ The detailed invariant ownership is maintained in
 
 ### Profile lifecycle
 
-The public lifecycle vocabulary is finite and intentionally distinguishes
-health uncertainty from lifecycle state:
+The public `ObservedState` lifecycle vocabulary is finite and intentionally
+distinguishes health uncertainty from lifecycle state:
 
 ```text
-initializing ──► stopped ──► starting ──► running ──► stopping ──► stopped
-                    │             │          │
-                    └─────────────┴──────────┴──────────────► failed
+stopped ──► starting ──► running ──► stopping ──► stopped
+   │           │             │          │
+   ├─────────────────────────────────────────────► blocked
+   └───────────┴─────────────┴──────────┴────────► failed
 ```
+
+`StatusSnapshot.initializing` is a separate boolean bootstrap/readiness
+indicator while the controller is producing its initial snapshot; it is not
+an `ObservedState` member or a lifecycle transition. `StatusSnapshot` can
+therefore report initialization independently of each profile's observed
+state. `ObservedState` and `StatusSnapshot` are defined in
+[`models.py`](../src/game_control/models.py) and
+[`protocol.py`](../src/game_control/protocol.py).
+`StatusService` derives `blocked` when a conflicting slot owner is present and
+`failed` for a failed job; these are observed outcomes, not additional
+transient lifecycle phases. See [`status.py`](../src/game_control/status.py).
 
 `StatusService` combines fresh adapter/process/port/health observations with
 root job and slot evidence to produce a typed status projection. `HealthState`
@@ -130,8 +142,7 @@ may be `unknown` when observation is unavailable; unavailable telemetry is not
 converted to a healthy or zero value. Cached status and UI projections cannot
 authorize a lifecycle transition. See [`status.py`](../src/game_control/status.py),
 [`health.py`](../src/game_control/health.py),
-[`models.py`](../src/game_control/models.py), and
-[`protocol.py`](../src/game_control/protocol.py).
+and [`protocol.py`](../src/game_control/protocol.py).
 
 ### Operation and maintenance lifecycle
 
@@ -170,9 +181,13 @@ absent ── reserve under exclusive operation.lock ──► live
 The reservation is exact: profile, operation ID, state generation, controller
 PID, process start ticks, operation kind, and bounded expiry must match. The
 direct slot runner accepts only a matching lifecycle reservation; the updater
-uses an update-kind reservation and a publication guard. The final publication
-guard rechecks ownership while the operation lock is held, performs the bounded
-irreversible action and directory fsync, then releases the exact reservation.
+uses an update-kind reservation and a publication guard. For each bounded
+irreversible action, the publication guard acquires the exclusive operation
+lock, rechecks exact ownership and inactive state, yields for the action and
+the affected directory fsync, then exits the lock. The guard does not release
+the reservation. The outer updater drains promotion, cleanup, and the renewal
+worker before releasing that exact reservation, so a failed cleanup cannot
+release or steal a replacement reservation.
 See [`slot.py`](../src/game_control/slot.py),
 [`ops/bin/game-slot-run`](../ops/bin/game-slot-run),
 [`sunlit_update.py`](../src/game_control/sunlit_update.py), and
@@ -194,9 +209,11 @@ publication fences. It discovers and validates an official release manifest,
 performs conservative capacity checks, stages and verifies the candidate,
 protects the existing backup/state, and calls the typed promotion API. Each
 irreversible state/release/version/active-link or rollback action enters the
-reservation-aware publication guard and fsyncs the affected directory. A
-failed or interrupted publication leaves durable evidence for an owned retry;
-it does not silently claim success. See [`sunlit_update.py`](../src/game_control/sunlit_update.py),
+reservation-aware publication guard, which locks and unlocks around that one
+action and fsyncs the affected directory. The outer updater retains ownership
+through all publication and cleanup, then releases the exact reservation only
+after renewal has drained. A failed or interrupted publication leaves durable
+evidence for an owned retry; it does not silently claim success. See [`sunlit_update.py`](../src/game_control/sunlit_update.py),
 [`sunlit_stage.py`](../src/game_control/sunlit_stage.py), and
 [`sunlit_promote.py`](../src/game_control/sunlit_promote.py).
 
