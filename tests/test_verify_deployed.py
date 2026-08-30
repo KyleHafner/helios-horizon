@@ -1,23 +1,19 @@
 from __future__ import annotations
 
 import json
-import importlib.util
 import os
+import subprocess
+import sys
 from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
 
+from game_control import deployment_verify as VERIFY
 from ops.install import Installer
 
 
 ROOT = Path(__file__).parents[1]
-SPEC = importlib.util.spec_from_file_location(
-    "verify_deployed", ROOT / "scripts" / "verify-deployed.py"
-)
-assert SPEC is not None and SPEC.loader is not None
-VERIFY = importlib.util.module_from_spec(SPEC)
-SPEC.loader.exec_module(VERIFY)
 
 
 def _profiles():
@@ -529,6 +525,69 @@ def _staged_root(tmp_path: Path) -> Path:
     root = tmp_path / "target"
     Installer(root, skip_systemd_verify=True).apply()
     return root
+
+
+def _run_front_door(argv: list[str], cwd: Path, *, pythonpath: str | None = None) -> subprocess.CompletedProcess[str]:
+    env = {key: value for key, value in os.environ.items() if key != "PYTHONPATH"}
+    if pythonpath is not None:
+        env["PYTHONPATH"] = pythonpath
+    return subprocess.run(
+        [sys.executable, *argv],
+        cwd=cwd,
+        env=env,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+
+def test_old_script_and_package_cli_have_static_parity_from_unrelated_cwd(tmp_path):
+    root = _staged_root(tmp_path)
+    old = _run_front_door(
+        [str(ROOT / "scripts/verify-deployed.py"), "--static", "--root", str(root)],
+        tmp_path,
+    )
+    new = _run_front_door(
+        ["-c", "from game_control.cli import main; raise SystemExit(main())", "deployment", "verify", "--static", "--root", str(root)],
+        tmp_path,
+        pythonpath=str(ROOT / "src"),
+    )
+    assert old.returncode == new.returncode == 0
+    assert json.loads(old.stdout) == json.loads(new.stdout)
+
+    retired = root / "usr/local/libexec/horizon-phase2-collect"
+    retired.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+    retired.chmod(0o755)
+    old_refusal = _run_front_door(
+        [str(ROOT / "scripts/verify-deployed.py"), "--static", "--root", str(root)],
+        tmp_path,
+    )
+    new_refusal = _run_front_door(
+        ["-c", "from game_control.cli import main; raise SystemExit(main())", "deployment", "verify", "--static", "--root", str(root)],
+        tmp_path,
+        pythonpath=str(ROOT / "src"),
+    )
+    assert old_refusal.returncode == new_refusal.returncode == 1
+    assert json.loads(old_refusal.stdout) == json.loads(new_refusal.stdout)
+
+
+def test_front_doors_ignore_target_manifest_and_runtime_manifest(tmp_path):
+    root = _staged_root(tmp_path)
+    target_manifest = root / "opt/game-control/src/game_control/deployment_manifest.py"
+    target_manifest.write_text("raise RuntimeError('target manifest must not load')\n", encoding="utf-8")
+    runtime_manifest = root / "opt/game-control/.horizon-runtime-manifest"
+    runtime_manifest.write_text("1\t../escape\t" + "0" * 64 + "\t0600\n", encoding="ascii")
+    old = _run_front_door(
+        [str(ROOT / "scripts/verify-deployed.py"), "--static", "--root", str(root)],
+        tmp_path,
+    )
+    new = _run_front_door(
+        ["-c", "from game_control.cli import main; raise SystemExit(main())", "deployment", "verify", "--static", "--root", str(root)],
+        tmp_path,
+        pythonpath=str(ROOT / "src"),
+    )
+    assert old.returncode == new.returncode == 0
+    assert json.loads(old.stdout) == json.loads(new.stdout)
 
 
 def test_static_verifier_accepts_complete_vm_target_root(tmp_path, capsys):
