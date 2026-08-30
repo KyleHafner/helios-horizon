@@ -181,12 +181,23 @@ error retained. Caller cancellation is drained through all stages and
 re-raised afterward; failed ledgers remain retryable. The synchronous state
 database close stays on its owning thread.
 
-At this exact source base, `slotd_main.serve()` and `ServiceSeams` still use
-the pre-composition integration path. The single production assembly
-finalizer, supervisor-task envelope, and delegation from `serve()` to the
-finalized container are pending commit9 integration. This section documents
-the proven typed owner modules and their target integration contract; it does
-not claim that the current `serve()` already performs that delegation.
+Production construction is transactional. `build_controller_assembly()` uses
+the provisional owner ledger to acquire the root state, adapters, telemetry,
+notifications, updates, history, and typed service seams; it constructs the
+`ServiceContainer`, binds the private container slot once, and publishes the
+`_RootAssembly` only after finalization. A construction failure drains every
+acquired owned resource in dependency order while borrowed resources remain
+open. The synchronous `build_controller()` entry point is a compatibility
+wrapper that rejects nested event-loop use.
+
+`slotd_main.serve()` owns every supervisor task it creates. Its outer cleanup
+envelope cancels, drains, and observes those tasks, closes the RPC server, and
+then closes the finalized assembly exactly once. `ServiceSeams.close()` and
+`.aclose()` are compatibility delegates to that finalized container owner;
+they do not retain an independent collector or database close path. The
+composition root and supervisor ownership are current source invariants, not
+pending integration work. This remains a source contract only and does not
+claim live deployment or activation.
 
 ## Explicit tick-source matrix
 
@@ -207,17 +218,29 @@ compatibility default applied only at the root configuration boundary.
 
 ## Deployment integrity boundary
 
-The current installer and verifier are separate static-policy and target-
-inspection tools, not a shared typed deployment manifest. Wave4 may define a
-frozen manifest for static files, directories, owners and modes, links,
-units/drop-ins/slices, retired paths, secret metadata, database roles, and
-runtime-manifest metadata. Independent target `lstat`/inspection and live
-probes for services, listeners, cgroups, authentication, database integrity,
-relay, and sockets remain necessary.
+`src/game_control/deployment_manifest.py` is the single typed, frozen,
+stdlib-only declaration for the package's static and runtime projections. The
+schema-1 manifest currently declares three fixed profiles, 65 static files,
+50 directories, 69 runtime sources, and 138 projected runtime files, together
+with the reviewed symlink, owned namespaces, retired paths, secret metadata,
+database roles, runtime-manifest metadata, and relay-mode expectations. Its
+constructor validates record types, modes, paths, duplicate/parent
+collisions, and immutable collections; source validation requires regular
+single-link package files.
 
-Package-safety preflight and the allowance for unrelated systemd units remain
-explicit. No installer output, manifest, or static package claim is live
-proof, and deployment manifest completion is not a current Horizon invariant.
+`ops/install.py` and `scripts/verify-deployed.py` both load this canonical
+module from their own location-derived package root. They do not load a
+manifest from the inspected target, current working directory, or runtime
+manifest. The installer projects the same declarations into staged or live
+targets, including deterministic staged ownership. The read-only verifier
+checks declared file/directory/link metadata, namespace contents, retired
+artifacts, runtime-manifest integrity, and directory child/link-count policy;
+target-side manifest tampering cannot change static expectations. The
+manifest and static verifier establish package/target policy, not live proof:
+independent probes for services, listeners, cgroups, authentication,
+database integrity, relay, and sockets remain necessary. Package-safety
+preflight and the allowance for unrelated systemd units remain explicit, and
+no live deployment or activation is claimed here.
 
 ## Future blueprint boundary
 
@@ -229,9 +252,11 @@ marketplace/provider implementation.
 
 The current contract remains the fixed `ProfileId` boundary, reviewed active
 profile topology, one-slot reservation, typed controller actions, and
-root-owned process and persistence paths. Update-journal reconciliation,
-dynamic instances, template compilation, provider acquisition, and private
-overlay separation remain future work.
+root-owned process and persistence paths. Update-journal startup
+reconciliation (no `UpdateService.reconcile_startup()` exists here), dynamic
+instances, template compilation, provider acquisition, private deployment
+overlay separation, and migration of the managed-tuning data path remain
+future work.
 
 ## Verification ledger
 
@@ -248,8 +273,8 @@ than mutable line numbers:
 | Benchmark safety and frozen provenance | `benchmark_safety.py`, `driver_preflight.py`, `benchmarks.py` | `tests/test_benchmark_safety.py`, `tests/test_driver_preflight.py`, `tests/test_benchmarks.py` |
 | Update, restore, and atomic publication | `updates.py`, `backups.py`, `controller.py` | `tests/test_updates.py`, `tests/test_restore.py`, `tests/test_sunlit_promote.py`, `tests/test_controller.py` |
 | Telemetry, alerts, history, and typed close ownership | `runtime/telemetry.py`, `runtime/alerts.py`, `history_queries.py`, `service_container.py`, `notifications.py`, `tps.py` | `tests/test_runtime_telemetry.py`, `tests/test_runtime_alerts.py`, `tests/test_history_queries.py`, `tests/test_service_container.py`, `tests/test_notifications.py`, `tests/test_tps.py` |
-| Current startup reconciliation and pending composition integration | `slotd_main.py`, `service_wiring.py` | `tests/test_slotd_main.py`, `tests/test_service_wiring.py`; commit9 remains required for finalized assembly delegation |
-| Static/live deployment separation | `ops/install.py`, `scripts/verify-deployed.py` | `tests/test_packaging.py`, `tests/test_verify_deployed.py`; Wave4 manifest is future |
+| Transactional assembly, supervisor ownership, and startup reconciliation | `slotd_main.py`, `service_wiring.py`, `service_container.py` | `tests/test_slotd_main.py`, `tests/test_service_wiring.py`, `tests/test_service_container.py` |
+| Typed deployment manifest and static/live separation | `deployment_manifest.py`, `ops/install.py`, `scripts/verify-deployed.py` | `tests/test_deployment_manifest.py`, `tests/test_packaging.py`, `tests/test_verify_deployed.py`; live deployment remains outside this source contract |
 
 ## Glossary
 
