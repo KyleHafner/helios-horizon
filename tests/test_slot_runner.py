@@ -20,6 +20,22 @@ import pytest
 RUNNER = Path(__file__).parents[1] / "ops/bin/game-slot-run"
 
 
+def test_slot_acquire_retries_a_transient_inspector_lock(monkeypatch):
+    runner = runpy.run_path(str(RUNNER), run_name="game-slot-run")
+    calls = 0
+
+    def flock(_fd, _flags):
+        nonlocal calls
+        calls += 1
+        if calls < 3:
+            raise BlockingIOError
+
+    monkeypatch.setattr(fcntl, "flock", flock)
+    monkeypatch.setattr(time, "sleep", lambda _seconds: None)
+    assert runner["_acquire_slot"](123) is True
+    assert calls == 3
+
+
 @pytest.fixture
 def runner_env(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     run_dir = tmp_path / "run"
@@ -176,6 +192,113 @@ def test_runner_exec_environment_uses_json_home_over_parent_home(tmp_path: Path)
     )
     assert result.returncode == 0
     assert observed_home.read_text() == candidate_home
+
+
+@pytest.mark.skipif(not Path("/usr/bin/java").is_file(), reason="Java 17 launcher is unavailable")
+def test_sunlit_runner_resolves_forge_relative_libraries_from_srv_cwd(tmp_path: Path):
+    profile = "minecraft-sunlit-cobblemon"
+    install_root = tmp_path / "opt/game-servers/minecraft-sunlit-cobblemon"
+    release_root = install_root / "releases"
+    release = release_root / "1.1.2-test"
+    state_root = tmp_path / "srv/game-servers/minecraft-sunlit-cobblemon-state"
+    active_link = tmp_path / "srv/game-servers/minecraft-sunlit-cobblemon-current"
+    install_root.joinpath("libraries").mkdir(parents=True)
+    release.mkdir(parents=True)
+    state_root.joinpath(".horizon").mkdir(parents=True)
+    state_root.joinpath("local").mkdir()
+    release_record = state_root / ".horizon/release.json"
+    release_record.write_text(json.dumps({"version": release.name}))
+    release_record.chmod(0o640)
+    active_link.symlink_to(release, target_is_directory=True)
+    (install_root / "libraries/forge-probe.jar").write_bytes(b"not a jar")
+    args_file = install_root / "unix_args.txt"
+    args_file.write_text("-jar\nlibraries/forge-probe.jar\n")
+    (release / "libraries").symlink_to(install_root / "libraries", target_is_directory=True)
+    (release / "user_jvm_args.txt").write_text("")
+
+    config_dir = tmp_path / "etc/runner.d"
+    config_dir.mkdir(parents=True)
+    config_dir.chmod(0o700)
+    operation = tmp_path / "operation.lock"
+    slot = tmp_path / "slot.lock"
+    metadata = tmp_path / "metadata.json"
+    operation.touch()
+    slot.touch()
+    (config_dir / f"{profile}.json").write_text(
+        json.dumps(
+            {
+                "user": "svc-sunlit",
+                "group": "svc-sunlit",
+                "cwd": str(active_link),
+                "argv": [
+                    "/usr/bin/java",
+                    f"-Duser.home={state_root / 'local'}",
+                    f"@{active_link / 'user_jvm_args.txt'}",
+                    f"@{args_file}",
+                ],
+                "environment": {"HOME": str(state_root / "local")},
+            }
+        )
+    )
+
+    result = subprocess.run(
+        [sys.executable, str(RUNNER), profile],
+        env={
+            "GAME_SLOT_RUNNER_DIR": str(config_dir),
+            "GAME_SLOT_RUNNER_OPERATION_LOCK": str(operation),
+            "GAME_SLOT_RUNNER_SLOT_LOCK": str(slot),
+            "GAME_SLOT_RUNNER_METADATA": str(metadata),
+            "GAME_SLOT_RUNNER_TEST_MODE": "1",
+            "GAME_SLOT_SUNLIT_ACTIVE_LINK": str(active_link),
+            "GAME_SLOT_SUNLIT_RELEASE_ROOT": str(release_root),
+            "GAME_SLOT_SUNLIT_STATE_ROOT": str(state_root),
+            "PATH": os.environ["PATH"],
+        },
+        text=True,
+        capture_output=True,
+    )
+    assert result.returncode != 0
+    assert "Invalid or corrupt jarfile" in result.stdout + result.stderr
+
+
+def test_sunlit_runner_fails_closed_when_runtime_and_release_record_diverge(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    runner = runpy.run_path(str(RUNNER), run_name="game-slot-run")
+    release_root = tmp_path / "releases"
+    release = release_root / "1.1.2-test"
+    state_root = tmp_path / "state"
+    active_link = tmp_path / "current"
+    release.mkdir(parents=True)
+    state_root.joinpath(".horizon").mkdir(parents=True)
+    state_root.joinpath("local").mkdir()
+    release_record = state_root / ".horizon/release.json"
+    release_record.write_text(json.dumps({"version": release.name}))
+    release_record.chmod(0o640)
+    active_link.symlink_to(release, target_is_directory=True)
+    monkeypatch.setenv("GAME_SLOT_RUNNER_TEST_MODE", "1")
+    monkeypatch.setenv("GAME_SLOT_SUNLIT_ACTIVE_LINK", str(active_link))
+    monkeypatch.setenv("GAME_SLOT_SUNLIT_RELEASE_ROOT", str(release_root))
+    monkeypatch.setenv("GAME_SLOT_SUNLIT_STATE_ROOT", str(state_root))
+    config = {
+        "cwd": str(active_link),
+        "argv": [
+            "/usr/bin/java",
+            f"-Duser.home={state_root / 'local'}",
+            f"@{active_link / 'user_jvm_args.txt'}",
+        ],
+        "environment": {"HOME": str(state_root / "local")},
+    }
+
+    runner["_sunlit_runtime_contract"]("minecraft-sunlit-cobblemon", config)
+
+    stale = {**config, "cwd": str(tmp_path / "legacy-tree")}
+    with pytest.raises(ValueError, match="active release"):
+        runner["_sunlit_runtime_contract"]("minecraft-sunlit-cobblemon", stale)
+
+    release_record.write_text(json.dumps({"version": "older"}))
+    with pytest.raises(ValueError, match="does not match"):
+        runner["_sunlit_runtime_contract"]("minecraft-sunlit-cobblemon", config)
 
 
 @pytest.mark.skipif(os.geteuid() != 0, reason="requires root to drop to an unprivileged runner")
@@ -698,7 +821,7 @@ def test_direct_start_waits_for_controller_reservation_commit(tmp_path: Path):
     assert direct.wait(timeout=2) == 75
 
 
-def test_controller_releases_exclusive_lock_before_runner_start(tmp_path: Path):
+def test_target_unit_direct_start_requires_controller_reservation(tmp_path: Path):
     operation = tmp_path / "operation.lock"
     slot = tmp_path / "slot.lock"
     operation.touch()
@@ -724,6 +847,50 @@ def test_controller_releases_exclusive_lock_before_runner_start(tmp_path: Path):
             "GAME_SLOT_RUNNER_SLOT_LOCK": str(slot),
             "GAME_SLOT_RUNNER_METADATA": str(tmp_path / "metadata.json"),
             "GAME_SLOT_RUNNER_RESERVATION": str(tmp_path / "reservation.json"),
+            "GAME_SLOT_REQUIRE_RESERVATION": "1",
+            "GAME_SLOT_RUNNER_TEST_MODE": "1",
+            "PATH": os.environ["PATH"],
+        },
+    )
+    assert result.returncode == 75
+
+
+def test_target_unit_accepts_matching_live_controller_reservation(tmp_path: Path):
+    operation = tmp_path / "operation.lock"
+    slot = tmp_path / "slot.lock"
+    operation.touch()
+    slot.touch()
+    cwd = tmp_path / "cwd"
+    cwd.mkdir()
+    target = cwd / "target.py"
+    target.write_text("raise SystemExit(0)")
+    config_dir = tmp_path / "runner.d"
+    config_dir.mkdir()
+    (config_dir / "minecraft.json").write_text(
+        json.dumps({"argv": [sys.executable, str(target)], "cwd": str(cwd)})
+    )
+    reservation = tmp_path / "reservation.json"
+    reservation.write_text(
+        json.dumps(
+            {
+                "profile_id": "minecraft",
+                "operation_id": "op",
+                "state_generation": 1,
+                "controller_pid": os.getpid(),
+                "controller_start_ticks": _start_ticks(os.getpid()),
+                "expires_at": time.time() + 10,
+            }
+        )
+    )
+    result = subprocess.run(
+        [sys.executable, str(RUNNER), "minecraft"],
+        env={
+            "GAME_SLOT_RUNNER_DIR": str(config_dir),
+            "GAME_SLOT_RUNNER_OPERATION_LOCK": str(operation),
+            "GAME_SLOT_RUNNER_SLOT_LOCK": str(slot),
+            "GAME_SLOT_RUNNER_METADATA": str(tmp_path / "metadata.json"),
+            "GAME_SLOT_RUNNER_RESERVATION": str(reservation),
+            "GAME_SLOT_REQUIRE_RESERVATION": "1",
             "GAME_SLOT_RUNNER_TEST_MODE": "1",
             "PATH": os.environ["PATH"],
         },

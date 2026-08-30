@@ -1,0 +1,240 @@
+#!/opt/game-control/.venv/bin/python
+"""Root-only issuance and installation of fixed Horizon capability tokens."""
+
+from __future__ import annotations
+
+import os
+import json
+import stat
+import sys
+import tempfile
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
+
+from game_control.capability import (
+    CAPABILITY_START_PROFILE,
+    CapabilityAudience,
+    CapabilityRole,
+    CapabilityScope,
+    CapabilityTokenStore,
+)
+from game_control.web_db import WebDatabase, WEB_DB_PATH
+
+
+SECRET_DIR = Path("/etc/game-control/secrets.d")
+TOKEN_FILES = {
+    "lazymc-waker": SECRET_DIR / "lazymc-waker.token",
+    "helios-mcp-observer": SECRET_DIR / "helios-mcp-observer.token",
+    "helios-mcp-waker": SECRET_DIR / "helios-mcp-waker.token",
+}
+OPERATIONAL_TTL = timedelta(days=30)
+EXPECTED_BINDINGS = {
+    "lazymc-waker": (CapabilityRole.WAKER, CapabilityAudience.LAZYMC, CAPABILITY_START_PROFILE, frozenset({CapabilityScope.STATUS, CapabilityScope.WAKE})),
+    "helios-mcp-observer": (CapabilityRole.OBSERVER, CapabilityAudience.HELIOS_MCP, None, frozenset({CapabilityScope.STATUS, CapabilityScope.TPS})),
+    "helios-mcp-waker": (CapabilityRole.WAKER, CapabilityAudience.HELIOS_MCP, CAPABILITY_START_PROFILE, frozenset({CapabilityScope.STATUS, CapabilityScope.WAKE})),
+}
+
+
+def _safe_secret_dir(path: Path) -> None:
+    info = path.lstat()
+    if (
+        stat.S_ISLNK(info.st_mode)
+        or not stat.S_ISDIR(info.st_mode)
+        or info.st_uid != 0
+        or stat.S_IMODE(info.st_mode) != 0o700
+    ):
+        raise RuntimeError("capability secret directory is unsafe")
+
+
+def _safe_existing_target(path: Path) -> None:
+    try:
+        info = path.lstat()
+    except FileNotFoundError:
+        return
+    if (
+        stat.S_ISLNK(info.st_mode)
+        or not stat.S_ISREG(info.st_mode)
+        or info.st_uid != 0
+        or info.st_nlink != 1
+        or stat.S_IMODE(info.st_mode) != 0o600
+    ):
+        raise RuntimeError("capability token target is unsafe")
+
+
+def _install_secret(path: Path, token: str) -> tuple[int, int]:
+    try:
+        path.lstat()
+    except FileNotFoundError:
+        pass
+    else:
+        _safe_existing_target(path)
+        raise RuntimeError("capability token target already exists")
+    fd, temporary = tempfile.mkstemp(prefix=".capability-token.", dir=path.parent)
+    temporary_path = Path(temporary)
+    try:
+        os.fchmod(fd, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as stream:
+            stream.write(token)
+            stream.write("\n")
+            stream.flush()
+            os.fsync(stream.fileno())
+        # Link the completed, fsynced inode into place without ever replacing
+        # a path that appeared after the initial all-absent preflight.
+        os.link(temporary_path, path)
+        info = path.lstat()
+        return info.st_dev, info.st_ino
+    finally:
+        temporary_path.unlink(missing_ok=True)
+
+
+def _token_text(path: Path) -> str:
+    raw = path.read_text(encoding="utf-8")
+    if not raw.endswith("\n") or raw[:-1].find("\n") != -1:
+        raise RuntimeError("capability token file has invalid framing")
+    token = raw[:-1]
+    if not token or any(character.isspace() for character in token):
+        raise RuntimeError("capability token file has invalid framing")
+    return token
+
+
+def _active_rows(store: CapabilityTokenStore, name: str, now: datetime) -> list[tuple]:
+    role, audience, profile_id, _scopes = EXPECTED_BINDINGS[name]
+    if profile_id is None:
+        rows = store.db.execute(
+            "SELECT token_id,token_hash,expires_at FROM capability_tokens "
+            "WHERE role=? AND audience=? AND profile_id IS NULL AND revoked_at IS NULL AND expires_at>?",
+            (role.value, audience.value, store._iso(now)),
+        ).fetchall()
+    else:
+        rows = store.db.execute(
+            "SELECT token_id,token_hash,expires_at FROM capability_tokens "
+            "WHERE role=? AND audience=? AND profile_id=? AND revoked_at IS NULL AND expires_at>?",
+            (role.value, audience.value, profile_id.value, store._iso(now)),
+        ).fetchall()
+    return rows
+
+
+def _validate_installed(store: CapabilityTokenStore, name: str, path: Path, now: datetime) -> dict[str, str]:
+    role, audience, profile_id, scopes = EXPECTED_BINDINGS[name]
+    token = _token_text(path)
+    grant = store._grant(token, audience)
+    if (
+        grant.role is not role
+        or grant.audience is not audience
+        or grant.profile_id is not profile_id
+        or grant.scopes != scopes
+    ):
+        raise RuntimeError("capability token binding does not match its fixed file")
+    rows = _active_rows(store, name, now)
+    token_hash = store._hash(token)
+    matching = [row for row in rows if row[1] == token_hash]
+    if len(rows) != 1 or len(matching) != 1:
+        raise RuntimeError("capability token grant set is not exactly one active binding")
+    return {"token_id": matching[0][0], "expires_at": matching[0][2]}
+
+
+def _remove_installed(path: Path, identity: tuple[int, int]) -> None:
+    try:
+        info = path.lstat()
+    except FileNotFoundError:
+        return
+    if (info.st_dev, info.st_ino) == identity:
+        path.unlink()
+
+
+def issue_and_install(store: CapabilityTokenStore, secret_dir: Path = SECRET_DIR) -> dict[str, object]:
+    """Idempotently install fixed bindings and return token-free expiry metadata."""
+
+    _safe_secret_dir(secret_dir)
+    targets = {
+        name: secret_dir / path.name
+        for name, path in TOKEN_FILES.items()
+    }
+    present = {}
+    for name, target in targets.items():
+        try:
+            target.lstat()
+        except FileNotFoundError:
+            present[name] = False
+        else:
+            _safe_existing_target(target)
+            present[name] = True
+    now = store.clock().astimezone(timezone.utc)
+    if all(present.values()):
+        metadata = {
+            name: _validate_installed(store, name, targets[name], now)["expires_at"]
+            for name in targets
+        }
+        return {
+            "state": "unchanged",
+            "operational_ttl_days": OPERATIONAL_TTL.days,
+            "expires_at": metadata,
+        }
+    if any(present.values()):
+        raise RuntimeError("capability token installation is partial; refusing issuance")
+    for name in targets:
+        if _active_rows(store, name, now):
+            raise RuntimeError("active capability grant exists without its installed file")
+
+    issued = []
+    written: list[tuple[Path, tuple[int, int]]] = []
+    try:
+        issued.append((targets["lazymc-waker"], store.issue(
+            role=CapabilityRole.WAKER,
+            audience=CapabilityAudience.LAZYMC,
+            profile_id=CAPABILITY_START_PROFILE,
+            ttl=OPERATIONAL_TTL,
+        )))
+        issued.append((targets["helios-mcp-observer"], store.issue(
+            role=CapabilityRole.OBSERVER,
+            audience=CapabilityAudience.HELIOS_MCP,
+            ttl=OPERATIONAL_TTL,
+        )))
+        issued.append((targets["helios-mcp-waker"], store.issue(
+            role=CapabilityRole.WAKER,
+            audience=CapabilityAudience.HELIOS_MCP,
+            profile_id=CAPABILITY_START_PROFILE,
+            ttl=OPERATIONAL_TTL,
+        )))
+        for target, capability in issued:
+            written.append((target, _install_secret(target, capability.token)))
+        return {
+            "state": "issued",
+            "operational_ttl_days": OPERATIONAL_TTL.days,
+            "expires_at": {
+                target.stem: capability.expires_at.astimezone(timezone.utc).isoformat()
+                for target, capability in issued
+            },
+        }
+    except Exception:
+        for target, identity in written:
+            try:
+                _remove_installed(target, identity)
+            except OSError:
+                pass
+        for _target, capability in issued:
+            try:
+                store.revoke(capability.token_id)
+            except Exception:
+                pass
+        raise
+
+
+def main() -> int:
+    if os.geteuid() != 0 or sys.argv != [sys.argv[0]]:
+        return 2
+    database = None
+    try:
+        database = WebDatabase.open(WEB_DB_PATH)
+        report = issue_and_install(CapabilityTokenStore(database.connection))
+        print(json.dumps(report, sort_keys=True, separators=(",", ":")))
+        return 0
+    except Exception:
+        return 1
+    finally:
+        if database is not None:
+            database.close()
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

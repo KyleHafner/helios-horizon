@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
+import hashlib
+import hmac
 import os
+import re
 import shutil
-import stat
 import subprocess
 import tarfile
 import tempfile
@@ -15,10 +17,13 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Mapping
+from urllib.parse import urlsplit
 
 import httpx
 
+from .adapters.crafty import parse_version_text
 from .errors import SafeError
+from .interim_maintenance_control import maintenance_argv
 from .protocol import UpdateStatus
 
 STEAMCMD_ARGV = (
@@ -34,6 +39,15 @@ STEAMCMD_ARGV = (
     "validate",
     "+quit",
 )
+
+_MAX_CANDIDATE_URL_LENGTH = 256
+_UNKNOWN_VERSION = "unknown"
+_SHA256_RE = re.compile(r"^[0-9a-fA-F]{64}$")
+MAX_DOWNLOAD_BYTES = 512 * 1024 * 1024
+MAX_ARCHIVE_MEMBERS = 4096
+MAX_MEMBER_BYTES = 256 * 1024 * 1024
+MAX_EXTRACTED_BYTES = 1024 * 1024 * 1024
+MAX_COMPRESSION_RATIO = 100
 
 
 def _id(profile: Any) -> str:
@@ -65,6 +79,7 @@ class UpdateService:
         running_check: Callable[[Any], bool] | Callable[[], bool] | None = None,
         http_client: Any | None = None,
         clock: Callable[[], float] | None = None,
+        lease_check: Callable[[], bool] | None = None,
     ) -> None:
         if isinstance(profiles, Mapping):
             self.profiles = profiles
@@ -82,6 +97,11 @@ class UpdateService:
         self.running_check = running_check
         self.http_client = http_client or httpx.Client(timeout=10.0)
         self.clock = clock or time.time
+        self.lease_check = lease_check
+
+    def _assert_lease(self) -> None:
+        if self.lease_check is not None and not self.lease_check():
+            raise SafeError("slot_conflict", "operation lease was lost before publication")
 
     def _profile(self, value: Any) -> Any:
         key = _id(getattr(value, "profile_id", value))
@@ -112,19 +132,52 @@ class UpdateService:
         profile_obj = self._profile(profile)
         strategy = self._strategy(profile_obj)
         installed = self._installed_version(profile_obj)
+        available = self._candidate_version(profile_obj)
+        if available == installed:
+            available = None
         return UpdateStatus(
             profile_id=profile_obj.id,
             strategy=strategy,
             installed_version=installed,
-            available_version=None,
+            available_version=available,
             restart_required=strategy != "manual",
             apply_supported=strategy != "manual",
         )
 
+    @staticmethod
+    def _candidate_version(profile: Any) -> str | None:
+        """Return a bounded candidate version only for fixed release URLs."""
+        try:
+            strategy = str(profile.update.kind)
+            if strategy == "curated_modpack":
+                value = str(profile.update.curated.version)
+                return value if 1 <= len(value) <= 128 else None
+            if strategy != "release_symlink":
+                return None
+            raw_url = profile.update.download_url
+            if raw_url is None:
+                return None
+            url = str(raw_url)
+            if len(url) > _MAX_CANDIDATE_URL_LENGTH:
+                return None
+            parsed = urlsplit(url)
+            if parsed.scheme not in {"http", "https"} or not parsed.netloc or not parsed.path:
+                return None
+            version = parse_version_text(parsed.path)
+            return None if version in {None, _UNKNOWN_VERSION} else version
+        except Exception:
+            return None
+
     def _installed_version(self, profile: Any) -> str | None:
+        if self._strategy(profile) == "curated_modpack":
+            try:
+                target = os.readlink(Path(profile.update.curated.active_link))
+                return Path(target).name[:128] or None
+            except OSError:
+                return None
         path = Path(profile.paths.version_file)
         try:
-            return path.read_text(encoding="utf-8").strip() or None
+            return parse_version_text(path.read_text(encoding="utf-8"))
         except OSError:
             current = Path(profile.paths.install_root) / "current"
             try:
@@ -188,7 +241,7 @@ class UpdateService:
     def _run(self, argv: list[str] | tuple[str, ...], **kwargs: Any) -> Any:
         kwargs.setdefault("check", True)
         kwargs.setdefault("shell", False)
-        return self.runner(list(argv), **kwargs)
+        return self.runner(maintenance_argv(argv, slice_name="maintenance.slice"), **kwargs)
 
     def apply(self, profile: Any) -> UpdateResult:
         profile_obj = self._profile(profile)
@@ -210,42 +263,125 @@ class UpdateService:
             return self._apply_release(profile_obj, backup)
         raise SafeError("update_failed", "update strategy is unavailable")
 
+    @staticmethod
+    def _fsync_file(path: Path) -> None:
+        with path.open("rb") as stream:
+            os.fsync(stream.fileno())
+
+    @staticmethod
+    def _fsync_dir(path: Path) -> None:
+        flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
+        fd = os.open(path, flags)
+        try:
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+
+    @classmethod
+    def _fsync_tree(cls, root: Path) -> None:
+        """Make every regular extracted file and directory durable bottom-up."""
+        entries = sorted(root.rglob("*"), key=lambda item: len(item.parts), reverse=True)
+        for path in entries:
+            if path.is_symlink():
+                continue
+            if path.is_file():
+                cls._fsync_file(path)
+            elif path.is_dir():
+                cls._fsync_dir(path)
+        cls._fsync_dir(root)
+
+    def _trusted_checksum(self, profile: Any) -> str:
+        configured = getattr(profile.update, "sha256", None)
+        if not isinstance(configured, str) or not _SHA256_RE.fullmatch(configured):
+            raise SafeError("update_failed", "trusted release checksum is required")
+        return configured.lower()
+
     def _download(self, profile: Any, destination: Path) -> None:
+        # Resolve trust before invoking any user-supplied downloader or network
+        # client. A missing/invalid digest must not cause an untrusted fetch.
+        expected_checksum = self._trusted_checksum(profile)
         if self.downloader is not None:
             try:
                 self.downloader(profile, destination)
             except TypeError:
                 self.downloader(str(profile.update.download_url), destination)
-            return
-        response = self.http_client.get(str(profile.update.download_url), timeout=10.0)
-        response.raise_for_status()
-        destination.write_bytes(response.content)
+        else:
+            with self.http_client.stream("GET", str(profile.update.download_url), timeout=10.0) as response:
+                response.raise_for_status()
+                with destination.open("wb") as output:
+                    total = 0
+                    for chunk in response.iter_bytes():
+                        if chunk:
+                            total += len(chunk)
+                            if total > MAX_DOWNLOAD_BYTES:
+                                raise SafeError("update_failed", "release download exceeds size limit")
+                            output.write(chunk)
+        try:
+            if destination.stat().st_size > MAX_DOWNLOAD_BYTES:
+                raise SafeError("update_failed", "release download exceeds size limit")
+        except OSError as exc:
+            raise SafeError("update_failed", "release download is unavailable") from exc
+        self._fsync_file(destination)
+        self._fsync_dir(destination.parent)
+        digest = hashlib.sha256()
+        with destination.open("rb") as stream:
+            for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+                digest.update(chunk)
+        if not hmac.compare_digest(digest.hexdigest(), expected_checksum):
+            raise SafeError("update_failed", "release checksum verification failed")
 
     def _safe_extract(self, archive_path: Path, staging: Path, expected_relative: str) -> None:
+        archive_size = archive_path.stat().st_size
+        try:
+            free = shutil.disk_usage(staging).free
+            if free < MAX_EXTRACTED_BYTES + MAX_MEMBER_BYTES:
+                raise SafeError("update_failed", "insufficient free space for release extraction")
+        except OSError as exc:
+            raise SafeError("update_failed", "unable to verify release free space") from exc
         if zipfile.is_zipfile(archive_path):
             with zipfile.ZipFile(archive_path) as archive:
-                for member in archive.infolist():
+                members = archive.infolist()
+                if len(members) > MAX_ARCHIVE_MEMBERS:
+                    raise SafeError("update_failed", "release archive has too many members")
+                total = 0
+                for member in members:
+                    if member.file_size > MAX_MEMBER_BYTES:
+                        raise SafeError("update_failed", "release archive member is too large")
+                    total += member.file_size
+                    if total > MAX_EXTRACTED_BYTES or (archive_size and total > archive_size * MAX_COMPRESSION_RATIO):
+                        raise SafeError("update_failed", "release archive expansion exceeds limit")
                     target = (staging / member.filename).resolve()
                     if staging.resolve() not in target.parents and target != staging.resolve():
                         raise SafeError("update_failed", "release archive is invalid")
-                    mode = member.external_attr >> 16
-                    kind = stat.S_IFMT(mode)
-                    if kind not in {0, stat.S_IFREG, stat.S_IFDIR}:
+                    if (member.external_attr >> 16) & 0o170000 == 0o120000:
                         raise SafeError("update_failed", "release archive is invalid")
                     archive.extract(member, staging)
             return
         try:
             with tarfile.open(archive_path, "r:*") as archive:
-                for member in archive.getmembers():
+                members = archive.getmembers()
+                if len(members) > MAX_ARCHIVE_MEMBERS:
+                    raise SafeError("update_failed", "release archive has too many members")
+                total = 0
+                for member in members:
+                    if member.size > MAX_MEMBER_BYTES:
+                        raise SafeError("update_failed", "release archive member is too large")
+                    total += member.size
+                    if total > MAX_EXTRACTED_BYTES or (archive_size and total > archive_size * MAX_COMPRESSION_RATIO):
+                        raise SafeError("update_failed", "release archive expansion exceeds limit")
                     target = (staging / member.name).resolve()
                     if staging.resolve() not in target.parents and target != staging.resolve():
                         raise SafeError("update_failed", "release archive is invalid")
-                    if not (member.isfile() or member.isdir()):
+                    if member.issym() or member.islnk():
                         raise SafeError("update_failed", "release archive is invalid")
                 archive.extractall(staging)
         except tarfile.TarError:
             # A single executable payload is also accepted by fixed profiles.
-            (staging / expected_relative).write_bytes(archive_path.read_bytes())
+            target = staging / expected_relative
+            with archive_path.open("rb") as source, target.open("wb") as output:
+                shutil.copyfileobj(source, output, length=1024 * 1024)
+            self._fsync_file(target)
+            self._fsync_dir(target.parent)
 
     def _apply_release(self, profile: Any, backup: Any) -> UpdateResult:
         install = Path(profile.paths.install_root)
@@ -268,6 +404,7 @@ class UpdateService:
                 payload = staging / ".download"
                 self._download(profile, payload)
                 self._safe_extract(payload, staging, str(profile.update.executable_relative_path))
+                self._fsync_tree(staging)
             relative = str(profile.update.executable_relative_path)
             if ".." in Path(relative).parts:
                 raise SafeError("update_failed", "release executable is invalid")
@@ -275,7 +412,14 @@ class UpdateService:
             if not executable.is_file():
                 raise SafeError("update_failed", "release executable verification failed")
             if profile.update.version_command:
-                command = list(profile.update.version_command) + [str(executable)]
+                command = [
+                    (str(argument).replace("{staged_executable}", str(executable))
+                     if "{staged_executable}" in str(argument) else str(executable)
+                     if "/current/" in str(argument) else argument)
+                    for argument in profile.update.version_command
+                ]
+                if not any(str(argument) == str(executable) for argument in command):
+                    command.append(str(executable))
                 completed = subprocess.run(command, check=True, capture_output=True, text=True, shell=False)
                 if not completed.stdout.strip():
                     raise SafeError("update_failed", "release version verification failed")
@@ -286,12 +430,17 @@ class UpdateService:
             destination = releases / new_version
             if destination.exists():
                 destination = releases / f"{new_version}-{uuid.uuid4().hex[:8]}"
+            self._assert_lease()
             os.replace(staging, destination)
+            self._fsync_dir(releases)
             staging = destination
             temporary_link = install / f".current-{uuid.uuid4().hex}"
             os.symlink(os.path.relpath(destination, install), temporary_link, target_is_directory=True)
+            self._fsync_dir(install)
+            self._assert_lease()
             os.replace(temporary_link, current)
             swapped = True
+            self._fsync_dir(install)
             if self.verify_release is not None and not self.verify_release(profile, destination):
                 self._record(profile, "failed", prior_version, new_version)
                 self._rollback_link(current, prior_target)
@@ -306,13 +455,16 @@ class UpdateService:
             if staging.name.startswith(".release-"):
                 shutil.rmtree(staging, ignore_errors=True)
             raise
-        except Exception as exc:
+        except BaseException as exc:
             if swapped:
                 self._rollback_link(current, prior_target)
-                self._record(profile, "failed", prior_version, new_version)
-                self._record(profile, "rolled_back", new_version, prior_version)
+                if isinstance(exc, Exception):
+                    self._record(profile, "failed", prior_version, new_version)
+                    self._record(profile, "rolled_back", new_version, prior_version)
             if staging.name.startswith(".release-"):
                 shutil.rmtree(staging, ignore_errors=True)
+            if isinstance(exc, BaseException) and not isinstance(exc, Exception):
+                raise
             raise SafeError("update_failed", "release update failed") from exc
 
     @staticmethod
@@ -320,9 +472,12 @@ class UpdateService:
         temporary = current.parent / f".rollback-{uuid.uuid4().hex}"
         if prior_target is None:
             current.unlink(missing_ok=True)
+            UpdateService._fsync_dir(current.parent)
         else:
             os.symlink(prior_target, temporary, target_is_directory=True)
+            UpdateService._fsync_dir(current.parent)
             os.replace(temporary, current)
+            UpdateService._fsync_dir(current.parent)
 
     def rollback(self, profile: Any, target: str | None = None) -> UpdateResult:
         profile_obj = self._profile(profile)

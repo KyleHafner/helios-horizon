@@ -19,13 +19,13 @@ import stat
 import sys
 import tempfile
 from collections import Counter
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterable
 
 
 APP_ID = 0x484F5249  # ASCII "HORI"; marks a generated Horizon migration DB.
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 RETAINED_PROFILES = frozenset(
     {"minecraft-sunlit-cobblemon", "terraria-vanilla", "terraria-tmod"}
 )
@@ -184,7 +184,17 @@ EXPECTED_TABLE_SQL = {
         overall_verdict TEXT CHECK (overall_verdict IS NULL OR overall_verdict IN ('better', 'worse', 'mixed', 'inconclusive')),
         summary_json TEXT,
         artifact_path TEXT,
-        error_code TEXT
+        artifact_sha256 TEXT,
+        error_code TEXT,
+        provenance_json TEXT,
+        planned_pairs INTEGER NOT NULL DEFAULT 0,
+        completed_pairs INTEGER NOT NULL DEFAULT 0,
+        primary_endpoints_json TEXT,
+        thresholds_json TEXT,
+        driver_verdict TEXT,
+        failure_category TEXT NOT NULL DEFAULT 'none',
+        stage TEXT NOT NULL DEFAULT 'prepared',
+        progress INTEGER NOT NULL DEFAULT 0
     )""",
 }
 EXPECTED_COLUMNS = {
@@ -200,9 +210,11 @@ EXPECTED_COLUMNS = {
     "rpc_idempotency": [("request_id", "TEXT", 0, None, 1), ("canonical_request", "TEXT", 1, None, 0), ("response", "TEXT", 0, None, 0), ("status", "TEXT", 1, "'completed'", 0), ("created_at", "TEXT", 1, None, 0)],
     "player_sessions": [("id", "TEXT", 0, None, 1), ("profile_id", "TEXT", 1, None, 0), ("player", "TEXT", 1, None, 0), ("started_at", "TEXT", 1, None, 0), ("ended_at", "TEXT", 0, None, 0), ("source", "TEXT", 1, None, 0)],
     "metric_samples": [("profile_id", "TEXT", 1, None, 0), ("metric", "TEXT", 1, None, 0), ("ts", "TEXT", 1, None, 0), ("value", "REAL", 1, None, 0)],
-    "benchmark_runs": [("id", "TEXT", 0, None, 1), ("profile_id", "TEXT", 1, None, 0), ("baseline_preset", "TEXT", 1, None, 0), ("candidate_preset", "TEXT", 1, None, 0), ("state", "TEXT", 1, None, 0), ("created_at", "TEXT", 1, None, 0), ("finished_at", "TEXT", 0, None, 0), ("overall_verdict", "TEXT", 0, None, 0), ("summary_json", "TEXT", 0, None, 0), ("artifact_path", "TEXT", 0, None, 0), ("error_code", "TEXT", 0, None, 0)],
+    "benchmark_runs": [("id", "TEXT", 0, None, 1), ("profile_id", "TEXT", 1, None, 0), ("baseline_preset", "TEXT", 1, None, 0), ("candidate_preset", "TEXT", 1, None, 0), ("state", "TEXT", 1, None, 0), ("created_at", "TEXT", 1, None, 0), ("finished_at", "TEXT", 0, None, 0), ("overall_verdict", "TEXT", 0, None, 0), ("summary_json", "TEXT", 0, None, 0), ("artifact_path", "TEXT", 0, None, 0), ("artifact_sha256", "TEXT", 0, None, 0), ("error_code", "TEXT", 0, None, 0), ("provenance_json", "TEXT", 0, None, 0), ("planned_pairs", "INTEGER", 1, "0", 0), ("completed_pairs", "INTEGER", 1, "0", 0), ("primary_endpoints_json", "TEXT", 0, None, 0), ("thresholds_json", "TEXT", 0, None, 0), ("driver_verdict", "TEXT", 0, None, 0), ("failure_category", "TEXT", 1, "'none'", 0), ("stage", "TEXT", 1, "'prepared'", 0), ("progress", "INTEGER", 1, "0", 0)],
 }
 EXPECTED_INDEXES = {
+    "idx_events_history_cursor": ("events", ("timestamp", "id")),
+    "idx_audit_history_cursor": ("audit", ("timestamp", "id")),
     "idx_player_sessions_profile": ("player_sessions", ("profile_id", "started_at")),
     "idx_metric_samples": ("metric_samples", ("profile_id", "metric", "ts")),
     "idx_backup_protections_scope": ("backup_protections", ("profile_id", "destination_id", "backup_class", "remote_verified", "comparison_state")),
@@ -216,6 +228,8 @@ EXPECTED_TRIGGERS = {
 }
 
 EXPECTED_INDEX_SQL = {
+    "idx_events_history_cursor": "CREATE INDEX idx_events_history_cursor ON events(timestamp DESC, id DESC)",
+    "idx_audit_history_cursor": "CREATE INDEX idx_audit_history_cursor ON audit(timestamp DESC, id DESC)",
     "idx_player_sessions_profile": "CREATE INDEX idx_player_sessions_profile ON player_sessions(profile_id, started_at)",
     "idx_metric_samples": "CREATE INDEX idx_metric_samples ON metric_samples(profile_id, metric, ts)",
     "idx_backup_protections_scope": "CREATE INDEX idx_backup_protections_scope ON backup_protections(profile_id, destination_id, backup_class, remote_verified, comparison_state)",
@@ -266,10 +280,32 @@ LEGACY_COLUMNS["jobs"] = (
     ("detail", "TEXT", 0, None, 0),
     ("completion_seq", "INTEGER", 0, None, 0),
 )
+# Horizon schema v3 benchmark rows predate the durable provenance and
+# lifecycle columns.  They are accepted as a source only and are padded with
+# canonical defaults while creating the v4 target.
+LEGACY_BENCHMARK_TABLE_SQL = """CREATE TABLE benchmark_runs (
+        id TEXT PRIMARY KEY,
+        profile_id TEXT NOT NULL,
+        baseline_preset TEXT NOT NULL,
+        candidate_preset TEXT NOT NULL,
+        state TEXT NOT NULL CHECK (state IN ('running', 'succeeded', 'failed')),
+        created_at TEXT NOT NULL CHECK (is_rfc3339_timestamp(created_at) = 1),
+        finished_at TEXT CHECK (finished_at IS NULL OR is_rfc3339_timestamp(finished_at) = 1),
+        overall_verdict TEXT CHECK (overall_verdict IS NULL OR overall_verdict IN ('better', 'worse', 'mixed', 'inconclusive')),
+        summary_json TEXT,
+        artifact_path TEXT,
+        error_code TEXT
+    )"""
+# The v3 benchmark table predates artifact_sha256 but still retains the
+# trailing error_code column.  Selecting the first ten canonical columns and
+# then error_code models that exact live schema instead of accidentally
+# expecting the post-v4 column in the legacy source.
+LEGACY_BENCHMARK_COLUMNS = EXPECTED_COLUMNS["benchmark_runs"][:10] + EXPECTED_COLUMNS["benchmark_runs"][11:12]
 PRE_BENCHMARK_SOURCE_TABLES = frozenset(EXPECTED_TABLE_SQL) - {"benchmark_runs"}
 PRE_BENCHMARK_SOURCE_INDEXES = frozenset(EXPECTED_INDEXES) - {"idx_benchmark_runs_profile"}
 LEGACY_SOURCE_TABLES = PRE_BENCHMARK_SOURCE_TABLES - {"backup_protections"}
 LEGACY_SOURCE_INDEXES = PRE_BENCHMARK_SOURCE_INDEXES - {"idx_backup_protections_scope"}
+LEGACY_BENCHMARK_TABLES = frozenset(EXPECTED_TABLE_SQL)
 
 
 def _sha256(path: Path) -> tuple[str, int]:
@@ -417,6 +453,15 @@ def _schema_snapshot(connection: sqlite3.Connection, *, target: bool = False) ->
         expected_indexes = PRE_BENCHMARK_SOURCE_INDEXES
         expected_foreign_keys = EXPECTED_FOREIGN_KEYS
         expected_version = 2
+    elif table_names == LEGACY_BENCHMARK_TABLES and _normal_sql(tables.get("benchmark_runs")) == _normal_sql(LEGACY_BENCHMARK_TABLE_SQL):
+        expected_tables = LEGACY_BENCHMARK_TABLES
+        expected_sql = dict(EXPECTED_TABLE_SQL)
+        expected_sql["benchmark_runs"] = LEGACY_BENCHMARK_TABLE_SQL
+        expected_columns = dict(EXPECTED_COLUMNS)
+        expected_columns["benchmark_runs"] = LEGACY_BENCHMARK_COLUMNS
+        expected_indexes = frozenset(EXPECTED_INDEXES)
+        expected_foreign_keys = EXPECTED_FOREIGN_KEYS
+        expected_version = 3
     elif table_names == frozenset(EXPECTED_TABLE_SQL):
         expected_tables = frozenset(EXPECTED_TABLE_SQL)
         expected_sql = EXPECTED_TABLE_SQL
@@ -649,7 +694,7 @@ def _stable_artifact_hash(path: Path, info: os.stat_result | None, label: str) -
     return digest, size
 
 
-def _target_is_not_newer(target: sqlite3.Connection, source: sqlite3.Connection, tables: list[str], columns_by_table: dict[str, list[str]]) -> None:
+def _target_is_not_newer(target: sqlite3.Connection, source: sqlite3.Connection, tables: list[str], columns_by_table: dict[str, list[str]], source_columns_by_table: dict[str, list[str]] | None = None) -> None:
     for table in tables:
         if source.execute(
             "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?", (table,)
@@ -657,14 +702,15 @@ def _target_is_not_newer(target: sqlite3.Connection, source: sqlite3.Connection,
             if target.execute(f'SELECT COUNT(*) FROM {_ident(table)}').fetchone()[0]:
                 raise MigrationError("existing generated target contains rows absent from source")
             continue
-        columns = columns_by_table[table]
-        source_rows = Counter(_row_key(tuple(row)) for row in _row_dicts(source, table, columns))
-        target_rows = Counter(_row_key(tuple(row)) for row in _row_dicts(target, table, columns))
+        columns = (source_columns_by_table or {}).get(table, columns_by_table[table])
+        compare_columns = tuple(column for column in columns if not (table == "jobs" and column == "completion_seq"))
+        source_rows = Counter(_row_key(tuple(row)) for row in _row_dicts(source, table, compare_columns))
+        target_rows = Counter(_row_key(tuple(row)) for row in _row_dicts(target, table, compare_columns))
         if target_rows - source_rows:
             raise MigrationError("existing generated target contains rows absent from source")
 
 
-def _validate_existing_target(path: Path, source: sqlite3.Connection, snapshot: dict[str, Any], tables: list[str], columns_by_table: dict[str, list[str]]) -> sqlite3.Connection:
+def _validate_existing_target(path: Path, source: sqlite3.Connection, snapshot: dict[str, Any], tables: list[str], columns_by_table: dict[str, list[str]], source_columns_by_table: dict[str, list[str]] | None = None) -> sqlite3.Connection:
     _check_file(path, allow_missing=False)
     _check_sidecars(path, source=False)
     target = _open_locked(path)
@@ -673,7 +719,7 @@ def _validate_existing_target(path: Path, source: sqlite3.Connection, snapshot: 
             raise MigrationError("non-empty target was not generated by this tool")
         _quick_check(target, "existing target")
         _schema_snapshot(target, target=True)
-        _target_is_not_newer(target, source, tables, columns_by_table)
+        _target_is_not_newer(target, source, tables, columns_by_table, source_columns_by_table)
     except Exception:
         target.rollback()
         target.close()
@@ -810,8 +856,12 @@ def migrate(source_path: str | os.PathLike[str], target_path: str | os.PathLike[
         snapshot = _schema_snapshot(source_connection)
         fingerprint = _schema_fingerprint(snapshot)
         tables = sorted(EXPECTED_TABLE_SQL)
-        columns_by_table = {
+        target_columns_by_table = {
             table: [column[0] for column in EXPECTED_COLUMNS[table]] for table in tables
+        }
+        source_columns_by_table = {
+            table: [column[0] for column in snapshot["tables"][table]["columns"]]
+            for table in snapshot["tables"]
         }
         included_rows: dict[str, list[tuple[Any, ...]]] = {table: [] for table in tables}
         included_counts: dict[str, int] = {table: 0 for table in tables}
@@ -822,13 +872,20 @@ def migrate(source_path: str | os.PathLike[str], target_path: str | os.PathLike[
         for table in tables:
             if table not in source_tables:
                 continue
-            columns = columns_by_table[table]
+            columns = source_columns_by_table.get(table, target_columns_by_table[table])
             table_rows: list[list[Any]] = []
             for raw_row in _row_dicts(source_connection, table, columns):
                 row = tuple(raw_row)
                 table_rows.append(list(row))
                 include, reason, reasons = _classify(table, columns, row)
                 if include:
+                    source_values = dict(zip(columns, row))
+                    row = tuple(source_values.get(column) for column in target_columns_by_table[table])
+                    if table == "benchmark_runs" and len(columns) == 11:
+                        # Fields introduced by schema v4 are intentionally
+                        # conservative: an old completed row is retained as
+                        # history, while no running state is fabricated.
+                        row = row[:10] + (None, source_values.get("error_code"), None, 0, 0, None, None, None, "none", "prepared", 0)
                     included_rows[table].append(row)
                     included_counts[table] += 1
                 else:
@@ -836,14 +893,39 @@ def migrate(source_path: str | os.PathLike[str], target_path: str | os.PathLike[
                     if "legacy_profile" in reasons or "unknown_profile" in reasons:
                         evidence_rows.append(_evidence_row(table, columns, row, reasons))
             logical_rows[table] = table_rows
+        # Canonical v4 completion sequence is an absolute, deterministic
+        # ordering of retained completed jobs. Reassign it offline so legacy
+        # NULLs, timezone offsets, and conflicting source values cannot change
+        # resume-last-active behavior. Unfinished jobs remain NULL.
+        jobs = [list(row) for row in included_rows.get("jobs", [])]
+        included_rows["jobs"] = jobs
+        if jobs:
+            job_columns = target_columns_by_table["jobs"]
+            state_index = job_columns.index("state")
+            finished_index = job_columns.index("finished_at")
+            id_index = job_columns.index("id")
+            seq_index = job_columns.index("completion_seq")
+            completed = [row for row in jobs if row[state_index] == "succeeded" and row[finished_index]]
+            def _job_order(row):
+                value = str(row[finished_index]).replace("Z", "+00:00")
+                try:
+                    instant = datetime.fromisoformat(value).astimezone(timezone.utc)
+                except ValueError:
+                    instant = datetime.min.replace(tzinfo=timezone.utc)
+                return instant, str(row[id_index])
+            for sequence, row in enumerate(sorted(completed, key=_job_order), 1):
+                row[seq_index] = sequence
+            for row in jobs:
+                if row not in completed:
+                    row[seq_index] = None
         logical_source_hash = _logical_source_sha256(snapshot, logical_rows)
 
         if target_info is not None and target_info.st_size and replace_empty_generated_target:
-            existing_target = _validate_existing_target(target, source_connection, snapshot, tables, columns_by_table)
+            existing_target = _validate_existing_target(target, source_connection, snapshot, tables, target_columns_by_table, source_columns_by_table)
             existing_target.rollback()
             existing_target.close()
             existing_target = None
-        _create_target(target, source_connection, snapshot, tables, columns_by_table, included_rows)
+        _create_target(target, source_connection, snapshot, tables, target_columns_by_table, included_rows)
         target_hash, target_bytes = _sha256(target)
     finally:
         if existing_target is not None:

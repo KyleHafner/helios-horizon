@@ -1,0 +1,15 @@
+{
+  "user": "svc-sunlit",
+  "group": "svc-sunlit",
+  "cwd": "/srv/game-servers/minecraft-sunlit-cobblemon-current",
+  "argv": [
+    "/usr/bin/java",
+    "-Duser.home=/srv/game-servers/minecraft-sunlit-cobblemon-state/local",
+    "@/srv/game-servers/minecraft-sunlit-cobblemon-current/user_jvm_args.txt",
+    "@/opt/game-servers/minecraft-sunlit-cobblemon/libraries/net/minecraftforge/forge/1.20.1-47.4.0/unix_args.txt",
+    "nogui"
+  ],
+  "environment": {
+    "HOME": "/srv/game-servers/minecraft-sunlit-cobblemon-state/local"
+  }
+}

@@ -1,11 +1,11 @@
 id = "minecraft"
 display_name = "Minecraft"
 adapter = "crafty"
-crafty_server_id = "00000000-0000-4000-8000-000000000001"
+crafty_server_id = "00000000-0000-4000-8000-000000000000" # replace for a real Crafty server
 ports = [{ protocol = "tcp", port = 25565, required = true }]
-start_timeout_seconds = 180
+start_timeout_seconds = 420
 stop_timeout_seconds = 90
-health_timeout_seconds = 180
+health_timeout_seconds = 420
 min_available_memory_bytes = 7516192768
 min_free_disk_bytes = 8589934592
 public_endpoint = { host = "mc.example.com", port = 25565, protocol = "tcp", relay_unit = "bore-minecraft.service" }
@@ -14,7 +14,7 @@ notification_events = ["start", "stop", "failed_start", "crash", "forced_stop", 
 
 [process]
 executable = "/usr/bin/java"
-argv_contains = ["forge"]
+argv_contains = ["server.jar"]
 
 [paths]
 data_roots = ["/srv/game-servers/minecraft"]

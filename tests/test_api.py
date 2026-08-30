@@ -1,10 +1,11 @@
 from pathlib import Path
 from uuid import uuid4
 
+import pytest
 from fastapi.testclient import TestClient
 
 from game_control.api import ROUTE_ACTIONS
-from game_control.protocol import GetStatus, JobAccepted, RpcSuccess, StatusSnapshot
+from game_control.protocol import GetStatus, GetBenchmarks, ExportBenchmarks, BenchmarkExport, BenchmarkOverview, BenchmarkPresetView, JobAccepted, RpcRequest, RpcSuccess, StatusSnapshot
 from game_control.protocol import ErrorCode, GetLogs, RpcError, RpcFailure
 from starlette.requests import Request
 
@@ -96,6 +97,8 @@ def test_web_app_serves_dashboard_assets():
 
     index = client.get("/")
     script = client.get("/app.js")
+    commands = client.get("/commands.js")
+    palette = client.get("/palette.js")
     stylesheet = client.get("/styles.css")
 
     assert index.status_code == 200
@@ -103,6 +106,12 @@ def test_web_app_serves_dashboard_assets():
     assert script.status_code == 200
     assert script.headers["content-type"].startswith("text/javascript")
     assert "const PROFILE_FALLBACK" in script.text
+    assert commands.status_code == 200
+    assert commands.headers["content-type"].startswith("text/javascript")
+    assert "window.HORIZON_COMMANDS" in commands.text
+    assert palette.status_code == 200
+    assert palette.headers["content-type"].startswith("text/javascript")
+    assert "window.HORIZON_PALETTE" in palette.text
     assert stylesheet.status_code == 200
     assert stylesheet.headers["content-type"].startswith("text/css")
     assert ".active-slot" in stylesheet.text
@@ -110,6 +119,28 @@ def test_web_app_serves_dashboard_assets():
     assert 'id="tab-benchmarks"' in index.text
     assert "function renderBenchmarks" in script.text
     assert ".benchmark-verdict" in stylesheet.text
+
+
+def test_installed_web_assets_are_world_readable_for_the_unprivileged_web_service(tmp_path):
+    from ops.install import Installer
+
+    installer = Installer(tmp_path)
+    web = tmp_path / "opt/game-control/web"
+    directory = next(item for item in installer.directories() if item[0] == web)
+    assets = {
+        path.name: mode
+        for path, (_source, mode) in installer.expected_files().items()
+        if path.parent == web
+    }
+
+    assert directory[1:] == (0o755, "root", "root")
+    assert assets == {
+        "app.js": 0o644,
+        "commands.js": 0o644,
+        "index.html": 0o644,
+        "palette.js": 0o644,
+        "styles.css": 0o644,
+    }
 
 
 def test_production_origin_allows_authenticated_mutation():
@@ -175,7 +206,7 @@ def test_returning_session_bootstrap_rotates_csrf_for_mutation():
 
     response = client.post(
         "/api/v1/profiles/minecraft/start",
-        headers={**headers, "X-CSRF-Token": csrf, "Origin": "https://games.example.com"},
+            headers={**headers, "X-CSRF-Token": csrf, "Origin": "https://games.example.com"},
     )
 
     assert response.status_code == 200
@@ -250,3 +281,149 @@ def test_logs_reject_naive_datetime_range():
     )
     assert response.status_code == 422
     assert not calls
+
+
+def _backup_client(rpc):
+    client = TestClient(
+        create_app(rpc=rpc, proxy_credential="secret", session_db=":memory:"),
+        base_url="https://games.example.com",
+    )
+    return client, {"X-Game-Control-Proxy": "secret", "X-authentik-username": "operator"}
+
+
+def _backup_headers(client, auth, **extra):
+    csrf = client.get("/api/v1/session", headers=auth).json()["csrf_token"]
+    return {**auth, "X-CSRF-Token": csrf, "Origin": "https://games.example.com", **extra}
+
+
+def test_backup_idempotency_key_replays_without_duplicate_controller_execution():
+    calls: list[RpcRequest] = []
+    completed: dict[str, tuple[object, RpcSuccess]] = {}
+
+    async def rpc(request: RpcRequest):
+        calls.append(request)
+        key = str(request.request_id)
+        if key in completed:
+            original_action, response = completed[key]
+            if request.action != original_action:
+                return RpcFailure(
+                    request_id=request.request_id,
+                    error=RpcError(code=ErrorCode.REQUEST_ID_CONFLICT, message="request id was already used", retryable=False),
+                )
+            return response
+        response = RpcSuccess(request_id=request.request_id, result=JobAccepted(job_id="backup-job", state="running"))
+        completed[key] = (request.action, response)
+        return response
+
+    client, auth = _backup_client(rpc)
+    key = str(uuid4())
+    first = client.post("/api/v1/profiles/minecraft/backups", headers=_backup_headers(client, auth, **{"Idempotency-Key": key}), json={"protected": True})
+    replay = client.post("/api/v1/profiles/minecraft/backups", headers=_backup_headers(client, auth, **{"Idempotency-Key": key}), json={"protected": True})
+    conflict = client.post("/api/v1/profiles/terraria-tmod/backups", headers=_backup_headers(client, auth, **{"Idempotency-Key": key}), json={"protected": True})
+
+    assert first.status_code == replay.status_code == 200
+    assert first.json() == replay.json()
+    assert conflict.status_code == 409
+    assert [str(call.request_id) for call in calls] == [key, key, key]
+    assert calls[0].action == calls[1].action
+    assert calls[0].action != calls[2].action
+
+
+def test_backup_idempotency_key_retry_after_timeout_reuses_request_id():
+    calls: list[RpcRequest] = []
+    completed: dict[str, RpcSuccess] = {}
+
+    async def rpc(request: RpcRequest):
+        calls.append(request)
+        key = str(request.request_id)
+        if key in completed:
+            return completed[key]
+        completed[key] = RpcSuccess(request_id=request.request_id, result=JobAccepted(job_id="backup-job", state="running"))
+        raise TimeoutError("response lost after controller execution")
+
+    client, auth = _backup_client(rpc)
+    key = str(uuid4())
+    first = client.post("/api/v1/profiles/minecraft/backups", headers=_backup_headers(client, auth, **{"Idempotency-Key": key}), json={})
+    retry = client.post("/api/v1/profiles/minecraft/backups", headers=_backup_headers(client, auth, **{"Idempotency-Key": key}), json={})
+
+    assert first.status_code == 503
+    assert retry.status_code == 200
+    assert len(calls) == 2
+    assert calls[0].request_id == calls[1].request_id
+
+
+@pytest.mark.parametrize("value", [" ", "not-a-uuid", "0" * 129, str(uuid4()).upper()])
+def test_backup_idempotency_key_rejects_malformed_values_before_rpc(value):
+    calls = []
+
+    async def rpc(request: RpcRequest):
+        calls.append(request)
+        return RpcSuccess(request_id=request.request_id, result={"ok": True})
+
+    client, auth = _backup_client(rpc)
+    response = client.post("/api/v1/profiles/minecraft/backups", headers=_backup_headers(client, auth, **{"Idempotency-Key": value}), json={})
+
+    assert response.status_code == 422
+    assert not calls
+
+
+def test_backup_idempotency_key_rejects_multiple_values_before_rpc():
+    calls = []
+
+    async def rpc(request: RpcRequest):
+        calls.append(request)
+        return RpcSuccess(request_id=request.request_id, result={"ok": True})
+
+    client, auth = _backup_client(rpc)
+    response = client.request(
+        "POST",
+        "/api/v1/profiles/minecraft/backups",
+        headers=[*_backup_headers(client, auth).items(), ("Idempotency-Key", str(uuid4())), ("Idempotency-Key", str(uuid4()))],
+        json={},
+    )
+
+    assert response.status_code == 422
+    assert not calls
+
+
+def test_backup_without_idempotency_key_preserves_generated_request_ids():
+    calls: list[RpcRequest] = []
+
+    async def rpc(request: RpcRequest):
+        calls.append(request)
+        return RpcSuccess(request_id=request.request_id, result={"ok": True})
+
+    client, auth = _backup_client(rpc)
+    for _ in range(2):
+        assert client.post("/api/v1/profiles/minecraft/backups", headers=_backup_headers(client, auth), json={}).status_code == 200
+
+    assert len(calls) == 2
+    assert calls[0].request_id != calls[1].request_id
+
+
+def test_benchmark_csv_export_has_attachment_type_and_formula_safe_cells():
+    async def rpc(actor, action):
+        if isinstance(action, ExportBenchmarks):
+            return RpcSuccess(request_id=uuid4(), result=BenchmarkExport(format="csv", content="id\nrun\n"))
+        if isinstance(action, GetBenchmarks):
+            from game_control.models import ProfileId
+            from game_control.protocol import BenchmarkRunSummary
+            run = BenchmarkRunSummary(
+                    id="run", profile_id=ProfileId.MINECRAFT, baseline_preset="current",
+                candidate_preset="candidate", state="succeeded",
+                created_at="2026-08-23T00:00:00Z", finished_at="2026-08-23T00:01:00Z",
+                overall_verdict="better",
+            )
+            return RpcSuccess(request_id=uuid4(), result=BenchmarkOverview(profile_id=action.profile_id, available=True, presets=(BenchmarkPresetView(id="current", label="Current"),), runs=(run,)))
+        return RpcSuccess(request_id=uuid4(), result=StatusSnapshot(generation=0, observed_at="2026-01-01T00:00:00Z", profiles=()))
+
+    app = create_app(rpc=rpc, proxy_credential="secret", session_db=":memory:")
+    headers = {"X-Game-Control-Proxy": "secret", "X-authentik-username": "operator"}
+    with TestClient(app, base_url="https://games.example.com") as client:
+        session = client.get("/api/v1/session", headers=headers)
+        csrf = session.json()["csrf_token"]
+        response = client.get("/api/v1/benchmarks/minecraft-sunlit-cobblemon/export?format=csv", headers=headers)
+    assert response.status_code == 200
+    assert response.headers["content-type"].startswith("text/csv")
+    assert "attachment" in response.headers["content-disposition"]
+    assert "run" in response.text

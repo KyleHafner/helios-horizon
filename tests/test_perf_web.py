@@ -3,8 +3,10 @@ from uuid import uuid4
 
 import pytest
 from fastapi.testclient import TestClient
+from starlette.requests import Request
 
 from game_control.protocol import GetPerf, PerfSnapshot, RpcSuccess, StatusSnapshot
+from game_control.perf import PerformanceTracker
 from game_control.web_main import BoundedTimingRing, EventHub, create_app
 
 
@@ -12,6 +14,54 @@ HEADERS = {
     "X-Game-Control-Proxy": "secret",
     "X-authentik-username": "operator",
 }
+
+
+def test_phase_zero_web_client_uses_visibility_gated_incremental_paths():
+    app = (Path(__file__).resolve().parents[1] / "web" / "app.js").read_text()
+
+    assert "const pageVisible = () => document.visibilityState === \"visible\";" in app
+    assert "if (!pageVisible()) return;" in app
+    assert "cursor" in app, "cursor-based log polling must remain explicit"
+    assert "params.set(\"cursor\", item.nextCursor)" in app
+    assert "consoleOutput.replaceChildren();" in app
+    assert "item?.consoleKey !== consoleKey" in app
+    assert "Math.min(20, latest.tps)" not in app
+    assert "drawFlightRecorder" in app
+    assert 'state.detail.statsTimer = window.setInterval' in app
+    visibility = app[app.index('document.addEventListener("visibilitychange"'):]
+    assert 'if (document.visibilityState !== "visible") {' in visibility
+    assert "state.detail.statsAbort?.abort();" in visibility
+    assert "suspendStream();" in visibility
+    assert "resumeStream();" in visibility
+    assert "function suspendStream()" in app
+    assert "stream.suspended = true;" in app
+    assert "window.clearTimeout(stream.reconnectTimer)" in app
+    assert "window.clearInterval(stream.watchdog)" in app
+    assert "stopFallbackPolling();" in app
+    assert "if (source) source.close();" in app
+    assert "function resumeStream()" in app
+    assert 'applyStatus(await api("/api/v1/status"), { confirmed: true })' in app
+    assert "if (!state.statusConfirmed)" in app
+    assert "generation < state.lastGeneration" in app
+    assert "if (!pageVisible() || stream.suspended) return;" in app
+    assert "stream.source !== source" in app
+    assert "function refreshVisiblePanels()" in app
+    assert "refreshVisiblePanels();" in app
+    assert "if (!pageVisible() || !id || state.detail.tab !== \"stats\") return;" in app
+    assert "if (!pageVisible() || !id) return;" in app
+    assert "if (item.loading) return;" in app
+    assert "summary?hours=${hours}" in app
+    assert "heatmap?hours=${hours}" in app
+    assert "Offline time is shaded, not plotted as zero." in app
+    assert "resolution=${encodeURIComponent(resolution)}&limit=720" in app
+
+
+def test_watch_resync_is_authoritative_and_duplicate_safe():
+    source = (Path(__file__).resolve().parents[1] / "src/game_control/web_main.py").read_text()
+    assert 'if kind == "full_resync":' in source
+    assert 'GetStatus(kind="get_status", refresh=True)' in source
+    assert 'if sequence <= cursor or frame_generation < generation:' in source
+    assert "watch_connected.clear()" in source
 
 
 def test_bounded_timing_ring_keeps_only_recent_samples_and_computes_percentiles():
@@ -25,6 +75,16 @@ def test_bounded_timing_ring_keeps_only_recent_samples_and_computes_percentiles(
     assert stats["p50_ms"] == pytest.approx(3.0)
     assert stats["p95_ms"] == pytest.approx(3.9)
     assert stats["max_ms"] == pytest.approx(4.0)
+
+
+def test_event_loop_snapshot_has_bounded_monotonic_sequence_window():
+    tracker = PerformanceTracker(maxlen=3)
+    for value in range(16_385):
+        tracker.record_event_loop_lag(value)
+    snapshot = tracker.snapshot()
+    assert len(snapshot["event_loop_lag_ms"]) == 3
+    assert snapshot["event_loop_lag_ms"][0] == 16_382.0
+    assert snapshot["event_loop_lag_sequence"] == {"start": 16_382, "end": 16_385}
 
 
 @pytest.mark.asyncio
@@ -84,3 +144,74 @@ def test_authenticated_perf_endpoint_reports_route_and_rpc_timing():
     assert body["rpc"]["count"] >= 1
     assert body["sse"]["connected_clients"] == 0
     assert body["slotd"]["cycle"]["p95_ms"] == 2.0
+
+
+def test_client_performance_summary_is_authenticated_bounded_and_identity_free():
+    async def rpc(_actor, action):
+        if isinstance(action, GetPerf):
+            empty = {"count": 0, "avg_ms": None, "p95_ms": None, "max_ms": None}
+            return RpcSuccess(request_id=uuid4(), result=PerfSnapshot(cycle=empty, rpc=empty))
+        return RpcSuccess(request_id=uuid4(), result=StatusSnapshot(generation=0, profiles=()))
+
+    app = create_app(rpc=rpc, proxy_credential="secret", session_db=":memory:",
+                     allowed_origins={"https://games.example.com"})
+    with TestClient(app, base_url="https://games.example.com") as client:
+        assert client.post("/api/v1/perf/client", json={"samples": [
+            {"metric": "stats_fetch", "duration_ms": 1},
+        ]}).status_code in {401, 403}
+        session = client.get("/api/v1/session", headers=HEADERS)
+        csrf = session.json()["csrf_token"]
+        mutation_headers = {**HEADERS, "X-CSRF-Token": csrf, "Origin": "https://games.example.com"}
+        response = client.post("/api/v1/perf/client", headers=mutation_headers, json={"samples": [
+            {"metric": "recorder_draw", "duration_ms": 4.25},
+            {"metric": "stats_fetch", "duration_ms": 18.5},
+        ]})
+        assert response.status_code == 200 and response.json() == {"accepted": 2}
+        assert client.post("/api/v1/perf/client", headers=mutation_headers, json={"samples": [
+            {"metric": "recorder_draw", "duration_ms": 1, "session": "forbidden"},
+        ]}).status_code == 422
+        assert client.post("/api/v1/perf/client", headers=mutation_headers, json={"samples": [
+            {"metric": "raw_url", "duration_ms": 1},
+        ]}).status_code == 422
+        assert client.post("/api/v1/perf/client", headers=mutation_headers, json={"samples": [
+            {"metric": "stats_fetch", "duration_ms": 1} for _ in range(17)
+        ]}).status_code == 422
+        assert client.post(
+            "/api/v1/perf/client", headers=mutation_headers,
+            content=b"{" + (b" " * 4096) + b"}",
+        ).status_code == 413
+        for _ in range(59):
+            assert client.post("/api/v1/perf/client", headers=mutation_headers, json={"samples": [
+                {"metric": "first_status_paint", "duration_ms": 1},
+            ]}).status_code == 200
+        assert client.post("/api/v1/perf/client", headers=mutation_headers, json={"samples": [
+            {"metric": "first_status_paint", "duration_ms": 1},
+        ]}).status_code == 429
+        snapshot = client.get("/api/v1/perf", headers=HEADERS).json()
+        assert snapshot["client"]["recorder_draw"]["count"] == 1
+        assert set(snapshot["client"]) == {"stats_fetch", "recorder_draw", "first_status_paint"}
+
+
+def test_stream_delivers_cached_snapshot_without_per_subscriber_controller_read(monkeypatch):
+    async def disconnected(_request):
+        return True
+
+    monkeypatch.setattr(Request, "is_disconnected", disconnected)
+    hub = EventHub()
+    import asyncio
+
+    asyncio.run(hub.publish("status", {"generation": 41, "profiles": []}))
+    calls = []
+
+    async def rpc(_actor, action):
+        calls.append(action)
+        raise AssertionError("cached stream subscriber must not issue GetStatus")
+
+    client = TestClient(create_app(rpc=rpc, hub=hub, proxy_credential="secret", session_db=":memory:"))
+    headers = {"X-Game-Control-Proxy": "secret", "X-Authentik-Username": "operator"}
+    with client.stream("GET", "/api/v1/stream", headers=headers) as response:
+        body = b"".join(response.iter_bytes())
+
+    assert response.status_code == 200
+    assert b'"generation":41' in body
+    assert calls == []

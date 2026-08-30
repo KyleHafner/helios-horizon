@@ -103,15 +103,16 @@ class SessionStore:
     :meth:`open`, which can only open ``/var/lib/game-control-web/web.db``.
     """
 
-    def __init__(self, db: sqlite3.Connection, *, now: Callable[[], datetime] | None = None):
+    def __init__(self, db: sqlite3.Connection, *, now: Callable[[], datetime] | None = None, path: Path | None = None):
         self.db = db
+        self.path = path
         self._now = now or (lambda: datetime.now(timezone.utc))
         self._ensure_schema()
 
     @classmethod
     def open(cls) -> "SessionStore":
         database = WebDatabase.open(WEB_DB_PATH)
-        return cls(database.connection)
+        return cls(database.connection, path=database.path)
 
     def _ensure_schema(self) -> None:
         self.db.execute(
@@ -139,6 +140,10 @@ class SessionStore:
         ):
             if name not in columns:
                 self.db.execute(f"ALTER TABLE web_sessions ADD COLUMN {name} {declaration}")
+        # Create indexes only after legacy-column migration; SQLite cannot
+        # index a column that has not yet been added on older databases.
+        self.db.execute("CREATE INDEX IF NOT EXISTS idx_web_sessions_expires ON web_sessions(expires_at)")
+        self.db.execute("CREATE INDEX IF NOT EXISTS idx_web_sessions_revoked ON web_sessions(revoked_at)")
         self.db.commit()
 
     @staticmethod
@@ -205,6 +210,21 @@ class SessionStore:
             return False
         self.db.execute("UPDATE web_sessions SET last_seen_at=? WHERE session_hash=?", (self._iso(now), session_hash))
         self.db.commit()
+        return True
+
+    def validate_session(self, session: str, *, actor: str, touch: bool = False) -> bool:
+        """Validate read and mutation identity using the same revocation gate."""
+        try:
+            actor = normalize_actor(actor)
+        except ValueError:
+            return False
+        record = self.get(session)
+        now = self._now().astimezone(timezone.utc)
+        if record is None or record.actor != actor or record.revoked_at is not None or record.expires_at <= now:
+            return False
+        if touch:
+            self.db.execute("UPDATE web_sessions SET last_seen_at=? WHERE session_hash=?", (self._iso(now), record.session_hash))
+            self.db.commit()
         return True
 
     def touch(self, session: str, *, ttl: timedelta = SESSION_TTL) -> bool:
@@ -276,6 +296,33 @@ class SessionStore:
             (self._iso(self._now().astimezone(timezone.utc)), token_hash(session)),
         )
         self.db.commit()
+
+    def revoke_all(self) -> int:
+        """Revoke every currently valid browser session without deleting history."""
+
+        revoked_at = self._iso(self._now().astimezone(timezone.utc))
+        cursor = self.db.execute(
+            "UPDATE web_sessions SET revoked_at=? WHERE revoked_at IS NULL",
+            (revoked_at,),
+        )
+        self.db.commit()
+        return max(0, int(cursor.rowcount))
+
+    def prune(self, *, older_than: timedelta = timedelta(days=2), batch_size: int = 256) -> int:
+        """Bound cleanup of terminal sessions; active rows are never removed."""
+        if older_than <= timedelta(0) or not 1 <= batch_size <= 5000:
+            raise ValueError("invalid session pruning bounds")
+        cutoff = self._iso(self._now().astimezone(timezone.utc) - older_than)
+        rows = self.db.execute(
+            "SELECT session_hash FROM web_sessions WHERE (expires_at <= ? OR revoked_at IS NOT NULL) "
+            "AND (revoked_at IS NULL OR revoked_at <= ?) ORDER BY expires_at LIMIT ?",
+            (cutoff, cutoff, batch_size),
+        ).fetchall()
+        if not rows:
+            return 0
+        self.db.executemany("DELETE FROM web_sessions WHERE session_hash=?", rows)
+        self.db.commit()
+        return len(rows)
 
 
 def set_session_cookie(response, session: str, *, max_age: int = int(SESSION_TTL.total_seconds())) -> None:

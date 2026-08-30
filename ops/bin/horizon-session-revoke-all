@@ -1,0 +1,67 @@
+#!/opt/game-control/.venv/bin/python
+"""Root-only, fixed-path global Horizon browser-session revocation."""
+
+from __future__ import annotations
+
+import json
+import os
+import stat
+import sys
+from datetime import datetime, timezone
+from pathlib import Path
+
+from game_control.auth import SessionStore
+
+
+AUDIT_PATH = Path("/var/lib/game-control/session-revoke-all.jsonl")
+
+
+def _append_audit(record: dict[str, object]) -> None:
+    parent = os.lstat(AUDIT_PATH.parent)
+    if (
+        stat.S_ISLNK(parent.st_mode)
+        or not stat.S_ISDIR(parent.st_mode)
+        or parent.st_uid != 0
+        or stat.S_IMODE(parent.st_mode) != 0o700
+    ):
+        raise RuntimeError("session audit directory is unsafe")
+    flags = os.O_WRONLY | os.O_APPEND | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0)
+    fd = os.open(AUDIT_PATH, flags, 0o600)
+    try:
+        info = os.fstat(fd)
+        if (
+            not stat.S_ISREG(info.st_mode)
+            or info.st_nlink != 1
+            or info.st_uid != 0
+            or stat.S_IMODE(info.st_mode) != 0o600
+        ):
+            raise RuntimeError("session audit file is unsafe")
+        payload = (json.dumps(record, sort_keys=True, separators=(",", ":")) + "\n").encode()
+        view = memoryview(payload)
+        while view:
+            view = view[os.write(fd, view) :]
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+
+
+def main() -> int:
+    if sys.argv != [sys.argv[0]] or os.geteuid() != 0:
+        return 2
+    store = SessionStore.open()
+    try:
+        count = store.revoke_all()
+    finally:
+        store.db.close()
+    record = {
+        "event": "horizon_session_revoke_all",
+        "revoked_sessions": count,
+        "timestamp_utc": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+    }
+    _append_audit(record)
+    print(json.dumps(record, sort_keys=True))
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

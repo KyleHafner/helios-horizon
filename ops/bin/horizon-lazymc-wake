@@ -1,0 +1,8 @@
+#!/opt/game-control/.venv/bin/python
+"""Fixed lazymc child contract; Horizon remains the game lifecycle owner."""
+
+from game_control.lazymc import run_wake_hook
+
+
+if __name__ == "__main__":
+    raise SystemExit(run_wake_hook())

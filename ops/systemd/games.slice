@@ -1,0 +1,8 @@
+[Slice]
+CPUAccounting=yes
+CPUWeight=200
+MemoryAccounting=yes
+MemoryHigh=9G
+MemoryMax=10G
+MemorySwapMax=0
+IOAccounting=yes

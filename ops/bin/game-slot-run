@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import fcntl
+import hashlib
 import grp
 import json
 import math
@@ -20,9 +21,14 @@ DEFAULT_SLOT_LOCK = Path("/run/game-control/slot.lock")
 DEFAULT_METADATA = Path("/run/game-slot/slot.json")
 DEFAULT_RESERVATION = Path("/run/game-control/reservation.json")
 DEFAULT_CONSOLE_DIR = Path("/run/game-slot")
+SUNLIT_PROFILE = "minecraft-sunlit-cobblemon"
+SUNLIT_ACTIVE_LINK = Path("/srv/game-servers/minecraft-sunlit-cobblemon-current")
+SUNLIT_RELEASE_ROOT = Path("/opt/game-servers/minecraft-sunlit-cobblemon/releases")
+SUNLIT_STATE_ROOT = Path("/srv/game-servers/minecraft-sunlit-cobblemon-state")
 PROFILES = frozenset(
     {
         "minecraft",
+        "minecraft-sunlit-cobblemon",
         "pz-rising",
         "terraria-vanilla",
         "terraria-tmod",
@@ -33,6 +39,8 @@ CONSOLE_PROFILES = frozenset(
     {"pz-rising", "terraria-vanilla", "terraria-tmod", "terraria-tmod-145-candidate"}
 )
 MAX_TTL = 30.0
+SLOT_ACQUIRE_TIMEOUT_SECONDS = 0.5
+SLOT_ACQUIRE_POLL_SECONDS = 0.01
 
 
 def _profile(value: str) -> str:
@@ -78,6 +86,21 @@ def _open_secure_lock(path: Path, flags: int) -> int:
     return fd
 
 
+def _acquire_slot(fd: int) -> bool:
+    """Tolerate brief read-only inspector locks without waiting on a real owner."""
+
+    deadline = time.monotonic() + SLOT_ACQUIRE_TIMEOUT_SECONDS
+    while True:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            return True
+        except BlockingIOError:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return False
+            time.sleep(min(SLOT_ACQUIRE_POLL_SECONDS, remaining))
+
+
 def _secure_config_dir(path: Path) -> None:
     info = path.lstat()
     if not stat.S_ISDIR(info.st_mode) or info.st_uid != 0 or info.st_mode & 0o022:
@@ -93,6 +116,33 @@ def _config(profile: str) -> dict[str, object]:
     if not isinstance(raw, dict):
         raise ValueError("invalid runner config")
     return raw
+
+
+def _managed_jvm_layer(profile: str, command: list[str]) -> list[str]:
+    """Add an optional root-controlled argfile without editing modpack args."""
+    if profile != "minecraft-sunlit-cobblemon" or not command or Path(command[0]).name != "java":
+        return command
+    path = Path("/etc/game-control/jvm/minecraft-sunlit-cobblemon.active.args")
+    manifest = path.with_suffix(path.suffix + ".manifest.json")
+    try:
+        info = path.lstat()
+        if not stat.S_ISREG(info.st_mode) or info.st_uid != 0 or stat.S_IMODE(info.st_mode) != 0o644 or info.st_size > 4096:
+            raise ValueError("managed JVM argfile is not root-controlled")
+        manifest_info = manifest.lstat()
+        if not stat.S_ISREG(manifest_info.st_mode) or manifest_info.st_uid != 0 or stat.S_IMODE(manifest_info.st_mode) != 0o644 or manifest_info.st_size > 2048:
+            raise ValueError("managed JVM argfile manifest is not root-controlled")
+        evidence = json.loads(manifest.read_text())
+        if evidence.get("schemaVersion") != 1 or evidence.get("profileId") != profile or evidence.get("overallVerdict") != "better" or not evidence.get("campaignSha256"):
+            raise ValueError("managed JVM argfile manifest provenance is invalid")
+        if evidence.get("campaignSha256", "") == "" or evidence.get("argfileSha256") != hashlib.sha256(path.read_bytes()).hexdigest():
+            raise ValueError("managed JVM argfile hash binding is invalid")
+    except FileNotFoundError:
+        return command
+    try:
+        index = next(index for index, value in enumerate(command) if value.endswith("/unix_args.txt"))
+    except StopIteration as exc:
+        raise ValueError("Forge argument boundary is unavailable") from exc
+    return [*command[:index], f"@{path}", *command[index:]]
 
 
 def _path_override(name: str, default: Path) -> Path:
@@ -159,6 +209,73 @@ def _environment(value: object) -> dict[str, str]:
             raise ValueError("environment contains an invalid value")
         result[key] = item
     return result
+
+
+def _sunlit_path(name: str, default: Path) -> Path:
+    """Permit path substitution only inside the existing root test boundary."""
+    override = os.environ.get(name)
+    if override is None:
+        return default
+    if os.geteuid() != 0 or os.environ.get("GAME_SLOT_RUNNER_TEST_MODE") != "1":
+        raise ValueError("Sunlit path overrides require root test mode")
+    return Path(override)
+
+
+def _sunlit_runtime_contract(profile: str, config: dict[str, object]) -> None:
+    """Bind the advertised Sunlit release to the process that will be exec'd.
+
+    The updater publishes one root-owned active symlink.  A stale runner that
+    points at the legacy mutable tree must fail before it can acquire the slot
+    or launch a JVM, even if the UI already reports the newer release record.
+    """
+    if profile != SUNLIT_PROFILE:
+        return
+    active_link = _sunlit_path("GAME_SLOT_SUNLIT_ACTIVE_LINK", SUNLIT_ACTIVE_LINK)
+    release_root = _sunlit_path("GAME_SLOT_SUNLIT_RELEASE_ROOT", SUNLIT_RELEASE_ROOT)
+    state_root = _sunlit_path("GAME_SLOT_SUNLIT_STATE_ROOT", SUNLIT_STATE_ROOT)
+    if config.get("cwd") != str(active_link) or not active_link.is_symlink():
+        raise ValueError("Sunlit runner is not bound to the active release")
+    active_release = active_link.resolve(strict=True)
+    canonical_root = release_root.resolve(strict=True)
+    if active_release.parent != canonical_root:
+        raise ValueError("Sunlit active release is outside the release root")
+    argv = _argv(config.get("argv"))
+    required_argv = {
+        f"-Duser.home={state_root / 'local'}",
+        f"@{active_link / 'user_jvm_args.txt'}",
+    }
+    if argv[0] != "/usr/bin/java" or not required_argv.issubset(argv):
+        raise ValueError("Sunlit runner arguments are not release-bound")
+    environment = _environment(config.get("environment", {}))
+    if environment.get("HOME") != str(state_root / "local"):
+        raise ValueError("Sunlit runner home is not state-bound")
+    state_info = state_root.lstat()
+    horizon_info = (state_root / ".horizon").lstat()
+    if (
+        stat.S_ISLNK(state_info.st_mode)
+        or not stat.S_ISDIR(state_info.st_mode)
+        or state_info.st_mode & 0o022
+        or stat.S_ISLNK(horizon_info.st_mode)
+        or not stat.S_ISDIR(horizon_info.st_mode)
+        or horizon_info.st_uid != state_info.st_uid
+        or horizon_info.st_gid != state_info.st_gid
+        or horizon_info.st_mode & 0o022
+    ):
+        raise ValueError("Sunlit state root is unsafe")
+    release_record = state_root / ".horizon/release.json"
+    info = release_record.lstat()
+    if (
+        not stat.S_ISREG(info.st_mode)
+        or info.st_uid != state_info.st_uid
+        or info.st_gid != state_info.st_gid
+        or stat.S_IMODE(info.st_mode) != 0o640
+        or info.st_nlink != 1
+        or info.st_size > 64 * 1024
+    ):
+        raise ValueError("Sunlit release record is unsafe")
+    record = json.loads(release_record.read_text(encoding="utf-8"))
+    if not isinstance(record, dict) or record.get("version") != active_release.name:
+        raise ValueError("Sunlit release record does not match the active release")
 
 
 def _console_path(value: object, profile: str) -> Path | None:
@@ -263,6 +380,13 @@ def _reservation_status(path: Path, profile: str) -> bool | None:
     return reserved_profile == profile
 
 
+def _reservation_required() -> bool:
+    value = os.environ.get("GAME_SLOT_REQUIRE_RESERVATION", "0")
+    if value not in {"0", "1"}:
+        raise ValueError("invalid reservation policy")
+    return value == "1"
+
+
 def _metadata(path: Path, profile: str) -> None:
     payload = {
         "pid": os.getpid(),
@@ -298,7 +422,8 @@ def main(argv: list[str] | None = None) -> int:
     try:
         profile = _profile(args[0])
         config = _config(profile)
-        command = _argv(config["argv"])
+        _sunlit_runtime_contract(profile, config)
+        command = _managed_jvm_layer(profile, _argv(config["argv"]))
         cwd = _cwd(config["cwd"])
         console = _console_path(config.get("console_fifo"), profile)
         operation = _path_override("GAME_SLOT_RUNNER_OPERATION_LOCK", DEFAULT_OPERATION_LOCK)
@@ -309,13 +434,11 @@ def main(argv: list[str] | None = None) -> int:
         fcntl.flock(operation_fd, fcntl.LOCK_SH)
         try:
             status = _reservation_status(reservation, profile)
-            if status is False:
+            if status is False or (_reservation_required() and status is not True):
                 return 75
             slot_fd = _open_secure_lock(slot, os.O_RDWR)
             try:
-                try:
-                    fcntl.flock(slot_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-                except BlockingIOError:
+                if not _acquire_slot(slot_fd):
                     os.close(slot_fd)
                     return 75
                 _metadata(metadata, profile)

@@ -1,0 +1,19 @@
+[Unit]
+Description=Fenced Terraria WireGuard relay (disabled until explicitly armed)
+After=network-online.target
+Wants=network-online.target
+ConditionPathExists=/etc/game-control/arm/horizon-terraria
+OnFailure=horizon-alert-notify@horizon-terraria-relay.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStartPre=/usr/bin/sh -c 'test -f /etc/game-control/arm/horizon-terraria && test "$(/usr/bin/stat -c %%u:%%a /etc/game-control/arm/horizon-terraria)" = 0:600 && test "$(/usr/bin/stat -c %%u:%%a /etc/wireguard/wg-hzn-terraria.conf)" = 0:600'
+ExecStart=/usr/bin/wg-quick up /etc/wireguard/wg-hzn-terraria.conf
+ExecStop=/usr/bin/wg-quick down /etc/wireguard/wg-hzn-terraria.conf
+Restart=no
+RestartSec=0
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+UMask=0077

@@ -1,0 +1,11 @@
+[Unit]
+Description=Horizon control-plane resource boundary
+
+[Slice]
+CPUAccounting=yes
+CPUWeight=100
+MemoryAccounting=yes
+MemoryHigh=1G
+MemoryMax=2G
+MemorySwapMax=0
+IOAccounting=yes

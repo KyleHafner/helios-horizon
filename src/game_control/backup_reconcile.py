@@ -2,7 +2,7 @@
 
 The production entry point has no profile, path, remote, prefix, or retention
 arguments.  The pure reconciliation function is intentionally fixture-friendly
-so its state transitions can be tested without opening production infrastructure.
+so its state transitions can be tested without opening VM 101 or B2.
 """
 
 from __future__ import annotations
@@ -21,6 +21,7 @@ from typing import Any, Iterable
 
 from .backups import B2CommandTransport, RemoteObject, b2_prefix
 from .errors import SafeError
+from .interim_maintenance_control import maintenance_argv, maintenance_popen
 
 
 RETAINED_PROFILE_IDS = (
@@ -29,6 +30,7 @@ RETAINED_PROFILE_IDS = (
     "terraria-tmod",
 )
 RETENTION = 2
+MAX_REMOTE_ORPHANS_PER_PROFILE = 1
 DESTINATION_ID = "horizon-b2"
 BACKUP_CLASS = "application"
 ARCHIVE_SUFFIX = ".tar.zst"
@@ -36,7 +38,7 @@ GENERATION_RE = re.compile(r"^[0-9]{8}T[0-9]{12}Z-[0-9a-f]{12}$")
 SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 MAX_STAGED_BYTES = 8 * 1024 * 1024 * 1024
 MAX_MANIFEST_BYTES = 8 * 1024 * 1024
-FIXED_REMOTE_STAGING_ROOT = Path("/var/tmp/horizon-backup-reconcile")
+FIXED_REMOTE_STAGING_ROOT = Path("/var/tmp/horizon-g11-staging-20260806-0907")
 FIXED_BACKUP_ROOTS = {
     profile_id: Path(f"/var/backups/game-servers/{profile_id}")
     for profile_id in RETAINED_PROFILE_IDS
@@ -128,6 +130,14 @@ class RemoteOrphan:
 
 
 @dataclass(frozen=True)
+class PrunedProtectionCorrection:
+    profile_id: str
+    backup_id: str
+    remote_key: str
+    sha256: str
+
+
+@dataclass(frozen=True)
 class ReconciliationPlan:
     classification: str
     profile_summary: tuple[dict[str, int | str], ...]
@@ -138,6 +148,7 @@ class ReconciliationPlan:
     remote_evidence: tuple[RemoteGeneration, ...] = ()
     replacement_candidates: tuple[ReplacementCandidate, ...] = ()
     remote_orphans: tuple[RemoteOrphan, ...] = ()
+    pruned_protection_corrections: tuple[PrunedProtectionCorrection, ...] = ()
 
     @property
     def ready(self) -> bool:
@@ -204,6 +215,13 @@ class ReconciliationPlan:
                 }
                 for item in self.remote_orphans
             ],
+            "already_pruned_protection_corrections": [
+                {
+                    "profile_id": item.profile_id,
+                    "backup_id": item.backup_id,
+                }
+                for item in self.pruned_protection_corrections
+            ],
             "refusals": list(self.refusals),
         }
 
@@ -252,7 +270,12 @@ def reconcile(
         for backup_id, item in rows.items():
             expected = catalogs.get(profile_id, {}).get(backup_id)
             if expected is None:
-                if replacement_mode and _manifest_proves_orphan(item, profile_id, backup_id):
+                if (
+                    replacement_mode
+                    and item.remote_key == _remote_key(profile_id, backup_id)
+                    and 0 <= item.size_bytes <= MAX_STAGED_BYTES
+                    and _manifest_proves_orphan(item, profile_id, backup_id)
+                ):
                     remote_orphans.append(
                         RemoteOrphan(
                             profile_id=profile_id,
@@ -304,6 +327,37 @@ def reconcile(
                     missing_protections.append((profile_id, backup_id, item, expected))
                 else:
                     refusals.add("protection row has no matching remote generation")
+
+    if replacement_mode:
+        classification = "remote_counts_" + "/".join(
+            str(len(remotes.get(profile_id, {}))) for profile_id in RETAINED_PROFILE_IDS
+        )
+        summary = tuple(
+            {
+                "profile_id": profile_id,
+                "catalog_count": len(catalogs.get(profile_id, {})),
+                "protection_count": len(protections_by_id.get(profile_id, {})),
+                "remote_count": len(remotes.get(profile_id, {})),
+            }
+            for profile_id in RETAINED_PROFILE_IDS
+        )
+        remote_evidence = tuple(
+            sorted(
+                remote_rows,
+                key=lambda item: (_profile_order(item.profile_id), _generation_sort_key(item.backup_id)),
+            )
+        )
+        return _reconcile_replacement_mode(
+            catalogs=catalogs,
+            protections=protections_by_id,
+            deleted_protections=deleted_protections,
+            remotes=remotes,
+            remote_orphans=remote_orphans,
+            refusals=refusals,
+            classification=classification,
+            summary=summary,
+            remote_evidence=remote_evidence,
+        )
 
     already_pruned: list[PruneCandidate] = []
     for profile_id in RETAINED_PROFILE_IDS:
@@ -522,6 +576,215 @@ def reconcile(
     )
 
 
+def _reconcile_replacement_mode(
+    *,
+    catalogs: dict[str, dict[str, CatalogGeneration]],
+    protections: dict[str, dict[str, ProtectionGeneration]],
+    deleted_protections: dict[tuple[str, str], ProtectionGeneration],
+    remotes: dict[str, dict[str, RemoteGeneration]],
+    remote_orphans: list[RemoteOrphan],
+    refusals: set[str],
+    classification: str,
+    summary: tuple[dict[str, int | str], ...],
+    remote_evidence: tuple[RemoteGeneration, ...],
+) -> ReconciliationPlan:
+    """Plan replacement retention from catalog-owned generations only.
+
+    Manifest-proven objects without catalog ownership are bounded prune-only
+    evidence.  They never participate in retention ordering and can therefore
+    never displace a verified catalog generation.
+    """
+    imports: list[ImportProtection] = []
+    corrections: list[ProtectedFlagCorrection] = []
+    pruned_corrections: list[PrunedProtectionCorrection] = []
+    candidates: list[PruneCandidate] = []
+    replacements: list[ReplacementCandidate] = []
+
+    orphan_by_profile = {profile_id: [] for profile_id in RETAINED_PROFILE_IDS}
+    for item in remote_orphans:
+        orphan_by_profile[item.profile_id].append(item)
+    for (profile_id, backup_id), item in deleted_protections.items():
+        catalog = catalogs.get(profile_id, {}).get(backup_id)
+        if catalog is None or not _deleted_protection_proves_prune(item, catalog):
+            refusals.add("deleted protection state is not proven")
+
+    for profile_id in RETAINED_PROFILE_IDS:
+        local_rows = catalogs[profile_id]
+        remote_profile = remotes[profile_id]
+        protection_profile = protections[profile_id]
+        profile_orphans = orphan_by_profile[profile_id]
+        if len(profile_orphans) > MAX_REMOTE_ORPHANS_PER_PROFILE:
+            refusals.add("remote orphan count exceeds bound")
+            continue
+
+        ordered_catalog = sorted(local_rows, key=_generation_sort_key, reverse=True)
+        retained = ordered_catalog[:RETENTION]
+        retained_ids = set(retained)
+        if not retained:
+            if remote_profile:
+                refusals.add("remote inventory has no catalog retention set")
+            continue
+
+        oldest_retained = min(retained, key=_generation_sort_key)
+        for orphan in profile_orphans:
+            if _generation_sort_key(orphan.backup_id) >= _generation_sort_key(oldest_retained):
+                refusals.add("remote orphan recency is ambiguous")
+                continue
+            candidates.append(
+                PruneCandidate(
+                    profile_id=profile_id,
+                    backup_id=orphan.backup_id,
+                    size_bytes=orphan.size_bytes,
+                    sha256=orphan.sha256,
+                    kind="orphan",
+                    remote_key=orphan.remote_key,
+                )
+            )
+
+        canonical_remote_ids = {
+            backup_id for backup_id in remote_profile if backup_id in local_rows
+        }
+        for backup_id in retained:
+            item = local_rows[backup_id]
+            remote_item = remote_profile.get(backup_id)
+            protection = protection_profile.get(backup_id)
+            deleted = deleted_protections.get((profile_id, backup_id))
+            if remote_item is not None:
+                if protection is not None:
+                    if not _protection_proves_cryptcheck(protection, item, remote_item):
+                        refusals.add("retained generation lacks canonical cryptcheck proof")
+                elif deleted is not None:
+                    refusals.add("deleted protection has matching remote generation")
+                else:
+                    imports.append(
+                        ImportProtection(
+                            profile_id=profile_id,
+                            backup_id=backup_id,
+                            size_bytes=_archive_size(item),
+                            sha256=item.sha256,
+                            remote_key=remote_item.remote_key,
+                        )
+                    )
+                if not item.protected:
+                    if not _protection_proves_cryptcheck(protection, item, remote_item):
+                        refusals.add("unprotected retained generation lacks canonical cryptcheck proof")
+                    else:
+                        corrections.append(
+                            ProtectedFlagCorrection(profile_id, backup_id, True)
+                        )
+                continue
+
+            if deleted is not None:
+                refusals.add("deleted retained generation cannot be replacement")
+                continue
+            if not item.protected:
+                refusals.add("unprotected local generation cannot be replacement")
+                continue
+            if item.archive_size_bytes is None or item.archive_size_bytes < 0 or not item.sha256:
+                refusals.add("replacement archive is unavailable")
+                continue
+            replacements.append(
+                ReplacementCandidate(
+                    profile_id=profile_id,
+                    backup_id=backup_id,
+                    size_bytes=_archive_size(item),
+                    sha256=item.sha256,
+                    archive_path=item.archive_path,
+                )
+            )
+
+        for backup_id in sorted(canonical_remote_ids - retained_ids, key=_generation_sort_key):
+            item = local_rows[backup_id]
+            remote_item = remote_profile[backup_id]
+            protection = protection_profile.get(backup_id)
+            deleted = deleted_protections.get((profile_id, backup_id))
+            if deleted is not None:
+                refusals.add("deleted protection has matching remote generation")
+                continue
+            if protection is None or not _protection_proves_cryptcheck(
+                protection, item, remote_item
+            ):
+                refusals.add("older remote generation lacks active protection")
+                continue
+            candidates.append(
+                PruneCandidate(
+                    profile_id=profile_id,
+                    backup_id=backup_id,
+                    size_bytes=_archive_size(item),
+                    sha256=item.sha256,
+                    kind="older",
+                    remote_key=remote_item.remote_key,
+                )
+            )
+            if item.protected:
+                corrections.append(ProtectedFlagCorrection(profile_id, backup_id, False))
+
+        for backup_id in sorted(set(local_rows) - retained_ids, key=_generation_sort_key):
+            item = local_rows[backup_id]
+            if backup_id in canonical_remote_ids:
+                continue
+            protection = protection_profile.get(backup_id)
+            deleted = deleted_protections.get((profile_id, backup_id))
+            if protection is not None:
+                pruned_corrections.append(
+                    PrunedProtectionCorrection(
+                        profile_id=profile_id,
+                        backup_id=backup_id,
+                        remote_key=protection.remote_key,
+                        sha256=item.sha256,
+                    )
+                )
+            elif deleted is not None and not _deleted_protection_proves_prune(deleted, item):
+                refusals.add("deleted protection state is not proven")
+            if item.protected:
+                corrections.append(ProtectedFlagCorrection(profile_id, backup_id, False))
+
+        replacement_ids = {
+            item.backup_id for item in replacements if item.profile_id == profile_id
+        }
+        prune_ids = {
+            item.backup_id for item in candidates if item.profile_id == profile_id
+        }
+        final_ids = (set(remote_profile) | replacement_ids) - prune_ids
+        if final_ids != retained_ids or len(final_ids) != min(RETENTION, len(local_rows)):
+            refusals.add("canonical retention result is not exact")
+
+    if refusals:
+        return ReconciliationPlan(
+            classification=classification,
+            profile_summary=summary,
+            imports=(),
+            protected_flag_corrections=(),
+            prune_candidates=(),
+            refusals=tuple(sorted(refusals)),
+            remote_evidence=remote_evidence,
+            remote_orphans=tuple(
+                sorted(remote_orphans, key=lambda item: (_profile_order(item.profile_id), item.backup_id))
+            ),
+        )
+    return ReconciliationPlan(
+        classification=classification,
+        profile_summary=summary,
+        imports=tuple(sorted(imports, key=lambda item: (_profile_order(item.profile_id), item.backup_id))),
+        protected_flag_corrections=tuple(
+            sorted(corrections, key=lambda item: (_profile_order(item.profile_id), item.backup_id))
+        ),
+        prune_candidates=tuple(
+            sorted(candidates, key=lambda item: (_profile_order(item.profile_id), item.backup_id))
+        ),
+        remote_evidence=remote_evidence,
+        replacement_candidates=tuple(
+            sorted(replacements, key=lambda item: (_profile_order(item.profile_id), item.backup_id))
+        ),
+        remote_orphans=tuple(
+            sorted(remote_orphans, key=lambda item: (_profile_order(item.profile_id), item.backup_id))
+        ),
+        pruned_protection_corrections=tuple(
+            sorted(pruned_corrections, key=lambda item: (_profile_order(item.profile_id), item.backup_id))
+        ),
+    )
+
+
 def apply_plan(
     connection: sqlite3.Connection,
     plan: ReconciliationPlan,
@@ -531,15 +794,20 @@ def apply_plan(
     """Apply only catalog transitions; never delete a local or remote object."""
     if not plan.ready:
         raise SafeError("backup_reconciliation_refused", "backup reconciliation was refused")
-    if any(not item.target_protected for item in plan.protected_flag_corrections) and plan.prune_candidates:
+    if (
+        plan.pruned_protection_corrections
+        or (
+            any(not item.target_protected for item in plan.protected_flag_corrections)
+            and plan.prune_candidates
+        )
+    ):
         raise SafeError(
             "backup_reconciliation_refused",
             "prune protected transition requires exact replacement apply",
         )
     timestamp = _iso(now or datetime.now(timezone.utc))
     try:
-        if not connection.in_transaction:
-            connection.execute("BEGIN IMMEDIATE")
+        connection.execute("BEGIN IMMEDIATE")
         _apply_catalog_transitions(connection, plan, timestamp)
         connection.commit()
     except Exception:
@@ -565,6 +833,60 @@ def apply_replacement_plan(
         ).fetchone()
         if row is None or tuple(row) != (item.profile_id, item.size_bytes, 1, 1):
             raise SafeError("backup_reconciliation_refused", "replacement catalog row changed")
+    for item in plan.pruned_protection_corrections:
+        row = connection.execute(
+            "SELECT b.protected,b.verified,p.remote_key,p.local_sha256,p.local_verified,"
+            "p.upload_state,p.remote_verified,p.comparison_state,p.prune_state,p.error_code "
+            "FROM backups b JOIN backup_protections p ON p.backup_id=b.id "
+            "WHERE b.id=? AND b.profile_id=? AND p.destination_id=? AND p.backup_class=?",
+            (item.backup_id, item.profile_id, DESTINATION_ID, BACKUP_CLASS),
+        ).fetchone()
+        catalog_correction = next(
+            (
+                candidate
+                for candidate in plan.protected_flag_corrections
+                if candidate.profile_id == item.profile_id
+                and candidate.backup_id == item.backup_id
+                and not candidate.target_protected
+            ),
+            None,
+        )
+        if (
+            row is None
+            or row[0] not in (0, 1)
+            or (row[0] == 1 and catalog_correction is None)
+            or row[1] != 1
+            or row[2] != item.remote_key
+            or row[3] != item.sha256
+            or tuple(row[4:]) != (1, "succeeded", 1, "verified", "not_started", None)
+            and tuple(row[4:]) != (1, "succeeded", 1, "verified", "succeeded", None)
+        ):
+            raise SafeError("backup_reconciliation_refused", "already-pruned protection changed")
+    prune_keys = [item.remote_key for item in plan.prune_candidates]
+    if any(not key for key in prune_keys) or len(prune_keys) != len(set(prune_keys)):
+        raise SafeError("backup_reconciliation_refused", "prune plan is not unique")
+    for item in plan.prune_candidates:
+        if item.kind == "orphan":
+            continue
+        row = connection.execute(
+            "SELECT b.protected,b.verified,b.size_bytes,p.remote_key,p.local_sha256,"
+            "p.local_verified,p.upload_state,p.remote_verified,p.comparison_state,"
+            "p.prune_state,p.error_code FROM backups b JOIN backup_protections p "
+            "ON p.backup_id=b.id WHERE b.id=? AND b.profile_id=? "
+            "AND p.destination_id=? AND p.backup_class=?",
+            (item.backup_id, item.profile_id, DESTINATION_ID, BACKUP_CLASS),
+        ).fetchone()
+        if (
+            row is None
+            or row[0] != 1
+            or row[1] != 1
+            or row[2] != item.size_bytes
+            or row[3] != item.remote_key
+            or row[4] != item.sha256
+            or tuple(row[5:]) != (1, "succeeded", 1, "verified", "not_started", None)
+            and tuple(row[5:]) != (1, "succeeded", 1, "verified", "succeeded", None)
+        ):
+            raise SafeError("backup_reconciliation_refused", "prune protection changed")
     before = _fixed_inventory(transport)
     expected_before = {
         item.remote_key: item.size_bytes
@@ -598,13 +920,12 @@ def apply_replacement_plan(
         raise SafeError("backup_reconciliation_refused", "remote inventory changed after replacement")
 
     for item in plan.prune_candidates:
-        if not item.remote_key:
-            raise SafeError("backup_reconciliation_refused", "prune candidate lacks canonical object")
         current_size = after.get(item.remote_key)
-        if current_size is not None and current_size != item.size_bytes:
+        if current_size is None:
+            raise SafeError("backup_reconciliation_refused", "prune candidate disappeared")
+        if current_size != item.size_bytes:
             raise SafeError("backup_reconciliation_refused", "prune candidate changed")
-        if current_size is not None:
-            transport.delete(item.remote_key)
+        transport.delete(item.remote_key)
 
     final_inventory = _fixed_inventory(transport)
     expected_final = {
@@ -687,7 +1008,9 @@ def _apply_catalog_transitions(
             )
     if update_prunes:
         for item in plan.prune_candidates:
-            connection.execute(
+            if item.kind == "orphan":
+                continue
+            updated = connection.execute(
                 "UPDATE backup_protections SET prune_state='deleted',updated_at=?,error_code=NULL "
                 "WHERE backup_id=? AND profile_id=? AND destination_id=? AND backup_class=? AND remote_key=?",
                 (
@@ -699,6 +1022,33 @@ def _apply_catalog_transitions(
                     item.remote_key,
                 ),
             )
+            if updated.rowcount != 1:
+                raise SafeError(
+                    "backup_reconciliation_refused",
+                    "prune protection changed before catalog commit",
+                )
+        for item in plan.pruned_protection_corrections:
+            updated = connection.execute(
+                "UPDATE backup_protections SET prune_state='deleted',updated_at=?,error_code=NULL "
+                "WHERE backup_id=? AND profile_id=? AND destination_id=? AND backup_class=? "
+                "AND remote_key=? AND local_sha256=? AND local_verified=1 AND upload_state='succeeded' "
+                "AND remote_verified=1 AND comparison_state='verified' "
+                "AND prune_state IN ('not_started','succeeded') AND error_code IS NULL",
+                (
+                    timestamp,
+                    item.backup_id,
+                    item.profile_id,
+                    DESTINATION_ID,
+                    BACKUP_CLASS,
+                    item.remote_key,
+                    item.sha256,
+                ),
+            )
+            if updated.rowcount != 1:
+                raise SafeError(
+                    "backup_reconciliation_refused",
+                    "already-pruned protection changed before catalog commit",
+                )
 
 
 def _insert_protection(
@@ -748,7 +1098,7 @@ def build_fixed_plan(
     connection: sqlite3.Connection,
     transport: B2CommandTransport,
 ) -> ReconciliationPlan:
-    """Capture the fixed catalog and remote scope without caller overrides."""
+    """Capture VM 101's fixed catalog and B2 scope without caller overrides."""
     _assert_fixed_profile_scope(connection)
     catalog: list[CatalogGeneration] = []
     placeholders = ",".join("?" for _ in RETAINED_PROFILE_IDS)
@@ -1037,8 +1387,7 @@ def _read_manifest(path: Path) -> dict[str, Any]:
         raise
     except (OSError, tarfile.TarError):
         try:
-            with subprocess.Popen(
-                [
+            with maintenance_popen([
                     "/usr/bin/tar",
                     "--zstd",
                     "--extract",

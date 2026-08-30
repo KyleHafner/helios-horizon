@@ -1,0 +1,29 @@
+[Unit]
+Description=Discover and safely apply official Sunlit Cobblemon updates
+After=network-online.target game-slotd.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=root
+Group=root
+ExecStart=/usr/local/libexec/horizon-sunlit-auto-update
+TimeoutStartSec=4h
+Nice=10
+IOSchedulingClass=best-effort
+IOSchedulingPriority=7
+UMask=0077
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectHome=yes
+ProtectSystem=strict
+ReadWritePaths=/srv/game-servers
+ReadWritePaths=/opt/game-servers/minecraft-sunlit-cobblemon/releases
+ReadWritePaths=/var/lib/game-control
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictSUIDSGID=yes
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+LockPersonality=yes
+MemoryDenyWriteExecute=yes

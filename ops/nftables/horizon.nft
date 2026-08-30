@@ -1,0 +1,52 @@
+#!/usr/sbin/nft -f
+
+flush ruleset
+
+table inet horizon_filter {
+    set admin_v4 {
+        type ipv4_addr
+        elements = { 192.0.2.10 }
+    }
+
+    set npm_v4 {
+        type ipv4_addr
+        elements = { 192.0.2.11 }
+    }
+
+    set monitoring_v4 {
+        type ipv4_addr
+        elements = { 192.0.2.12 }
+    }
+
+    chain input {
+        type filter hook input priority filter
+        policy drop
+
+        iifname "lo" accept
+        ct state established,related accept
+        ip protocol icmp accept
+        ip6 nexthdr ipv6-icmp accept
+
+        ip saddr @admin_v4 tcp dport 22 accept
+        ip saddr @npm_v4 tcp dport 8444 accept
+        ip saddr @monitoring_v4 tcp dport 8444 accept
+        # 25565 is the local lazymc/Bore gameplay path; 25566 is a loopback
+        # backend and is never opened to a remote source.
+        ip saddr @admin_v4 tcp dport { 25565, 7777 } accept
+
+        # This interface cannot exist until the fenced target relay is armed.
+        iifname "wg-hzn-terraria" ip saddr 192.0.2.13 tcp dport 7777 accept
+
+        tcp dport 25575 drop
+    }
+
+    chain forward {
+        type filter hook forward priority filter
+        policy drop
+    }
+
+    chain output {
+        type filter hook output priority filter
+        policy accept
+    }
+}

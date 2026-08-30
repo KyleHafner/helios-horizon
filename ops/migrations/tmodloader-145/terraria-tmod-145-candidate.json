@@ -1,0 +1,25 @@
+{
+  "user": "tmodloader",
+  "group": "tmodloader",
+  "cwd": "/opt/game-servers/terraria-tmod/versions/1.4.5-ddffee7",
+  "console_fifo": "/run/game-slot/terraria-tmod-145-candidate.console",
+  "argv": [
+    "/opt/game-servers/terraria-tmod/versions/1.4.5-ddffee7/dotnet/dotnet",
+    "/opt/game-servers/terraria-tmod/versions/1.4.5-ddffee7/tModLoader.dll",
+    "-server",
+    "-config",
+    "/srv/game-servers/terraria-tmod-145-ddffee7/config/serverconfig.txt",
+    "-tmlsavedirectory",
+    "/srv/game-servers/terraria-tmod-145-ddffee7",
+    "-world",
+    "/srv/game-servers/terraria-tmod-145-ddffee7/worlds/swag_central.wld",
+    "-modpath",
+    "/srv/game-servers/terraria-tmod-145-ddffee7/Mods"
+  ],
+  "environment": {
+    "HOME": "/srv/game-servers/terraria-tmod-145-ddffee7/home",
+    "DOTNET_CLI_TELEMETRY_OPTOUT": "1",
+    "DOTNET_NOLOGO": "1",
+    "DOTNET_ROLL_FORWARD": "Disable"
+  }
+}

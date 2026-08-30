@@ -53,7 +53,8 @@ _STATE_TABLES = (
         profile_id TEXT,
         payload TEXT NOT NULL,
         expires_at TEXT NOT NULL CHECK (is_rfc3339_timestamp(expires_at) = 1),
-        consumed_at TEXT CHECK (consumed_at IS NULL OR is_rfc3339_timestamp(consumed_at) = 1)
+        consumed_at TEXT CHECK (consumed_at IS NULL OR is_rfc3339_timestamp(consumed_at) = 1),
+        state_generation INTEGER NOT NULL DEFAULT 0
     )
     """,
     """
@@ -154,7 +155,17 @@ _STATE_TABLES = (
         overall_verdict TEXT CHECK (overall_verdict IS NULL OR overall_verdict IN ('better', 'worse', 'mixed', 'inconclusive')),
         summary_json TEXT,
         artifact_path TEXT,
-        error_code TEXT
+        artifact_sha256 TEXT,
+        error_code TEXT,
+        provenance_json TEXT,
+        planned_pairs INTEGER NOT NULL DEFAULT 0,
+        completed_pairs INTEGER NOT NULL DEFAULT 0,
+        primary_endpoints_json TEXT,
+        thresholds_json TEXT,
+        driver_verdict TEXT,
+        failure_category TEXT NOT NULL DEFAULT 'none',
+        stage TEXT NOT NULL DEFAULT 'prepared',
+        progress INTEGER NOT NULL DEFAULT 0
     )
     """,
 )
@@ -206,52 +217,31 @@ class StateDatabase:
 
 def _migrate_state(connection: sqlite3.Connection) -> None:
     version = connection.execute("PRAGMA user_version").fetchone()[0]
-    if version < 1:
-        for statement in _STATE_TABLES:
-            connection.execute(statement)
-    else:
-        # CREATE IF NOT EXISTS keeps this migration safe for partially
-        # initialized development databases.
-        for statement in _STATE_TABLES:
-            connection.execute(statement)
-    metric_sql = connection.execute(
-        "SELECT sql FROM sqlite_master WHERE type='table' AND name='metric_samples'"
-    ).fetchone()[0] or ""
-    if "OR metric LIKE 'perf.%'" not in metric_sql:
-        connection.execute("ALTER TABLE metric_samples RENAME TO metric_samples_legacy")
-        metric_statement = next(
-            statement for statement in _STATE_TABLES if "CREATE TABLE IF NOT EXISTS metric_samples" in statement
+    # StateDatabase only opens the canonical schema.  Historical databases are
+    # upgraded by the offline, locked horizon-state-migrate utility; doing
+    # ALTER TABLE here made a controller startup an implicit migration.
+    if version not in (0, 4):
+        raise RuntimeError(
+            f"unsupported state database schema version {version}; run horizon-state-migrate"
         )
-        connection.execute(metric_statement)
-        connection.execute(
-            "INSERT INTO metric_samples(profile_id, metric, ts, value) "
-            "SELECT profile_id, metric, ts, value FROM metric_samples_legacy"
-        )
-        connection.execute("DROP TABLE metric_samples_legacy")
-    # Existing Task 3 databases predate pending idempotency claims and
-    # durable transition generations.
-    columns = {row[1] for row in connection.execute("PRAGMA table_info(rpc_idempotency)")}
-    if "status" not in columns:
-        connection.execute("ALTER TABLE rpc_idempotency ADD COLUMN status TEXT NOT NULL DEFAULT 'completed'")
-    confirmation_columns = {row[1] for row in connection.execute("PRAGMA table_info(confirmations)")}
-    if "state_generation" not in confirmation_columns:
-        connection.execute("ALTER TABLE confirmations ADD COLUMN state_generation INTEGER NOT NULL DEFAULT 0")
-    jobs_columns = {row[1] for row in connection.execute("PRAGMA table_info(jobs)")}
-    if jobs_columns and "completion_seq" not in jobs_columns:
-        connection.execute("ALTER TABLE jobs ADD COLUMN completion_seq INTEGER")
-        next_seq = connection.execute(
-            "SELECT COALESCE(MAX(completion_seq), 0) FROM jobs"
-        ).fetchone()[0]
-        rows = connection.execute(
-            "SELECT rowid FROM jobs "
-            "WHERE finished_at IS NOT NULL AND completion_seq IS NULL "
-            "ORDER BY julianday(finished_at), julianday(created_at), rowid"
-        ).fetchall()
-        for (rowid,) in rows:
-            next_seq += 1
-            connection.execute(
-                "UPDATE jobs SET completion_seq=? WHERE rowid=? AND completion_seq IS NULL",
-                (next_seq, rowid),
+    for statement in _STATE_TABLES:
+        connection.execute(statement)
+    required = {
+        "metric_samples": {"profile_id", "metric", "ts", "value"},
+        "rpc_idempotency": {"request_id", "canonical_request", "response", "status", "created_at"},
+        "confirmations": {"id", "state_generation"},
+        "jobs": {"id", "completion_seq"},
+        "benchmark_runs": {
+            "id", "provenance_json", "planned_pairs", "completed_pairs",
+            "primary_endpoints_json", "thresholds_json", "driver_verdict",
+            "failure_category", "stage", "progress", "artifact_sha256",
+        },
+    }
+    for table, expected in required.items():
+        actual = {row[1] for row in connection.execute(f'PRAGMA table_info("{table}")')}
+        if not expected.issubset(actual):
+            raise RuntimeError(
+                f"non-canonical state database table {table}; run horizon-state-migrate"
             )
     connection.execute(
         "CREATE TRIGGER IF NOT EXISTS events_append_only_update "
@@ -285,7 +275,17 @@ def _migrate_state(connection: sqlite3.Connection) -> None:
         "CREATE INDEX IF NOT EXISTS idx_benchmark_runs_profile"
         " ON benchmark_runs(profile_id, created_at DESC)"
     )
-    connection.execute("PRAGMA user_version = 3")
+    # History pages use (timestamp,id) keyset cursors.  The id tie-breaker
+    # makes equal-timestamp rows deterministic and avoids deep OFFSET scans.
+    connection.execute(
+        "CREATE INDEX IF NOT EXISTS idx_events_history_cursor"
+        " ON events(timestamp DESC, id DESC)"
+    )
+    connection.execute(
+        "CREATE INDEX IF NOT EXISTS idx_audit_history_cursor"
+        " ON audit(timestamp DESC, id DESC)"
+    )
+    connection.execute("PRAGMA user_version = 4")
 
 
 def prune_metric_samples(
@@ -295,6 +295,26 @@ def prune_metric_samples(
         "DELETE FROM metric_samples"
         " WHERE julianday(ts) < julianday(?) - ?",
         (now, max_age_days),
+    )
+    return cursor.rowcount
+
+
+def prune_completed_rpc_idempotency(
+    connection: sqlite3.Connection, *, now: str, max_age_hours: int = 48
+) -> int:
+    """Delete expired completed replays while preserving every pending claim.
+
+    ``created_at`` accepts RFC3339 offsets, so chronological comparison stays
+    on SQLite's date parser until the epoch migration rather than using unsafe
+    lexical ordering.
+    """
+    if max_age_hours < 1:
+        raise ValueError("max_age_hours must be positive")
+    cursor = connection.execute(
+        "DELETE FROM rpc_idempotency"
+        " WHERE status = 'completed'"
+        " AND julianday(created_at) < julianday(?) - (? / 24.0)",
+        (now, max_age_hours),
     )
     return cursor.rowcount
 

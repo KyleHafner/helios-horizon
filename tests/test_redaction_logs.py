@@ -1,8 +1,11 @@
 from pathlib import Path
 
+import pytest
+
+import game_control.redaction as redaction_module
 from game_control.logs import LogService, clamp_since
 from game_control.protocol import LogLine
-from game_control.redaction import Redactor
+from game_control.redaction import Redactor, SecretRegistry
 
 
 def test_recognizable_secrets_are_redacted():
@@ -20,6 +23,47 @@ def test_recognizable_secrets_are_redacted():
         secret not in output
         for secret in ("abcdefghijklmnop", telegram_token, "hunter2", "session-value", "configured-secret")
     )
+
+
+def test_secret_registry_accepts_mapping_and_filters_empty_or_non_text_values():
+    registry = SecretRegistry({"proxy": "configured-secret", "empty": "", "number": 42})
+    registry.add("added-secret")
+    registry.add("")
+    registry.add(None)
+
+    assert set(registry.values()) == {"configured-secret", "added-secret"}
+    output = Redactor(registry).redact("configured-secret added-secret")
+    assert output == "[REDACTED] [REDACTED]"
+
+
+@pytest.mark.parametrize("field", ["passwd", "pass", "secret", "token", "api_key", "api-key", "authorization"])
+def test_all_generic_secret_fields_are_redacted(field):
+    value = f"{field}-value"
+    output = Redactor().redact(f"{field}={value}")
+    assert value not in output
+    assert output == "[REDACTED]"
+
+
+@pytest.mark.parametrize("field", ["session", "connect.sid", "auth_token", "jwt-cookie"])
+def test_all_session_cookie_shapes_are_redacted(field):
+    value = f"{field}-value"
+    output = Redactor().redact(f"{field}={value}")
+    assert value not in output
+    assert "[REDACTED]" in output
+
+
+def test_redaction_fails_closed_for_malformed_input_and_regex_failure(monkeypatch):
+    redactor = Redactor()
+    assert redactor.redact(None) == "[REDACTED]"
+    assert redactor.redact(42) == "[REDACTED]"
+    assert redactor.redact("x" * (512 * 1024 + 1)) == "[REDACTED]"
+
+    class BrokenPattern:
+        def sub(self, _replacement, _text):
+            raise redaction_module.re.error("malformed pattern")
+
+    monkeypatch.setattr(redaction_module, "_PATTERNS", (BrokenPattern(),))
+    assert redactor.redact("otherwise safe text") == "[REDACTED]"
 
 
 def test_truncated_private_key_is_fail_closed():

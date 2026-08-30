@@ -140,7 +140,7 @@ def test_migrates_every_actual_state_table_and_exact_retained_filter(tmp_path: P
     connection.execute("INSERT INTO player_sessions VALUES (?,?,?,?,?,?)", ("s2", "minecraft-sunlit-cobblemon", "Current", TS, None, "log"))
     connection.execute("INSERT INTO metric_samples VALUES (?,?,?,?)", ("terraria-tmod", "players", TS, 2.0))
     connection.executemany(
-        "INSERT INTO benchmark_runs VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+        "INSERT INTO benchmark_runs(id,profile_id,baseline_preset,candidate_preset,state,created_at,finished_at,overall_verdict,summary_json,artifact_path,error_code) VALUES (?,?,?,?,?,?,?,?,?,?,?)",
         [
             ("br-good", "minecraft-sunlit-cobblemon", "current", "balanced-g1", "succeeded", TS, TS, "inconclusive", "{}", "/var/lib/game-control/benchmarks/br-good", None),
             ("br-running", "minecraft-sunlit-cobblemon", "current", "balanced-g1", "running", TS, None, None, None, None, None),
@@ -297,6 +297,7 @@ def test_exact_live_legacy_schema_upgrades_to_canonical_b2_target(tmp_path: Path
     make_legacy_db(source)
     connection = sqlite3.connect(source)
     state_db._configure(connection)
+    state_db._configure(connection)
     connection.execute(
         "INSERT INTO jobs(id,profile_id,operation,state,created_at,finished_at,detail,completion_seq) "
         "VALUES (?,?,?,?,?,?,?,?)",
@@ -328,6 +329,27 @@ def test_exact_live_legacy_schema_upgrades_to_canonical_b2_target(tmp_path: Path
         replace_empty_generated_target=True,
     )
     assert rerun["target_sha256"]
+
+
+def test_offline_jobs_migration_backfills_absolute_chronological_completion_sequence(tmp_path: Path):
+    source, target, report, retired = paths(tmp_path)
+    make_legacy_db(source)
+    connection = sqlite3.connect(source)
+    state_db._configure(connection)
+    rows = [
+        ("j-late", "terraria-vanilla", "stop", "succeeded", "2026-08-05T12:00:00Z", "2026-08-05T14:00:00Z", "done", None),
+        ("j-tie-b", "terraria-vanilla", "stop", "succeeded", "2026-08-05T12:00:00Z", "2026-08-05T13:00:00+01:00", "done", 999),
+        ("j-tie-a", "terraria-vanilla", "stop", "succeeded", "2026-08-05T12:00:00Z", "2026-08-05T12:00:00Z", "done", 2),
+        ("j-early", "terraria-vanilla", "stop", "succeeded", "2026-08-05T12:00:00Z", "2026-08-05T11:00:00Z", "done", 1),
+        ("j-open", "terraria-vanilla", "start", "running", "2026-08-05T12:00:00Z", None, "live", 77),
+    ]
+    connection.executemany("INSERT INTO jobs VALUES (?,?,?,?,?,?,?,?)", rows)
+    connection.commit(); connection.close()
+    run(source, target, report, retired)
+    target_db = sqlite3.connect(target)
+    assert target_db.execute("SELECT id, completion_seq FROM jobs WHERE state='succeeded' ORDER BY completion_seq").fetchall() == [("j-early", 1), ("j-tie-a", 2), ("j-tie-b", 3), ("j-late", 4)]
+    assert target_db.execute("SELECT completion_seq FROM jobs WHERE id='j-open'").fetchone() is None
+    target_db.close()
 
 
 @pytest.mark.parametrize("malicious_object", ["index", "trigger", "foreign_key", "ddl"])

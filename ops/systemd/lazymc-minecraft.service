@@ -1,0 +1,37 @@
+[Unit]
+Description=Fixed lazymc Minecraft public proxy
+After=network-online.target game-control-web.service
+Wants=network-online.target game-control-web.service
+ConditionPathExists=/usr/local/bin/lazymc
+ConditionPathExists=/etc/game-control/lazymc/lazymc.toml
+OnFailure=horizon-alert-notify@lazymc-minecraft.service
+StartLimitIntervalSec=300
+StartLimitBurst=1
+
+[Service]
+Type=simple
+User=svc-lazymc
+Group=svc-lazymc
+WorkingDirectory=/etc/game-control/lazymc
+LoadCredential=wake-token:/etc/game-control/secrets.d/lazymc-waker.token
+ExecStart=/usr/local/bin/lazymc start
+Restart=no
+NoNewPrivileges=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectSystem=strict
+ProtectHome=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictSUIDSGID=yes
+RestrictRealtime=yes
+LockPersonality=yes
+SystemCallArchitectures=native
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+CapabilityBoundingSet=
+ReadOnlyPaths=/etc/game-control/lazymc /usr/local/bin/lazymc /opt/game-control
+UMask=0077
+StandardOutput=journal
+StandardError=journal
+LogNamespace=horizon

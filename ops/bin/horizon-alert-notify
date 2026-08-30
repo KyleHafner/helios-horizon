@@ -1,0 +1,203 @@
+#!/usr/bin/env python3
+"""Send a fixed, secret-free Alertmanager event for an allowed systemd target."""
+
+from __future__ import annotations
+
+import json
+import os
+import socket
+import stat
+import subprocess
+import sys
+import time
+import uuid
+from dataclasses import dataclass
+from datetime import datetime, timezone
+from pathlib import Path
+from urllib.error import HTTPError, URLError
+from urllib.request import Request, urlopen
+
+
+ALERTMANAGER_URL = os.environ.get(
+    "HORIZON_ALERTMANAGER_URL", "http://192.0.2.12:9093/api/v2/alerts"
+)
+ALERT_LOG = Path("/var/lib/game-control/alerts/target-failures.jsonl")
+SYSTEMCTL = "/usr/bin/systemctl"
+MAX_ATTEMPTS = 3
+HTTP_TIMEOUT_SECONDS = 2.5
+SYSTEMCTL_TIMEOUT_SECONDS = 1.0
+
+
+@dataclass(frozen=True)
+class Target:
+    target_id: str
+    unit: str
+    kind: str
+
+
+# This is deliberately the only caller-to-unit mapping in this program.  The
+# notifier never accepts a unit name, URL, path, message, command, or secret.
+TARGETS = {
+    "minecraft-sunlit-cobblemon": Target(
+        "minecraft-sunlit-cobblemon", "minecraft-sunlit-cobblemon.service", "game"
+    ),
+    "terraria-vanilla": Target("terraria-vanilla", "terraria-vanilla.service", "game"),
+    "terraria-tmod": Target("terraria-tmod", "terraria-tmod.service", "game"),
+    "controller": Target("controller", "game-slotd.service", "controller"),
+    "web": Target("web", "game-control-web.service", "web"),
+    "lazymc-minecraft": Target(
+        "lazymc-minecraft", "lazymc-minecraft.service", "proxy"
+    ),
+    "bore-minecraft-fenced": Target(
+        "bore-minecraft-fenced", "bore-minecraft-fenced.service", "relay"
+    ),
+    "horizon-terraria-relay": Target(
+        "horizon-terraria-relay", "horizon-terraria-relay.service", "relay"
+    ),
+    "drill-minecraft": Target(
+        "drill-minecraft", "horizon-alert-drill@minecraft.service", "drill"
+    ),
+    "drill-controller": Target(
+        "drill-controller", "horizon-alert-drill@controller.service", "drill"
+    ),
+    "drill-web": Target("drill-web", "horizon-alert-drill@web.service", "drill"),
+}
+
+
+def _unit_state(unit: str) -> tuple[str, str]:
+    """Read state for a unit chosen from TARGETS, never from argv."""
+
+    try:
+        result = subprocess.run(
+            [
+                SYSTEMCTL,
+                "show",
+                "--no-pager",
+                "--value",
+                "--property=ActiveState",
+                "--property=SubState",
+                unit,
+            ],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=SYSTEMCTL_TIMEOUT_SECONDS,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return "unknown", "unknown"
+    values = result.stdout.splitlines()
+    if len(values) >= 2 and all(values[:2]):
+        return values[0][:64], values[1][:64]
+    return "unknown", "unknown"
+
+
+def _secure_parent(path: Path) -> None:
+    """Require a root-owned, non-symlinked directory with root-only access."""
+
+    parent = path.parent
+    current = Path("/")
+    for part in parent.parts[1:]:
+        current /= part
+        info = os.lstat(current)
+        if stat.S_ISLNK(info.st_mode) or not stat.S_ISDIR(info.st_mode):
+            raise RuntimeError("alert log parent is not a directory")
+        mode = stat.S_IMODE(info.st_mode)
+        if info.st_uid != 0 or ((mode & 0o022) and not (mode & 0o1000)):
+            raise RuntimeError("alert log parent is not root-only")
+
+
+def _append_durable(record: dict[str, object], path: Path = ALERT_LOG) -> None:
+    if os.geteuid() != 0:
+        raise RuntimeError("not root")
+    _secure_parent(path)
+    payload = (json.dumps(record, sort_keys=True, separators=(",", ":")) + "\n").encode()
+    flags = os.O_WRONLY | os.O_APPEND | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0)
+    fd = os.open(path, flags, 0o600)
+    try:
+        info = os.fstat(fd)
+        if info.st_uid != 0 or stat.S_IMODE(info.st_mode) != 0o600:
+            raise RuntimeError("alert log is not root-only")
+        view = memoryview(payload)
+        while view:
+            view = view[os.write(fd, view) :]
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+
+
+def _post(payload: list[dict[str, object]]) -> tuple[bool, int]:
+    body = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()
+    request = Request(
+        ALERTMANAGER_URL,
+        data=body,
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    for attempt in range(1, MAX_ATTEMPTS + 1):
+        try:
+            with urlopen(request, timeout=HTTP_TIMEOUT_SECONDS) as response:
+                response.read(1)
+            return True, attempt
+        except (HTTPError, OSError, TimeoutError, URLError):
+            if attempt < MAX_ATTEMPTS:
+                time.sleep(0.15 * attempt)
+    return False, MAX_ATTEMPTS
+
+
+def notify(target_token: str, *, log_path: Path = ALERT_LOG) -> int:
+    if target_token not in TARGETS:
+        return 2
+    target = TARGETS[target_token]
+    timestamp = datetime.now(timezone.utc).isoformat(timespec="milliseconds").replace("+00:00", "Z")
+    event_id = uuid.uuid4().hex
+    active_state, sub_state = _unit_state(target.unit)
+    hostname = socket.gethostname()
+    alert = {
+        "labels": {
+            "alertname": "HorizonTargetFailure",
+            "event_id": event_id,
+            "hostname": hostname,
+            "target_id": target.target_id,
+            "unit": target.unit,
+            "kind": target.kind,
+            "active_state": active_state,
+            "sub_state": sub_state,
+        },
+        "annotations": {
+            "summary": "Horizon fixed target failure",
+            "description": f"Fixed target {target.target_id} reported a systemd failure.",
+        },
+        "startsAt": timestamp,
+    }
+    delivered, attempts = _post([alert])
+    record = {
+        "event_id": event_id,
+        "target_id": target.target_id,
+        "unit": target.unit,
+        "hostname": hostname,
+        "active_state": active_state,
+        "sub_state": sub_state,
+        "timestamp_utc": timestamp,
+        "delivery_ok": delivered,
+        "delivery_attempts": attempts,
+    }
+    # Record the event even when all bounded delivery attempts fail.
+    _append_durable(record, log_path)
+    return 0 if delivered else 1
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = sys.argv[1:] if argv is None else argv
+    if len(args) != 1 or args[0] not in TARGETS:
+        sys.stderr.write("invalid fixed alert target\n")
+        return 2
+    try:
+        return notify(args[0])
+    except (OSError, RuntimeError, ValueError):
+        # Never echo subprocess, URL, environment, or filesystem details.
+        sys.stderr.write("fixed alert notification failed\n")
+        return 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

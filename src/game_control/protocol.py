@@ -26,6 +26,8 @@ from .models import (
 )
 
 MAX_REQUEST_BYTES = 64 * 1024
+# Explicit framing budget shared by the privileged writer and web client.
+MAX_RESPONSE_BYTES = 1024 * 1024
 
 
 class RpcModel(BaseModel):
@@ -69,6 +71,21 @@ class GetStatus(RpcModel):
     refresh: bool = False
 
 
+class Watch(RpcModel):
+    """Long-lived read-only Unix watch subscription."""
+
+    kind: Literal["watch"]
+    cursor: int = Field(default=0, ge=0, le=2**63 - 1)
+    generation: int = Field(default=0, ge=0)
+
+
+class WaitReadiness(RpcModel):
+    kind: Literal["wait_readiness"]
+    profile_id: ProfileId
+    generation: int | None = Field(default=None, ge=1)
+    timeout_seconds: float = Field(default=300.0, ge=1, le=600)
+
+
 class GetPerf(RpcModel):
     kind: Literal["get_perf"]
 
@@ -89,6 +106,11 @@ class ListBackups(RpcModel):
     page: PageOptions
 
 
+class ListAggregateBackups(RpcModel):
+    kind: Literal["list_aggregate_backups"]
+    page: PageOptions
+
+
 class ListEvents(RpcModel):
     kind: Literal["list_events"]
     page: PageOptions
@@ -98,18 +120,22 @@ class GetStatsSummary(RpcModel):
     kind: Literal["get_stats_summary"]
     profile_id: ProfileId
     days: int | None = Field(default=None, ge=1, le=3650)
+    hours: int | None = Field(default=None, ge=1, le=87600)
 
 
 class GetStatsHeatmap(RpcModel):
     kind: Literal["get_stats_heatmap"]
     profile_id: ProfileId
     days: int = Field(default=90, ge=1, le=365)
+    hours: int | None = Field(default=None, ge=1, le=8760)
 
 
 class GetStatsTps(RpcModel):
     kind: Literal["get_stats_tps"]
     profile_id: ProfileId
-    window: Literal["1h", "6h", "24h"] = "6h"
+    window: Literal["1h", "6h", "24h", "7d", "30d", "1y"] = "6h"
+    resolution: Literal["raw", "1m", "5m", "1h", "auto"] = "auto"
+    limit: int = Field(default=500, ge=1, le=2000)
 
 
 class GetProfileConfig(RpcModel):
@@ -120,6 +146,21 @@ class GetProfileConfig(RpcModel):
 class GetBenchmarks(RpcModel):
     kind: Literal["get_benchmarks"]
     profile_id: ProfileId
+    cursor: str | None = Field(default=None, max_length=128)
+    limit: int = Field(default=20, ge=1, le=100)
+    format: Literal["json", "csv"] = "json"
+
+
+class ExportBenchmarks(RpcModel):
+    kind: Literal["export_benchmarks"]
+    profile_id: ProfileId
+    format: Literal["json", "csv"] = "json"
+    limit: int = Field(default=100, ge=1, le=100)
+
+
+class BenchmarkExport(RpcModel):
+    format: Literal["json", "csv"]
+    content: str = Field(max_length=2_000_000)
 
 
 class RunBenchmark(RpcModel):
@@ -135,6 +176,11 @@ class RunBenchmark(RpcModel):
         return self
 
 
+class CancelBenchmark(RpcModel):
+    kind: Literal["cancel_benchmark"]
+    job_id: str = Field(pattern=r"^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$")
+
+
 class SetProfileConfig(RpcModel):
     kind: Literal["set_profile_config"]
     profile_id: ProfileId
@@ -146,6 +192,13 @@ class ScheduleSpec(RpcModel):
     profile: ProfileId
     enabled: StrictBool = True
     backup_destination: BackupDestination | None = None
+    operation: Literal["backup", "switch", "benchmark"] = "backup"
+    baseline_preset: str | None = Field(default=None, pattern=r"^[a-z0-9][a-z0-9_-]{0,31}$")
+    candidate_preset: str | None = Field(default=None, pattern=r"^[a-z0-9][a-z0-9_-]{0,31}$")
+    campaign: str | None = Field(default=None, pattern=r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$")
+    maintenance_window: bool = False
+    rollback_safe: bool = False
+    public_wake_policy: Literal["disabled", "safe"] = "disabled"
 
     @field_validator("cron")
     @classmethod
@@ -170,6 +223,10 @@ class ScheduleView(RpcModel):
     next_fire: datetime | None
     enabled: bool = True
     backup_destination: BackupDestination | None = None
+    operation: Literal["backup", "switch", "benchmark"] = "backup"
+    baseline_preset: str | None = None
+    candidate_preset: str | None = None
+    campaign: str | None = None
 
 
 class ScheduleResponse(RpcModel):
@@ -232,11 +289,29 @@ class BenchmarkRunSummary(RpcModel):
     error_code: str | None = Field(default=None, pattern=r"^[a-z0-9_]{1,64}$")
 
 
+class BenchmarkTrendMetric(RpcModel):
+    name: str = Field(min_length=1, max_length=64)
+    baseline_median: float | None = None
+    candidate_median: float | None = None
+    delta_percent: float | None = None
+    verdict: Literal["better", "worse", "mixed", "inconclusive"]
+
+
+class BenchmarkTrendPoint(RpcModel):
+    id: str = Field(pattern=r"^[A-Za-z0-9_-]{1,128}$")
+    finished_at: datetime | None = None
+    verdict: Literal["better", "worse", "mixed", "inconclusive"]
+    metrics: tuple[BenchmarkTrendMetric, ...] = Field(default=(), max_length=16)
+
+
 class BenchmarkOverview(RpcModel):
     profile_id: ProfileId
     available: bool
     presets: tuple[BenchmarkPresetView, ...] = Field(max_length=16)
     runs: tuple[BenchmarkRunSummary, ...] = Field(max_length=20)
+    next_cursor: str | None = None
+    corrupt_runs: int = 0
+    trends: tuple[BenchmarkTrendPoint, ...] = Field(default=(), max_length=20)
 
 
 class ListAudit(RpcModel):
@@ -379,17 +454,22 @@ class TestNotification(RpcModel):
 
 RpcAction: TypeAlias = Annotated[
     GetStatus
+    | Watch
+    | WaitReadiness
     | GetPerf
     | GetProfiles
     | GetLogs
     | ListBackups
+    | ListAggregateBackups
     | ListEvents
     | GetStatsSummary
     | GetStatsHeatmap
     | GetStatsTps
     | GetProfileConfig
     | GetBenchmarks
+    | ExportBenchmarks
     | RunBenchmark
+    | CancelBenchmark
     | SetProfileConfig
     | GetSchedules
     | SetSchedules
@@ -518,9 +598,31 @@ class PerfAggregate(RpcModel):
     max_ms: float | None = Field(default=None, ge=0)
 
 
+class PerfDatabaseTable(RpcModel):
+    name: str
+    row_count: int = Field(ge=0)
+    oldest_timestamp: datetime | None = None
+
+
+class PerfDatabase(RpcModel):
+    state: Literal["available", "inactive", "unavailable"]
+    tables: tuple[PerfDatabaseTable, ...] = ()
+    page_count: int | None = Field(default=None, ge=0)
+    page_size: int | None = Field(default=None, ge=0)
+    freelist_pages: int | None = Field(default=None, ge=0)
+    wal_bytes: int | None = Field(default=None, ge=0)
+    query_ms: PerfAggregate = Field(default_factory=lambda: PerfAggregate(count=0))
+
+
 class PerfSnapshot(RpcModel):
     cycle: PerfAggregate
     rpc: PerfAggregate
+    maintenance: PerfAggregate = Field(default_factory=lambda: PerfAggregate(count=0))
+    maintenance_ms: tuple[float, ...] = ()
+    maintenance_sequence: dict[str, int] = Field(default_factory=lambda: {"start": 0, "end": 0})
+    event_loop_lag_ms: tuple[float, ...] = ()
+    event_loop_lag_sequence: dict[str, int] = Field(default_factory=lambda: {"start": 0, "end": 0})
+    databases: dict[str, PerfDatabase] = Field(default_factory=dict)
 
 
 class LogLine(RpcModel):
@@ -579,7 +681,15 @@ class AuditPage(RpcModel):
 
 class JobAccepted(RpcModel):
     job_id: str
-    state: Literal["accepted", "running"]
+    state: Literal["accepted", "running", "succeeded", "failed", "cancelled"]
+    readiness_generation: int | None = Field(default=None, ge=1)
+    readiness: Literal["success", "failure", "timeout"] | None = None
+
+
+class ReadinessResult(RpcModel):
+    profile_id: ProfileId
+    generation: int = Field(ge=1)
+    outcome: Literal["success", "failure", "timeout"]
 
 
 class ConfirmationBase(RpcModel):
@@ -636,7 +746,7 @@ ConfirmationSummary: TypeAlias = Annotated[
 
 class UpdateStatus(RpcModel):
     profile_id: ProfileId
-    strategy: Literal["manual", "steamcmd_in_place", "release_symlink"]
+    strategy: Literal["manual", "steamcmd_in_place", "release_symlink", "curated_modpack"]
     installed_version: str | None
     available_version: str | None
     restart_required: bool
@@ -657,6 +767,7 @@ class NotificationConfig(RpcModel):
 
 RpcResult: TypeAlias = (
     StatusSnapshot
+    | ReadinessResult
     | PerfSnapshot
     | tuple[PublicProfile, ...]
     | LogPage
@@ -669,6 +780,7 @@ RpcResult: TypeAlias = (
     | NotificationConfig
     | ProfileConfigResponse
     | BenchmarkOverview
+    | BenchmarkExport
     | ScheduleResponse
     | dict[str, Any]
 )
@@ -749,6 +861,7 @@ def failure(
 
 __all__ = [
     "MAX_REQUEST_BYTES",
+    "MAX_RESPONSE_BYTES",
     "RpcModel",
     "PageOptions",
     "LogOptions",
@@ -767,12 +880,18 @@ __all__ = [
     "PublicProfile",
     "ProfileStatus",
     "StatusSnapshot",
+    "WaitReadiness",
+    "Watch",
+    "ReadinessResult",
     "PerfAggregate",
+    "PerfDatabaseTable",
+    "PerfDatabase",
     "PerfSnapshot",
     "LogLine",
     "LogPage",
     "BackupSummary",
     "BackupPage",
+    "ListAggregateBackups",
     "EventSummary",
     "EventPage",
     "GetStatsSummary",

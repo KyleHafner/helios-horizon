@@ -45,23 +45,28 @@ def _test_directory(monkeypatch, directory: Path) -> None:
     monkeypatch.setenv("GAME_CONSOLE_COMMAND_TEST_MODE", "1")
 
 
-def _read_once(path: Path, result: list[bytes]) -> threading.Thread:
+def _read_once(path: Path, result: list[bytes]) -> tuple[threading.Thread, threading.Event]:
     ready = threading.Event()
+    release_keeper = threading.Event()
 
     def reader() -> None:
-        keeper_fd = os.open(path, os.O_RDONLY | os.O_NONBLOCK)
-        ready.set()
+        # Keep a writer open only long enough to let the real reader attach.
+        # Readiness must mean that this fd is open; an O_RDONLY keeper alone
+        # lets the helper write before the second open has completed.
+        keeper_fd = os.open(path, os.O_RDWR | os.O_NONBLOCK)
         fd = os.open(path, os.O_RDONLY)
+        ready.set()
+        release_keeper.wait()
+        os.close(keeper_fd)
         try:
             result.append(os.read(fd, 32))
         finally:
             os.close(fd)
-            os.close(keeper_fd)
 
     thread = threading.Thread(target=reader, daemon=True)
     thread.start()
     assert ready.wait(timeout=1)
-    return thread
+    return thread, release_keeper
 
 
 @pytest.mark.parametrize("command", ["save", "say Server restart in 5 minutes", "time noon"])
@@ -70,11 +75,11 @@ def test_helper_writes_exact_command_payload_to_fixed_fifo(tmp_path, monkeypatch
     _test_directory(monkeypatch, tmp_path)
     path = _fifo(module, tmp_path)
     received: list[bytes] = []
-    reader = _read_once(path, received)
+    reader, release_keeper = _read_once(path, received)
 
     assert module.main(["terraria-vanilla"], io.BytesIO(command.encode())) == 0
-    reader.join(timeout=3)
-    assert not reader.is_alive()
+    release_keeper.set()
+    reader.join(timeout=1)
     assert received == [command.encode() + b"\n"]
 
 
@@ -105,11 +110,11 @@ def test_helper_accepts_mapped_nonroot_owner_and_writes_exact_payload(
     path = _fifo(module, tmp_path, profile)
     os.chown(path, mapped_uid, -1)
     received: list[bytes] = []
-    reader = _read_once(path, received)
+    reader, release_keeper = _read_once(path, received)
 
     assert module.main([profile], io.BytesIO("save".encode())) == 0
-    reader.join(timeout=3)
-    assert not reader.is_alive()
+    release_keeper.set()
+    reader.join(timeout=1)
     assert lookups == [service_user]
     assert received == [b"save\n"]
 
@@ -168,7 +173,7 @@ def test_helper_rejects_mapped_owner_change_after_open(tmp_path, monkeypatch):
     path = _fifo(module, tmp_path)
     os.chown(path, mapped_uid, -1)
     received: list[bytes] = []
-    reader = _read_once(path, received)
+    reader, release_keeper = _read_once(path, received)
     real_open = module.os.open
 
     def open_and_change_owner(path_arg, flags, *args):
@@ -179,8 +184,8 @@ def test_helper_rejects_mapped_owner_change_after_open(tmp_path, monkeypatch):
     monkeypatch.setattr(module.os, "open", open_and_change_owner)
 
     assert module.main(["terraria-vanilla"], io.BytesIO("save".encode())) != 0
-    reader.join(timeout=3)
-    assert not reader.is_alive()
+    release_keeper.set()
+    reader.join(timeout=1)
     assert received == [b""]
 
 
@@ -256,12 +261,12 @@ def test_helper_rejects_partial_write(tmp_path, monkeypatch):
     _test_directory(monkeypatch, tmp_path)
     path = _fifo(module, tmp_path)
     received: list[bytes] = []
-    reader = _read_once(path, received)
+    reader, release_keeper = _read_once(path, received)
     monkeypatch.setattr(module.os, "write", lambda _fd, _payload: 1)
 
     assert module.main(["terraria-vanilla"], io.BytesIO("save".encode())) != 0
-    reader.join(timeout=3)
-    assert not reader.is_alive()
+    release_keeper.set()
+    reader.join(timeout=1)
 
 
 @pytest.mark.parametrize("stdin", [b"", b"\xff", b"x" * 4097])
@@ -274,7 +279,7 @@ def test_helper_rejects_missing_malformed_or_oversized_stdin(tmp_path, monkeypat
 def test_helper_subprocess_accepts_test_directory_override(tmp_path):
     path = _fifo(_helper_module(), tmp_path)
     received: list[bytes] = []
-    reader = _read_once(path, received)
+    reader, release_keeper = _read_once(path, received)
     env = {
         **os.environ,
         "GAME_CONSOLE_COMMAND_DIR": str(tmp_path),
@@ -288,8 +293,8 @@ def test_helper_subprocess_accepts_test_directory_override(tmp_path):
         capture_output=True,
         check=False,
     )
-    reader.join(timeout=3)
-    assert not reader.is_alive()
+    release_keeper.set()
+    reader.join(timeout=1)
     assert result.returncode == 0
     assert result.stdout == result.stderr == b""
     assert received == [b"save\n"]

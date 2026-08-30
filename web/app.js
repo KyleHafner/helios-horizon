@@ -11,6 +11,7 @@ const PROFILE_FAMILY_RULES = [
 ];
 const THEMES = ["ember", "frost", "moss", "aurora", "paper"];
 const SAMPLE_LIMIT = 90;
+const DETAIL_LOG_BUFFER_LIMIT = 200;
 const NOISE_PATTERNS = [
   /Closing TcpSocket/i,
   /\(Anonymous\)\] (Connecting|Closing)/i,
@@ -18,6 +19,7 @@ const NOISE_PATTERNS = [
   /Thread RCON Client \/127\.0\.0\.1 (?:started|shutting down)/i,
 ];
 const isNoise = (line) => NOISE_PATTERNS.some((pattern) => pattern.test(line.message || ""));
+const detailLogKey = (line) => `${line.timestamp || ""}\u0000${line.severity || ""}\u0000${line.message || ""}`;
 
 function markPerformance(name) {
   try { window.performance?.mark(name); } catch {}
@@ -44,20 +46,55 @@ const state = {
   drawerReturnFocus: null,
   forceProfile: null,
   restoreProfile: null,
+  updateProfile: null,
   logs: new Map(),
   cpuSamples: new Map(),
   metricSamples: new Map(),
   schedules: null,
+  incidents: { items: [], loaded: false },
   benchmarks: new Map(),
-  detail: { id: null, tab: "console", backups: [], statsTimer: null, statsRequest: 0, statsTpsRequest: 0, benchmarkTimer: null },
+  session: { profileId: null, latestBackup: null, backupState: "loading", operation: null },
+  detail: { id: null, tab: "console", backups: [], statsTimer: null, statsRequest: 0, statsAbort: null, benchmarkTimer: null, benchmarkCursor: null, benchmarkRuns: [], statsBaseLoaded: false, commandCatalogKey: null },
+  statsCache: new Map(),
   configRestartRequired: new Map(),
   lastGeneration: 0,
+  statusConfirmed: false,
   loadFailed: false,
-  perf: { firstStatusPaint: false, pendingMutations: new Map() },
+  perf: { firstStatusPaint: false, pendingMutations: new Map(), clientQueue: [], clientTimer: null },
 };
 let aggregateBackupRequest = 0;
 let reauthenticating = false;
-const stream = { source: null, lastEventAt: 0, retryMs: 3000, watchdog: null, pollTimer: null, reconnectTimer: null, reconnectStartedAt: null };
+const stream = { source: null, lastEventAt: 0, lastEventId: null, retryMs: 3000, watchdog: null, pollTimer: null, reconnectTimer: null, reconnectStartedAt: null, suspended: false };
+const MAX_STREAM_CURSOR = 9007199254740991n;
+const canonicalStreamCursor = (raw) => {
+  if (typeof raw !== "string" || raw.length === 0 || raw.length > 16 || !/^(0|[1-9][0-9]*)$/.test(raw)) return null;
+  try { const value = BigInt(raw); return value <= MAX_STREAM_CURSOR ? raw : null; } catch { return null; }
+};
+const recordStreamCursor = (source, event) => {
+  if (stream.suspended || stream.source !== source) return;
+  const cursor = canonicalStreamCursor(event?.lastEventId);
+  if (cursor === null || (stream.lastEventId !== null && BigInt(cursor) <= BigInt(stream.lastEventId))) return;
+  stream.lastEventId = cursor;
+};
+
+const pageVisible = () => document.visibilityState === "visible";
+const CLIENT_PERF_METRICS = new Set(["stats_fetch", "recorder_draw", "first_status_paint"]);
+
+function queueClientPerformance(metric, durationMs) {
+  const duration = Number(durationMs);
+  if (!pageVisible() || !CLIENT_PERF_METRICS.has(metric) || !Number.isFinite(duration) || duration < 0) return;
+  state.perf.clientQueue.push({ metric, duration_ms: Math.min(30000, duration) });
+  state.perf.clientQueue = state.perf.clientQueue.slice(-16);
+  if (state.perf.clientTimer) return;
+  state.perf.clientTimer = window.setTimeout(flushClientPerformance, 1000);
+}
+
+async function flushClientPerformance() {
+  state.perf.clientTimer = null;
+  if (!pageVisible() || !state.perf.clientQueue.length) return;
+  const samples = state.perf.clientQueue.splice(0, 16);
+  try { await api("/api/v1/perf/client", { method: "POST", body: JSON.stringify({ samples }) }); } catch {}
+}
 
 const byId = (id) => document.getElementById(id);
 const cards = byId("profile-cards");
@@ -397,16 +434,16 @@ function patchCard(id) {
   card.querySelector(".metric-version").textContent = formatVersion(status.installed_version);
   patchSparkline(card, id, status);
   const readiness = status.required_ports_ready ? "ready" : "process accepted; waiting for required ports";
-  const reason = current === "blocked" ? "Blocked: another server owns the active slot. Switch active server…" :
+  const reason = !state.statusConfirmed ? "Refreshing current status; actions are paused." :
+    current === "blocked" ? "Blocked: another server owns the active slot. Switch active server…" :
     current === "failed" ? "Previous health check failed; review details before starting." :
-      current === "starting" ? "Starting: actions are paused until the server is ready." :
+      current === "starting" ? (status.pid != null ? `Starting: process detected; ${readiness}.` : "Starting: request accepted; waiting for the server process.") :
         current === "stopping" ? "Stopping: actions are paused until shutdown completes." : "";
-  card.querySelector(".card-reason").textContent = reason || (current === "starting" ? `Start accepted; ${readiness}.` : "");
   card.querySelector(".card-reason").textContent = reason;
   const buttons = [
-    [".action-start", "Start", "start", !["stopped", "failed", "blocked", "unknown"].includes(current) || !operationSet.has("start") || current === "blocked"],
-    [".action-stop", "Stop", "stop", !["running", "starting"].includes(current) || !operationSet.has("stop")],
-    [".action-restart", "Restart", "restart", current !== "running" || !operationSet.has("restart")],
+    [".action-start", "Start", "start", !state.statusConfirmed || !["stopped", "failed", "blocked", "unknown"].includes(current) || !operationSet.has("start") || current === "blocked"],
+    [".action-stop", "Stop", "stop", !state.statusConfirmed || !["running", "starting"].includes(current) || !operationSet.has("stop")],
+    [".action-restart", "Restart", "restart", !state.statusConfirmed || current !== "running" || !operationSet.has("restart")],
   ];
   buttons.forEach(([selector, label, operation, disabled]) => {
     const button = card.querySelector(selector);
@@ -430,42 +467,213 @@ function patchCard(id) {
 }
 
 function patchActiveSlot() {
+  const targetId = sessionProfileId();
+  const target = targetId ? state.statuses.get(targetId) : null;
+  const profile = targetId ? state.profiles.get(targetId) : null;
   const ownerId = slotOwnerId();
-  const active = ownerId ? state.statuses.get(ownerId) : null;
   const slot = byId("active-slot");
   const title = byId("active-slot-title");
   const manage = byId("active-manage");
-  if (!active) {
-    title.textContent = "Nothing is running";
-    byId("active-slot-summary").textContent = "No server currently owns the active slot.";
+  const primary = byId("session-primary");
+  if (!targetId || !target) {
+    title.textContent = "Status unavailable";
+    byId("active-slot-summary").textContent = "Horizon cannot identify the primary game profile.";
     byId("active-players").textContent = "—";
     byId("active-uptime").textContent = "—";
     byId("active-health").textContent = "—";
+    byId("session-endpoint").textContent = "Unavailable";
+    byId("session-copy-endpoint").disabled = true;
+    primary.textContent = "Retry status";
+    primary.dataset.sessionAction = "retry";
+    primary.disabled = false;
     slot.classList.add("is-empty");
     slot.classList.remove("is-transitional");
     manage.hidden = true;
+    patchSessionRunway(null, null);
     return;
   }
-  const name = profileLabel(active.profile_id);
+  const name = profileLabel(targetId);
+  const endpoint = sessionEndpoint(profile);
+  const copy = byId("session-copy-endpoint");
   title.textContent = name;
-  byId("active-slot-summary").textContent = "";
-  byId("active-players").textContent = active.players_online == null ? "—" : String(active.players_online);
-  byId("active-uptime").textContent = uptime(active.uptime_seconds);
-  byId("active-health").textContent = titleCase(active.health);
-  slot.classList.remove("is-empty");
-  slot.classList.toggle("is-transitional", ["starting", "stopping"].includes(active.state));
-  manage.hidden = false;
-  manage.href = `#/servers/${encodeURIComponent(active.profile_id)}/console`;
+  byId("session-endpoint").textContent = endpoint || "Unavailable";
+  copy.dataset.endpoint = endpoint || "";
+  copy.setAttribute("aria-label", `Copy ${name} join address`);
+  byId("active-players").textContent = target.players_online == null ? "Not observed" : String(target.players_online);
+  byId("active-uptime").textContent = uptime(target.uptime_seconds);
+  byId("active-health").textContent = titleCase(target.health);
+  slot.classList.toggle("is-empty", target.state === "stopped" || !ownerId);
+  slot.classList.toggle("is-transitional", ["starting", "stopping"].includes(target.state));
+  manage.href = `#/servers/${encodeURIComponent(targetId)}/console`;
   manage.setAttribute("aria-label", `Manage ${name}`);
+  byId("session-activity-link").href = `#/servers/${encodeURIComponent(targetId)}/stats`;
+  byId("session-backups-link").href = `#/servers/${encodeURIComponent(targetId)}/backups`;
+  const model = sessionModel(target, ownerId, targetId, endpoint);
+  manage.hidden = model.action === "console";
+  copy.disabled = !state.statusConfirmed || !endpoint || model.action !== "copy";
+  byId("active-slot-summary").textContent = state.statusConfirmed
+    ? model.summary
+    : "Confirming current server status. Actions remain paused until Horizon responds.";
+  primary.textContent = state.statusConfirmed ? model.actionLabel : "Checking status…";
+  primary.dataset.sessionAction = state.statusConfirmed ? model.action : "none";
+  primary.dataset.sessionProfileId = targetId;
+  primary.disabled = !state.statusConfirmed || model.action === "none";
+  patchSessionRunway(target, ownerId);
+  if (state.session.profileId !== targetId) {
+    state.session = { profileId: targetId, latestBackup: null, backupState: "loading", operation: null };
+    loadSessionBackup(targetId);
+  }
+  patchSessionBackup();
+  patchSessionOperation();
 }
 
-function applyStatus(snapshot) {
+function sessionProfileId() {
+  const owner = slotOwnerId();
+  if (owner && state.profiles.has(owner)) return owner;
+  if (state.profiles.has("minecraft-sunlit-cobblemon")) return "minecraft-sunlit-cobblemon";
+  const minecraft = [...state.profiles].find(([id, profile]) => id.startsWith("minecraft") || String(profile?.adapter?.value || profile?.adapter || "") === "crafty");
+  return minecraft?.[0] || slotOwnerId() || state.profiles.keys().next().value || null;
+}
+
+function sessionEndpoint(profile) {
+  const endpoint = profile?.public_endpoint;
+  const host = typeof endpoint === "string" ? endpoint : endpoint?.host;
+  if (!host) return "";
+  const port = Number(endpoint?.port);
+  return Number.isInteger(port) && port > 0 && port !== 25565 ? `${host}:${port}` : String(host);
+}
+
+function sessionModel(status, ownerId, targetId, endpoint) {
+  const current = status?.state || "unknown";
+  const conflict = ownerId && ownerId !== targetId;
+  if (conflict || current === "blocked") {
+    const owner = ownerId ? profileLabel(ownerId) : "another server";
+    return { summary: `${owner} owns the active slot. Review the switch before starting ${profileLabel(targetId)}.`, action: "switch", actionLabel: "Review switch" };
+  }
+  if (current === "stopped") return { summary: "Offline. Horizon can start it now.", action: "start", actionLabel: `Start ${profileLabel(targetId)}` };
+  if (current === "starting") {
+    const processSeen = status.pid != null;
+    return {
+      summary: processSeen ? "The server process is loading. Waiting for the game port." : "Start accepted. Waiting for the server process.",
+      action: "console",
+      actionLabel: "Open console",
+    };
+  }
+  const ownedAndHealthy = ownerId === targetId && status.health === "healthy";
+  if (current === "running" && status.required_ports_ready && ownedAndHealthy) return { summary: "The server is healthy and its game port is ready.", action: endpoint ? "copy" : "console", actionLabel: endpoint ? "Copy join address" : "Open console" };
+  if (current === "running" && ownerId !== targetId) return { summary: "The process is running without active-slot ownership. Review events before joining.", action: "events", actionLabel: "Review ownership" };
+  if (current === "running" && status.required_ports_ready && status.health !== "healthy") return { summary: `The game port is open, but health is ${String(status.health || "unknown")}.`, action: "diagnose", actionLabel: "Diagnose health" };
+  if (current === "running") return { summary: "The server process is running, but Horizon cannot confirm game readiness.", action: "diagnose", actionLabel: "Diagnose readiness" };
+  if (current === "stopping") return { summary: "Ending the session safely. Actions are paused until shutdown completes.", action: "console", actionLabel: "Open console" };
+  if (current === "failed") return { summary: "The last operation failed. Horizon will preserve the evidence if you retry.", action: "start", actionLabel: "Retry start" };
+  return { summary: "Horizon cannot currently verify this server.", action: "retry", actionLabel: "Retry status" };
+}
+
+function patchSessionRunway(status, ownerId) {
+  const phases = [...byId("session-runway").querySelectorAll("[data-session-phase]")];
+  const current = status?.state || "unknown";
+  const conflict = ownerId && status?.profile_id && ownerId !== status.profile_id;
+  const processSeen = status?.pid != null || current === "running" || Boolean(status?.required_ports_ready);
+  const complete = {
+    request: ["starting", "running", "stopping"].includes(current),
+    process: processSeen,
+    port: Boolean(status?.required_ports_ready),
+    ready: current === "running" && Boolean(status?.required_ports_ready) && status?.health === "healthy" && ownerId === status?.profile_id,
+  };
+  const active = current === "starting"
+    ? (processSeen ? "port" : "process")
+    : current === "running" && !status?.required_ports_ready ? "port"
+      : current === "stopping" ? "request" : null;
+  phases.forEach((phase) => {
+    const key = phase.dataset.sessionPhase;
+    let next = complete[key] ? "complete" : "waiting";
+    if (key === active) next = "active";
+    if (conflict && key === "request") next = "conflict";
+    if (current === "failed" && key === "request") next = "failed";
+    phase.dataset.state = next;
+    if (next === "active") phase.setAttribute("aria-current", "step"); else phase.removeAttribute("aria-current");
+    const detail = phase.querySelector("small");
+    detail.textContent = next === "complete" ? "complete" : next === "active" ? "in progress" : next === "failed" ? "failed" : next === "conflict" ? "blocked" : "waiting";
+    phase.setAttribute("aria-label", `${phase.querySelector("strong").textContent}, ${detail.textContent}`);
+  });
+  const completed = phases.filter((phase) => phase.dataset.state === "complete").length;
+  const activePhase = phases.find((phase) => phase.dataset.state === "active");
+  const failedPhase = phases.find((phase) => ["failed", "conflict"].includes(phase.dataset.state));
+  byId("session-readiness-summary").textContent = failedPhase
+    ? `Readiness: ${failedPhase.querySelector("strong").textContent.toLowerCase()} ${failedPhase.dataset.state === "conflict" ? "blocked" : "failed"}`
+    : activePhase
+      ? `Readiness: ${completed} of 4 checks complete · ${activePhase.querySelector("strong").textContent.toLowerCase()} in progress`
+      : `Readiness: ${completed} of 4 checks complete`;
+}
+
+function patchSessionBackup() {
+  const node = byId("session-backup");
+  const backup = state.session.latestBackup;
+  if (state.session.backupState === "loading") { node.textContent = "Checking…"; return; }
+  if (state.session.backupState === "error") { node.textContent = "Lookup unavailable"; return; }
+  if (!backup) { node.textContent = "Not recorded"; return; }
+  const date = backup.created_at ? new Date(backup.created_at) : null;
+  const stamp = date && !Number.isNaN(date.getTime()) ? date.toLocaleDateString(undefined, { month: "short", day: "numeric" }) : "date unavailable";
+  node.textContent = `${backup.verified ? "Verified" : "Unverified"} ${stamp}`;
+}
+
+async function loadSessionBackup(id) {
+  if (!id || state.session.backupState !== "loading") return;
+  try {
+    const page = await api(`/api/v1/profiles/${encodeURIComponent(id)}/backups?limit=1`);
+    if (state.session.profileId !== id) return;
+    state.session.latestBackup = Array.isArray(page.items) ? page.items[0] || null : null;
+    state.session.backupState = "loaded";
+  } catch (error) {
+    if (options.signal?.aborted || error?.name === "AbortError") throw error;
+    if (state.session.profileId !== id) return;
+    state.session.latestBackup = null;
+    state.session.backupState = "error";
+  }
+  patchSessionBackup();
+}
+
+function patchSessionOperation() {
+  const node = byId("session-operation");
+  const operation = state.session.operation;
+  if (!operation || operation.profileId !== state.session.profileId) {
+    node.hidden = true;
+    node.textContent = "";
+    node.removeAttribute("data-result");
+    return;
+  }
+  node.hidden = false;
+  node.dataset.result = operation.result;
+  node.textContent = operation.message;
+}
+
+function observeSessionOperation(status) {
+  const operation = state.session.operation;
+  if (!operation || operation.profileId !== status?.profile_id || operation.result === "failed") return;
+  const stateValue = status.state || "unknown";
+  if (operation.kind === "start" && stateValue === "running" && status.required_ports_ready && status.health === "healthy" && status.slot_owner === status.profile_id) {
+    operation.result = "complete";
+    operation.message = `${profileLabel(status.profile_id)} reached healthy game readiness. This tab notice is transient; the Audit trail is durable.`;
+  } else if (operation.kind === "stop" && stateValue === "stopped") {
+    operation.result = "complete";
+    operation.message = `${profileLabel(status.profile_id)} stopped safely.`;
+  } else if (stateValue === "failed") {
+    operation.result = "failed";
+    operation.message = `${titleCase(operation.kind)} failed. Review recent events and logs before retrying.`;
+  }
+}
+
+function applyStatus(snapshot, { confirmed = false } = {}) {
   if (!snapshot || !Array.isArray(snapshot.profiles)) return;
-  if (Number.isFinite(Number(snapshot.generation))) state.lastGeneration = Number(snapshot.generation);
+  const generation = Number(snapshot.generation);
+  if (Number.isFinite(generation) && generation < state.lastGeneration) return;
+  if (Number.isFinite(generation)) state.lastGeneration = generation;
+  if (confirmed) state.statusConfirmed = true;
   snapshot.profiles.forEach((item) => {
     if (!item?.profile_id) return;
     const previous = state.statuses.get(item.profile_id) || {};
     state.statuses.set(item.profile_id, { ...previous, ...item });
+    observeSessionOperation(state.statuses.get(item.profile_id));
     markPerformance("horizon-card-reflect");
     if (state.perf.pendingMutations.has(item.profile_id)) {
       measurePerformance("horizon-mutation-click-to-card-reflect", "horizon-mutation-click", "horizon-card-reflect");
@@ -486,9 +694,14 @@ function applyStatus(snapshot) {
   if (!state.perf.firstStatusPaint) {
     markPerformance("horizon-first-status-paint");
     measurePerformance("horizon-load-to-first-status-paint", "horizon-load-start", "horizon-first-status-paint");
+    const entry = [...(window.performance?.getEntriesByName("horizon-load-to-first-status-paint") || [])].at(-1);
+    if (entry) queueClientPerformance("first_status_paint", entry.duration);
     state.perf.firstStatusPaint = true;
   }
   byId("profile-cards").setAttribute("aria-busy", "false");
+  window.dispatchEvent(new CustomEvent("horizon:status-applied", {
+    detail: { generation: Number(snapshot.generation) },
+  }));
   if (snapshot.observed_at) {
     const observed = new Date(snapshot.observed_at);
     const hours = String(observed.getHours()).padStart(2, "0");
@@ -501,10 +714,27 @@ function applyStatus(snapshot) {
 }
 
 async function api(path, options = {}) {
+  const method = String(options.method || "GET").toUpperCase();
+  const mutation = method !== "GET" && method !== "HEAD" && method !== "OPTIONS";
+  let operationKey = options.idempotencyKey || null;
+  let operationStorageKey = null;
+  if (mutation) {
+    operationStorageKey = `horizon-operation:${method}:${path}:${options.body || ""}`;
+    try {
+      operationKey = operationKey || sessionStorage.getItem(operationStorageKey);
+      if (!operationKey) {
+        operationKey = crypto.randomUUID();
+        sessionStorage.setItem(operationStorageKey, operationKey);
+      }
+    } catch {
+      operationKey = operationKey || crypto.randomUUID();
+    }
+  }
   const attempt = async () => {
     const headers = new Headers(options.headers || {});
     headers.set("Accept", "application/json");
     if (options.body) headers.set("Content-Type", "application/json");
+    if (mutation && operationKey) headers.set("Idempotency-Key", operationKey);
     if (state.csrf && options.method && options.method !== "GET") headers.set("X-CSRF-Token", state.csrf);
     return fetch(path, { credentials: "same-origin", ...options, headers, redirect: "manual" });
   };
@@ -514,9 +744,14 @@ async function api(path, options = {}) {
   } catch {
     if (!options.method || options.method === "GET") {
       await new Promise((resolve) => setTimeout(resolve, 1500));
-      try { response = await attempt(); } catch { throw new Error("Connection lost. Retrying in the background…"); }
+      try { response = await attempt(); } catch (retryError) {
+        if (options.signal?.aborted || retryError?.name === "AbortError") throw retryError;
+        throw new Error("Connection lost. Retrying in the background…");
+      }
     } else {
-      throw new Error("Connection lost — action not sent. Check the connection pill and retry.");
+      const unknown = new Error("Outcome unknown; reconciling original operation. Retry with the same operation key.");
+      unknown.outcomeUnknown = true;
+      throw unknown;
     }
   }
   if (response.type === "opaqueredirect") {
@@ -548,12 +783,21 @@ async function api(path, options = {}) {
   if (!response.ok) {
     let detail = "Request failed.";
     try { detail = (await response.json())?.error?.message || detail; } catch {}
+    // A typed HTTP response is definitive. Only transport failures retain
+    // the sessionStorage key for reconciliation/replay.
+    if (mutation && operationStorageKey) {
+      try { sessionStorage.removeItem(operationStorageKey); } catch {}
+    }
     throw new Error(detail);
+  }
+  if (mutation && operationStorageKey) {
+    try { sessionStorage.removeItem(operationStorageKey); } catch {}
   }
   return response.json();
 }
 
 async function load() {
+  state.statusConfirmed = false;
   try {
     const session = await api("/api/v1/session");
     state.actor = session.actor;
@@ -567,7 +811,8 @@ async function load() {
     PROFILE_FALLBACK.forEach(([id, display_name]) => { if (!state.profiles.has(id)) state.profiles.set(id, { id, display_name }); });
     populateNotificationProfiles();
     renderCards();
-    applyStatus(status);
+    applyStatus(status, { confirmed: true });
+    void loadIncidents();
     try { await loadSchedules(); } catch { renderAutomationSummary(null); }
     populateTargets();
     populateNotificationProfiles();
@@ -669,6 +914,108 @@ async function loadNotifications(id) {
 
 function setNotificationStatus(message) { const node = byId("notification-status"); if (node) node.textContent = message; }
 
+const INCIDENT_COPY = {
+  start_timeout: ["Start timed out", "The service did not become ready. Horizon now stops any process left by this failed start."],
+  health_failed: ["Health check failed", "The process or required game port did not reach a healthy state."],
+  grace_timeout: ["Graceful stop timed out", "Use the confirmed force-stop flow only after checking player activity."],
+  backup_failed: ["Backup failed", "Review the backup record before retrying; retention is not changed automatically."],
+  restore_failed: ["Restore failed", "The requested restore did not complete. The current world remains authoritative."],
+  update_failed: ["Update failed", "The release did not pass Horizon's guarded update path."],
+  benchmark_failed: ["Benchmark failed", "The isolated benchmark did not produce accepted evidence."],
+  low_disk: ["Storage gate blocked the action", "Free space fell below the configured safety threshold."],
+  low_memory: ["Memory gate blocked the action", "Available memory fell below the configured safety threshold."],
+  required_file_missing: ["Required file missing", "The profile failed its fixed-file preflight."],
+  upstream_unavailable: ["Upstream unavailable", "A fixed dependency could not be reached."],
+  slot_conflict: ["Slot ownership conflict", "Another operation, player fence, or server owns the single game slot."],
+  profile_reserved: ["Profile reserved", "Another controller request currently owns this profile."],
+  internal_error: ["Controller error", "Horizon rejected the operation without exposing internal details."],
+};
+const CRITICAL_INCIDENTS = new Set(["start_timeout", "health_failed", "backup_failed", "restore_failed", "update_failed", "internal_error"]);
+
+function deriveIncidents(auditItems) {
+  const items = (Array.isArray(auditItems) ? auditItems : [])
+    .filter((item) => item && item.timestamp && item.action)
+    .sort((left, right) => new Date(left.timestamp) - new Date(right.timestamp));
+  const groups = new Map();
+  items.forEach((item) => {
+    if (!["failed", "rejected"].includes(item.result) || !item.error_code) return;
+    const key = `${item.profile_id || "system"}\u0000${item.action}\u0000${item.error_code}`;
+    const existing = groups.get(key) || {
+      key,
+      profileId: item.profile_id || null,
+      action: item.action,
+      code: item.error_code,
+      firstSeen: item.timestamp,
+      lastSeen: item.timestamp,
+      occurrences: 0,
+      resolvedAt: null,
+    };
+    existing.lastSeen = item.timestamp;
+    existing.occurrences += 1;
+    existing.resolvedAt = null;
+    groups.set(key, existing);
+  });
+  groups.forEach((incident) => {
+    const resolved = items.find((item) => item.result === "succeeded" && item.action === incident.action && (item.profile_id || null) === incident.profileId && new Date(item.timestamp) > new Date(incident.lastSeen));
+    if (resolved) incident.resolvedAt = resolved.timestamp;
+  });
+  return [...groups.values()].sort((left, right) => new Date(right.lastSeen) - new Date(left.lastSeen));
+}
+
+function renderIncidentRail(listId, incidents, { limit = 50, summaryId } = {}) {
+  const list = byId(listId);
+  if (!list) return;
+  list.replaceChildren();
+  list.setAttribute("aria-busy", "false");
+  const visible = incidents.slice(0, limit);
+  visible.forEach((incident) => {
+    const [title, hint] = INCIDENT_COPY[incident.code] || [`${titleCase(incident.action)} failed`, "Review the typed audit trail before retrying."];
+    const active = !incident.resolvedAt;
+    const row = document.createElement("li");
+    row.className = "incident-item";
+    row.dataset.state = active ? (CRITICAL_INCIDENTS.has(incident.code) ? "critical" : "open") : "resolved";
+    const marker = document.createElement("span"); marker.className = "incident-marker"; marker.setAttribute("aria-hidden", "true");
+    const body = document.createElement("div"); body.className = "incident-body";
+    const top = document.createElement("div"); top.className = "incident-topline";
+    const heading = document.createElement("strong"); heading.textContent = title;
+    const stateLabel = document.createElement("span"); stateLabel.className = "incident-state"; stateLabel.textContent = active ? "Needs review" : "Resolved";
+    top.append(heading, stateLabel);
+    const meta = document.createElement("p"); meta.className = "incident-meta";
+    const profile = incident.profileId ? profileLabel(incident.profileId) : "Horizon";
+    const count = incident.occurrences > 1 ? ` · ${incident.occurrences} occurrences` : "";
+    meta.textContent = `${profile} · ${new Date(incident.lastSeen).toLocaleString()}${count}`;
+    const copy = document.createElement("p"); copy.className = "incident-copy"; copy.textContent = hint;
+    body.append(top, meta, copy); row.append(marker, body); list.append(row);
+  });
+  if (!visible.length) {
+    const empty = document.createElement("li"); empty.className = "incident-empty is-clear"; empty.textContent = "No recent controller failures. Horizon's typed record is clear."; list.append(empty);
+  }
+  const summary = byId(summaryId);
+  if (summary) {
+    const open = incidents.filter((item) => !item.resolvedAt).length;
+    summary.textContent = incidents.length ? `${open} needing review · ${incidents.length - open} resolved in the recent record` : "No recent controller failures.";
+  }
+}
+
+async function loadIncidents() {
+  try {
+    // Keep the projection below the controller's bounded response envelope.
+    // A 500-row page can exceed the Unix-RPC frame even though the HTTP route
+    // accepts the query parameter, which must not turn the whole rail into an
+    // unavailable state.
+    const page = await api("/api/v1/audit?limit=200");
+    state.incidents = { items: deriveIncidents(page.items), loaded: true };
+    renderIncidentRail("incident-list-compact", state.incidents.items, { limit: 3, summaryId: "incident-summary" });
+    renderIncidentRail("incident-list", state.incidents.items, { summaryId: "incident-history-summary" });
+  } catch (error) {
+    ["incident-list-compact", "incident-list"].forEach((id) => {
+      const list = byId(id); if (!list) return; list.replaceChildren(); list.setAttribute("aria-busy", "false");
+      const item = document.createElement("li"); item.className = "incident-empty is-unavailable"; item.textContent = "Incident history is temporarily unavailable."; list.append(item);
+    });
+    ["incident-summary", "incident-history-summary"].forEach((id) => { const node = byId(id); if (node) node.textContent = "Could not read the typed audit record."; });
+  }
+}
+
 async function testNotification(channel) {
   const id = byId("notification-profile")?.value;
   if (!id) return;
@@ -694,11 +1041,15 @@ async function loadActivity(kind) {
 }
 
 function connectStream() {
+  if (!pageVisible() || stream.suspended) return;
   if (!window.EventSource) { startFallbackPolling(); return; }
+  if (stream.source && stream.source.readyState !== window.EventSource.CLOSED) return;
   if (stream.source) { stream.source.close(); stream.source = null; }
-  const source = new EventSource("/api/v1/stream");
+  const cursor = stream.lastEventId === null ? "" : `?after=${encodeURIComponent(stream.lastEventId)}`;
+  const source = new EventSource(`/api/v1/stream${cursor}`);
   stream.source = source;
   const alive = () => {
+    if (stream.suspended || stream.source !== source) return;
     if (stream.reconnectStartedAt !== null) {
       markPerformance("horizon-sse-reconnect-end");
       measurePerformance("horizon-sse-reconnect-gap", "horizon-sse-reconnect-start", "horizon-sse-reconnect-end");
@@ -708,14 +1059,20 @@ function connectStream() {
   };
   source.onopen = alive;
   source.addEventListener("heartbeat", alive);
-  source.addEventListener("status", (event) => { alive(); try { applyStatus(JSON.parse(event.data)); } catch {} });
-  source.onmessage = (event) => { alive(); try { applyStatus(JSON.parse(event.data)); } catch {} };
+  const applyStreamEvent = (event) => { if (stream.suspended || stream.source !== source) return; recordStreamCursor(source, event); alive(); try { applyStatus(JSON.parse(event.data)); } catch {} };
+  source.addEventListener("status", applyStreamEvent);
+  source.onmessage = applyStreamEvent;
   source.onerror = () => {
+    if (stream.suspended || stream.source !== source) return;
     setConnState("reconnecting");
-    startFallbackPolling();
-    if (source.readyState === EventSource.CLOSED) scheduleReconnect();
+    if (source.readyState === EventSource.CLOSED) {
+      startFallbackPolling();
+      scheduleReconnect();
+    }
   };
+  // Recurring timer: connection watchdog; callback is visibility-gated.
   if (!stream.watchdog) stream.watchdog = window.setInterval(() => {
+    if (!pageVisible()) return;
     if (stream.source && Date.now() - stream.lastEventAt > 45000) { setConnState("reconnecting"); scheduleReconnect(); }
   }, 10000);
 }
@@ -728,6 +1085,7 @@ function setConnState(mode) {
 }
 
 function scheduleReconnect() {
+  if (!pageVisible() || stream.suspended) return;
   if (stream.reconnectTimer) return;
   if (stream.source) { stream.source.close(); stream.source = null; }
   if (stream.reconnectStartedAt === null) {
@@ -738,6 +1096,7 @@ function scheduleReconnect() {
   stream.retryMs = Math.min(stream.retryMs * 2, 60000);
   stream.reconnectTimer = window.setTimeout(async () => {
     stream.reconnectTimer = null;
+    if (!pageVisible() || stream.suspended) return;
     try {
       const session = await api("/api/v1/session");
       state.csrf = session.csrf_token || state.csrf;
@@ -747,14 +1106,43 @@ function scheduleReconnect() {
 }
 
 function startFallbackPolling() {
+  if (!pageVisible() || stream.suspended) return;
   if (stream.pollTimer) return;
+  // Recurring timer: REST status fallback; callback is visibility-gated.
   stream.pollTimer = window.setInterval(async () => {
-    try { applyStatus(await api("/api/v1/status")); } catch { setConnState("offline"); }
+    if (!pageVisible()) return;
+    try { applyStatus(await api("/api/v1/status"), { confirmed: true }); } catch { setConnState("offline"); }
   }, 10000);
 }
 
 function stopFallbackPolling() {
   if (stream.pollTimer) { window.clearInterval(stream.pollTimer); stream.pollTimer = null; }
+}
+
+function suspendStream() {
+  stream.suspended = true;
+  if (stream.reconnectTimer) { window.clearTimeout(stream.reconnectTimer); stream.reconnectTimer = null; }
+  if (stream.watchdog) { window.clearInterval(stream.watchdog); stream.watchdog = null; }
+  stopFallbackPolling();
+  const source = stream.source;
+  stream.source = null;
+  if (source) source.close();
+}
+
+async function resumeStream() {
+  if (!pageVisible()) return;
+  const wasSuspended = stream.suspended;
+  stream.suspended = false;
+  if (!wasSuspended && stream.source && stream.source.readyState !== window.EventSource?.CLOSED) return;
+  state.statusConfirmed = false;
+  state.profiles.forEach((_profile, id) => patchCard(id));
+  patchActiveSlot();
+  // One full snapshot closes the event gap while the browser was hidden.  SSE
+  // then resumes from a single fresh source; cached UI remains in place until
+  // this snapshot wins.
+  try { applyStatus(await api("/api/v1/status"), { confirmed: true }); } catch { setConnState("reconnecting"); }
+  if (!pageVisible() || stream.suspended) return;
+  connectStream();
 }
 
 function populateTargets(preferredTarget = null) {
@@ -786,6 +1174,10 @@ function openSwitchDialog(targetId, opener) {
 }
 
 async function mutate(id, operation) {
+  if (!state.statusConfirmed) {
+    notify("Horizon is still confirming current status. Try again when the status check completes.");
+    return;
+  }
   const owner = [...state.statuses.values()].find((status) => status?.slot_owner)?.slot_owner;
   if (operation === "start" && owner && owner !== id) {
     notify(`${profileLabel(id)} cannot start while ${profileLabel(owner)} owns the active slot. Switch active server…`);
@@ -802,6 +1194,17 @@ async function mutate(id, operation) {
     required_ports_ready: operation === "start" ? false : previous.required_ports_ready,
   };
   const pending = { operation, previous };
+  if (id === sessionProfileId()) {
+    state.session.operation = {
+      profileId: id,
+      kind: operation,
+      result: "pending",
+      startedAt: new Date().toISOString(),
+      jobId: null,
+      message: `${titleCase(operation)} request is being sent to Horizon. This tab notice is transient; the Audit trail is durable.`,
+    };
+    patchSessionOperation();
+  }
   state.perf.pendingMutations.set(id, pending);
   state.statuses.set(id, optimistic);
   markPerformance("horizon-mutation-click");
@@ -813,7 +1216,14 @@ async function mutate(id, operation) {
   markPerformance("horizon-mutation-optimistic-reflect");
   measurePerformance("horizon-mutation-click-to-optimistic-reflect", "horizon-mutation-optimistic-click", "horizon-mutation-optimistic-reflect");
   try {
-    await api(`/api/v1/profiles/${encodeURIComponent(id)}/${operation}`, { method: "POST", body: JSON.stringify({}) });
+    const accepted = await api(`/api/v1/profiles/${encodeURIComponent(id)}/${operation}`, { method: "POST", body: JSON.stringify({}) });
+    if (state.session.operation?.profileId === id && state.session.operation.kind === operation && state.session.operation.result === "pending") {
+      state.session.operation.result = "accepted";
+      state.session.operation.jobId = accepted?.job_id || null;
+      const job = state.session.operation.jobId ? ` Job ${state.session.operation.jobId}.` : "";
+      state.session.operation.message = `${titleCase(operation)} accepted by Horizon.${job} Waiting for observed readiness. This tab notice is transient; the Audit trail is durable.`;
+      patchSessionOperation();
+    }
     notify(`${titleCase(operation)} requested for ${profileLabel(id)}.`);
   } catch (error) {
     if (state.perf.pendingMutations.get(id) === pending) {
@@ -824,8 +1234,42 @@ async function mutate(id, operation) {
       patchFamilyHeaders();
       if (state.detail.id === id) patchDetail(id);
     }
+    if (state.session.operation?.profileId === id && state.session.operation.kind === operation && ["pending", "accepted"].includes(state.session.operation.result)) {
+      state.session.operation.result = error?.outcomeUnknown ? "unknown" : "failed";
+      state.session.operation.message = error?.outcomeUnknown
+        ? `${titleCase(operation)} outcome is unknown. Horizon is reconciling the original operation; observed status will settle this notice.`
+        : `${titleCase(operation)} was not accepted: ${error.message || "request failed"}`;
+      patchSessionOperation();
+    }
     notify(error.message || `${titleCase(operation)} failed.`);
   }
+}
+
+async function copySessionEndpoint() {
+  const value = byId("session-copy-endpoint").dataset.endpoint || "";
+  if (!value) return;
+  try {
+    await navigator.clipboard.writeText(value);
+    notify(`Copied ${value}.`);
+  } catch {
+    notify(`Copy unavailable. Join at ${value}.`);
+  }
+}
+
+function setupSessionDeck() {
+  byId("session-copy-endpoint")?.addEventListener("click", copySessionEndpoint);
+  byId("session-primary")?.addEventListener("click", (event) => {
+    const control = event.currentTarget;
+    const id = control.dataset.sessionProfileId || sessionProfileId();
+    const action = control.dataset.sessionAction;
+    if (action === "start" && id) mutate(id, "start");
+    else if (action === "switch" && id) openSwitchDialog(id, control);
+    else if (action === "console" && id) window.location.hash = `#/servers/${encodeURIComponent(id)}/console`;
+    else if (action === "diagnose" && id) window.location.hash = `#/servers/${encodeURIComponent(id)}/logs`;
+    else if (action === "events") window.location.hash = "#/events";
+    else if (action === "copy") copySessionEndpoint();
+    else if (action === "retry") load().finally(route);
+  });
 }
 
 function setupDialog(dialog, opener) {
@@ -880,7 +1324,7 @@ function wireDialogForms() {
       closeDialog(switchDialog); notify(`Switch to ${profileLabel(target)} requested.`);
     } catch (error) { notify(error.message || "Switch was not accepted."); }
   });
-  [switchDialog, byId("force-dialog"), byId("logs-dialog"), byId("restore-dialog"), byId("console-save-as-dialog")].forEach((dialog) => {
+  [switchDialog, byId("force-dialog"), byId("logs-dialog"), byId("restore-dialog"), byId("update-dialog"), byId("console-save-as-dialog")].forEach((dialog) => {
     dialog.addEventListener("click", (event) => { if (event.target === dialog) closeDialog(dialog); });
     dialog.addEventListener("close", () => {
       if (state.dialog !== dialog) return;
@@ -910,8 +1354,8 @@ function wireDialogForms() {
   byId("restore-confirm-text").addEventListener("input", () => { byId("restore-confirm").disabled = byId("restore-confirm-text").value.trim().toLowerCase() !== profileLabel(state.restoreProfile).toLowerCase() || !byId("restore-backup-id").value.trim(); });
   byId("restore-backup-id").addEventListener("input", () => { byId("restore-confirm-text").dispatchEvent(new Event("input")); });
   byId("restore-form").addEventListener("submit", async (event) => {
-    if (event.submitter?.value === "cancel") { closeDialog(byId("restore-dialog")); return; }
     event.preventDefault();
+    if (event.submitter?.value === "cancel") { closeDialog(byId("restore-dialog")); return; }
     const id = state.restoreProfile;
     try {
       const confirmation = await api(`/api/v1/profiles/${encodeURIComponent(id)}/restore/prepare`, { method: "POST", body: JSON.stringify({ backup_id: byId("restore-backup-id").value.trim() }) });
@@ -919,6 +1363,28 @@ function wireDialogForms() {
       closeDialog(byId("restore-dialog")); notify(`Restore requested for ${profileLabel(id)}.`);
     } catch (error) { notify(error.message || "Restore was not accepted."); }
   });
+
+  byId("update-form").addEventListener("submit", async (event) => {
+    event.preventDefault();
+    if (event.submitter?.value === "cancel") { closeDialog(byId("update-dialog")); return; }
+    const id = state.updateProfile;
+    if (!id) return;
+    const confirm = byId("update-confirm");
+    confirm.disabled = true;
+    confirm.textContent = "Applying…";
+    try {
+      const prepared = await api(`/api/v1/profiles/${encodeURIComponent(id)}/update/prepare`, { method: "POST", body: "{}" });
+      await api("/api/v1/update/confirm", { method: "POST", body: JSON.stringify({ confirmation_id: prepared.confirmation_id }) });
+      closeDialog(byId("update-dialog"));
+      notify(`Update requested for ${profileLabel(id)}.`);
+    } catch (error) {
+      notify(error.message || "Update request failed.");
+    } finally {
+      confirm.disabled = false;
+      confirm.textContent = "Apply update";
+    }
+  });
+
 }
 
 function openForce(id, opener) {
@@ -1020,12 +1486,14 @@ function renderMetricChart(svgId, samples, { unit = "", formatValue = (value) =>
 
 const STATS_PROFILES = new Set(["minecraft", "minecraft-sunlit-cobblemon", "terraria-vanilla", "terraria-tmod", "pz-rising"]);
 const TICK_PROFILES = new Set(["minecraft", "minecraft-sunlit-cobblemon"]);
-const STATS_WINDOWS = { "1h": 1, "6h": 6, "24h": 24 };
+const STATS_WINDOWS = { "1h": 1, "6h": 6, "24h": 24, "7d": 168, "30d": 720 };
 const HEATMAP_LABELS = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"];
 
 function clearStatsTimer() {
   if (state.detail.statsTimer) window.clearInterval(state.detail.statsTimer);
   state.detail.statsTimer = null;
+  state.detail.statsAbort?.abort();
+  state.detail.statsAbort = null;
 }
 
 function renderStatsSummary(summary) {
@@ -1040,30 +1508,7 @@ function renderStatsSummary(summary) {
   byId("stats-unique-players").textContent = Number.isFinite(unique) ? String(unique) : "—";
   byId("stats-leaderboard-meta").textContent = Number.isFinite(unique) ? `${unique} player${unique === 1 ? "" : "s"}` : "—";
   const latest = Number(summary?.occupancy?.latest);
-  const status = state.statuses.get(state.detail.id) || {};
-  const currentCount = status.players_online == null ? NaN : Number(status.players_online);
-  const latestSample = Array.isArray(summary?.occupancy?.samples) ? summary.occupancy.samples.at(-1) : null;
-  const latestTs = summary?.occupancy?.latest_ts || summary?.occupancy?.timestamp || summary?.occupancy?.ts || latestSample?.timestamp || latestSample?.ts;
-  const parsed = latestTs ? Date.parse(latestTs) : NaN;
-  const localized = Number.isFinite(parsed) ? new Date(parsed).toLocaleString() : null;
-  if (status.state === "stopped" && Number.isFinite(latest) && localized) {
-    byId("stats-occupancy-current").textContent = `Stopped · last observed ${latest} players at ${localized}`;
-  } else if (status.state === "running" && Number.isFinite(currentCount)) {
-    byId("stats-occupancy-current").textContent = `ONLINE NOW · ${currentCount} players`;
-  } else if (Number.isFinite(latest) && localized) {
-    byId("stats-occupancy-current").textContent = `LAST OBSERVED OCCUPANCY · ${latest} players at ${localized}`;
-  } else {
-    byId("stats-occupancy-current").textContent = "Historical occupancy is unavailable.";
-  }
-}
-
-function renderStatsHeader(id) {
-  const value = state.statuses.get(id)?.state;
-  byId("stats-scope-copy").textContent = value === "stopped"
-    ? "Server stopped by design. Historical observations remain available."
-    : value === "running"
-      ? "Server running. Current status and historical observations are shown separately."
-      : "Server state is changing or unavailable. Historical observations remain available.";
+  byId("stats-occupancy-current").textContent = Number.isFinite(latest) ? `${latest} online` : "Unavailable";
 }
 
 function renderStatsLeaderboard(rows) {
@@ -1074,7 +1519,7 @@ function renderStatsLeaderboard(rows) {
     const cell = document.createElement("td");
     cell.className = "empty-state";
     cell.colSpan = 4;
-    cell.textContent = "No player activity recorded in the last 90 days.";
+    cell.textContent = "No sessions recorded yet.";
     row.append(cell);
     body.append(row);
     return;
@@ -1098,18 +1543,6 @@ function renderStatsHeatmap(result) {
   const buckets = Array.isArray(result?.buckets) ? result.buckets : [];
   const values = buckets.flatMap((row) => Array.isArray(row) ? row.map(Number) : []).filter(Number.isFinite);
   const maximum = Math.max(0, ...values);
-  const axis = document.createElement("div");
-  axis.className = "heatmap-row heatmap-axis";
-  const zone = document.createElement("span");
-  zone.className = "heatmap-label";
-  zone.textContent = "UTC";
-  axis.append(zone);
-  for (let hour = 0; hour < 24; hour += 1) {
-    const label = document.createElement("span");
-    label.textContent = hour % 6 === 0 ? String(hour).padStart(2, "0") : "";
-    axis.append(label);
-  }
-  grid.append(axis);
   HEATMAP_LABELS.forEach((label, day) => {
     const row = document.createElement("div");
     row.className = "heatmap-row";
@@ -1121,37 +1554,236 @@ function renderStatsHeatmap(result) {
       const value = Number(buckets[day]?.[hour]) || 0;
       const cell = document.createElement("span");
       cell.className = "heatmap-cell";
-      cell.tabIndex = 0;
       cell.style.setProperty("--heat", maximum ? String(Math.min(1, value / maximum)) : "0");
-      cell.title = `${label} ${String(hour).padStart(2, "0")}:00 UTC · ${value.toFixed(2)} player-hours · last 90 days`;
+      cell.title = `${label} ${String(hour).padStart(2, "0")}:00 UTC · ${value.toFixed(2)} player-hours`;
       cell.setAttribute("aria-label", cell.title);
       row.append(cell);
     }
     grid.append(row);
   });
-  const legend = document.createElement("div");
-  legend.className = "heatmap-legend";
-  legend.innerHTML = '<span>Less player time</span><i style="--heat: .12"></i><i style="--heat: .35"></i><i style="--heat: .65"></i><i style="--heat: 1"></i><span>More player time</span>';
-  grid.append(legend);
 }
 
-function renderStatsTpsUnavailable(message) {
-  byId("stats-tps-note").textContent = "";
-  byId("stats-tps-current").textContent = "—";
-  byId("stats-mspt-current").textContent = "—";
-  const lines = byId("stats-tps-chart")?.querySelector(".tps-chart-lines");
-  byId("stats-tps-chart")?.querySelector(".tps-chart-areas")?.replaceChildren();
-  byId("stats-tps-chart")?.querySelector(".tps-chart-points")?.replaceChildren();
-  if (lines) lines.replaceChildren();
-  byId("stats-tps-status").textContent = message;
-  const hours = STATS_WINDOWS[byId("stats-window")?.value] || 24;
-  const end = Date.now();
-  const start = end - hours * 60 * 60 * 1000;
-  const fmt = (time) => new Date(time).toLocaleString([], hours >= 24
-    ? { weekday: "short", hour: "numeric", minute: "2-digit" }
-    : { hour: "numeric", minute: "2-digit" });
-  byId("stats-tps-chart").querySelector(".chart-x0").textContent = fmt(start);
-  byId("stats-tps-chart").querySelector(".chart-x1").textContent = fmt(end);
+function recorderSamples(result) {
+  return (Array.isArray(result?.samples) ? result.samples : []).map((sample) => {
+    const time = Date.parse(sample.ts || sample.timestamp);
+    const finite = (value) => value === null || value === undefined || value === "" ? null : Number(value);
+    const tps = finite(sample.tps);
+    const mspt = finite(sample.mspt);
+    const stateName = ["available", "inactive", "unavailable"].includes(sample.state)
+      ? sample.state : (Number.isFinite(tps) && Number.isFinite(mspt) ? "available" : "unavailable");
+    return { ...sample, time, tps: Number.isFinite(tps) ? tps : null, mspt: Number.isFinite(mspt) ? mspt : null, state: stateName };
+  }).filter((sample) => Number.isFinite(sample.time)).sort((a, b) => a.time - b.time);
+}
+
+function recorderSignal(result, samples) {
+  const latest = samples.at(-1);
+  if (latest?.state === "inactive") return "offline";
+  if (!latest || result?.stale === true || result?.state === "unknown") return "stale";
+  return latest.state === "available" ? "live" : "stale";
+}
+
+function recorderLatestObservation(result, samples) {
+  const explicit = result?.latest_observation;
+  if (explicit && typeof explicit === "object") {
+    const time = Date.parse(explicit.ts || explicit.timestamp);
+    const tps = explicit.tps === null || explicit.tps === undefined ? null : Number(explicit.tps);
+    const mspt = explicit.mspt === null || explicit.mspt === undefined ? null : Number(explicit.mspt);
+    if (Number.isFinite(time) && Number.isFinite(tps) && Number.isFinite(mspt)) {
+      return { time, tps, mspt, state: "available", stale: explicit.stale === true };
+    }
+  }
+  return [...samples].reverse().find((sample) => sample.state === "available") || null;
+}
+
+function recorderContext(result) {
+  const raw = result?.context?.series && typeof result.context.series === "object" ? result.context.series : {};
+  const series = {};
+  ["cpu_percent", "rss_bytes", "gc_pause"].forEach((metric) => {
+    series[metric] = (Array.isArray(raw[metric]) ? raw[metric] : []).map((item) => ({
+      time: Date.parse(item.ts || item.timestamp), value: Number(item.value), state: item.state || "available",
+    })).filter((item) => Number.isFinite(item.time) && Number.isFinite(item.value));
+  });
+  const allowed = new Set(["backup", "update", "benchmark", "restart", "start", "stop", "switch"]);
+  const jobs = (Array.isArray(result?.context?.jobs) ? result.context.jobs : []).filter((item) => allowed.has(item.kind)).map((item) => ({
+    kind: item.kind, start: Date.parse(item.started_at), end: Date.parse(item.ended_at || item.started_at), state: item.state,
+  })).filter((item) => Number.isFinite(item.start));
+  return { series, jobs };
+}
+
+function recorderDomain(samples) {
+  const hours = STATS_WINDOWS[byId("stats-window")?.value] || 6;
+  const width = hours * 60 * 60 * 1000;
+  const latest = samples.at(-1)?.time;
+  const now = Date.now();
+  const end = Number.isFinite(latest) && Math.abs(now - latest) > width ? latest : now;
+  return { start: end - width, end };
+}
+
+function drawRecorderLine(ctx, items, x, y, color, { width = 1.6, dash = [] } = {}) {
+  let open = false;
+  ctx.beginPath(); ctx.strokeStyle = color; ctx.lineWidth = width; ctx.setLineDash(dash);
+  items.forEach((item) => {
+    if (item.state !== "available" || item.value == null || !Number.isFinite(item.value)) { open = false; return; }
+    const px = x(item.time); const py = y(item.value);
+    if (!open) { ctx.moveTo(px, py); open = true; } else ctx.lineTo(px, py);
+  });
+  ctx.stroke(); ctx.setLineDash([]);
+}
+
+function recorderComparisonSamples(mode, comparison, domain) {
+  if (!Array.isArray(comparison?.samples)) return [];
+  const normalized = recorderSamples({ samples: comparison.samples });
+  if (!normalized.length) return [];
+  if (mode === "restart") return normalized;
+  if (mode === "yesterday") return normalized.map((item) => ({ ...item, time: item.time + 24 * 60 * 60 * 1000 }));
+  if (mode === "previous") {
+    const first = normalized[0].time;
+    return normalized.map((item) => ({ ...item, time: domain.start + (item.time - first) }));
+  }
+  return [];
+}
+
+function drawFlightRecorder(result, samples) {
+  const drawStarted = window.performance?.now?.() || 0;
+  const canvas = byId("stats-tps-chart");
+  if (!canvas) return;
+  const context = recorderContext(result);
+  const comparisonMode = byId("stats-comparison")?.value || "none";
+  const comparison = comparisonMode === "none" ? null : result?.comparisons?.[comparisonMode];
+  const css = getComputedStyle(document.documentElement);
+  const color = (name, fallback) => css.getPropertyValue(name).trim() || fallback;
+  const dpr = Math.min(2, Math.max(1, window.devicePixelRatio || 1));
+  const width = Math.max(280, Math.round(canvas.clientWidth || 520)); const height = 220;
+  const signature = JSON.stringify([width, dpr, result?.resolution, samples, context, comparisonMode, comparison]);
+  if (canvas.dataset.signature === signature) return;
+  canvas.dataset.signature = signature;
+  canvas.width = Math.round(width * dpr); canvas.height = Math.round(height * dpr);
+  const ctx = canvas.getContext("2d");
+  if (!ctx) return;
+  ctx.scale(dpr, dpr);
+  const plot = { left: 48, right: width - 14, top: 22, bottom: height - 32 };
+  const domain = recorderDomain(samples);
+  const x = (time) => plot.left + Math.max(0, Math.min(1, (time - domain.start) / (domain.end - domain.start))) * (plot.right - plot.left);
+  const tpsMax = Math.max(20, ...samples.map((item) => item.tps || 0));
+  const msptMax = Math.max(50, ...samples.map((item) => item.mspt || 0));
+  const yTps = (value) => plot.bottom - Math.max(0, value) / tpsMax * (plot.bottom - plot.top);
+  const yMspt = (value) => plot.bottom - Math.max(0, value) / msptMax * (plot.bottom - plot.top);
+  ctx.fillStyle = color("--console-surface", "#071011"); ctx.fillRect(0, 0, width, height);
+  ctx.strokeStyle = color("--line", "#253033"); ctx.fillStyle = color("--muted", "#8d9a9f"); ctx.font = "10px ui-monospace, monospace";
+  [0, .5, 1].forEach((ratio) => {
+    const py = plot.bottom - ratio * (plot.bottom - plot.top);
+    ctx.beginPath(); ctx.moveTo(plot.left, py); ctx.lineTo(plot.right, py); ctx.stroke();
+    ctx.fillText(`${(tpsMax * ratio).toFixed(0)} TPS`, 4, py + 3);
+  });
+  const inDomain = samples.filter((item) => item.time >= domain.start && item.time <= domain.end);
+  inDomain.forEach((item, index) => {
+    const next = inDomain[index + 1]; const end = next ? next.time : domain.end;
+    const left = x(item.time); const bandWidth = Math.max(1, x(end) - left);
+    if (item.state === "inactive") { ctx.fillStyle = "rgba(88, 101, 105, .22)"; ctx.fillRect(left, plot.top, bandWidth, plot.bottom - plot.top); }
+    else if (Number(item.inactive_fraction) > 0) { ctx.fillStyle = "rgba(88, 101, 105, .22)"; ctx.fillRect(left, plot.top, bandWidth * Math.min(1, Number(item.inactive_fraction)), plot.bottom - plot.top); }
+    if (item.state === "available") { ctx.fillStyle = "rgba(89, 217, 145, .45)"; ctx.fillRect(left, plot.bottom + 7, bandWidth, 3); }
+  });
+  drawRecorderLine(ctx, inDomain.map((item) => ({ time: item.time, value: item.tps, state: item.state })), x, yTps, color("--accent", "#59d991"), { width: 2 });
+  drawRecorderLine(ctx, inDomain.map((item) => ({ time: item.time, value: item.mspt, state: item.state })), x, yMspt, "#d6e5a8", { width: 1.5 });
+  ["cpu_percent", "rss_bytes"].forEach((metric, index) => {
+    const items = context.series[metric].filter((item) => item.time >= domain.start && item.time <= domain.end);
+    const maximum = Math.max(1, ...items.map((item) => item.value));
+    drawRecorderLine(ctx, items, x, (value) => plot.bottom - (value / maximum) * (plot.bottom - plot.top) * .34 - index * 6, "rgba(101, 168, 162, .55)", { width: 1 });
+  });
+  context.series.gc_pause.forEach((item) => {
+    if (item.time < domain.start || item.time > domain.end) return;
+    const px = x(item.time); ctx.fillStyle = color("--warn", "#d7aa55"); ctx.beginPath(); ctx.arc(px, plot.top + 7, 2.5, 0, Math.PI * 2); ctx.fill();
+  });
+  context.jobs.forEach((job, index) => {
+    if (job.start > domain.end || (job.end || job.start) < domain.start) return;
+    const left = x(Math.max(domain.start, job.start)); const right = x(Math.min(domain.end, job.end || job.start));
+    ctx.fillStyle = "rgba(215, 170, 85, .12)"; ctx.fillRect(left, plot.top, Math.max(2, right - left), plot.bottom - plot.top);
+    if (index < 8) { ctx.fillStyle = color("--warn", "#d7aa55"); ctx.fillText(job.kind, Math.min(left + 3, plot.right - 55), plot.top + 12); }
+  });
+  const alignedComparison = recorderComparisonSamples(comparisonMode, comparison, domain);
+  canvas.dataset.comparisonAlignment = comparisonMode === "restart" ? "wall-clock"
+    : comparisonMode === "yesterday" ? "plus-24h" : comparisonMode === "previous" ? "relative" : "none";
+  canvas.dataset.comparisonStart = alignedComparison.length ? String(alignedComparison[0].time) : "";
+  if (alignedComparison.length) {
+    drawRecorderLine(ctx, alignedComparison.map((item) => ({ time: item.time, value: item.tps, state: item.state })),
+      x, yTps, "rgba(159, 176, 184, .8)", { width: 1, dash: [4, 4] });
+  }
+  if (comparisonMode === "preset") {
+    const metric = comparison?.metrics?.mspt_p95;
+    const safe = (value) => value === null || value === undefined || value === "" ? null : Number(value);
+    const baseline = safe(metric?.baseline); const candidate = safe(metric?.candidate);
+    if (Number.isFinite(baseline) && Number.isFinite(candidate) && baseline >= 0 && candidate >= 0) {
+      [[baseline, "rgba(159, 176, 184, .82)", [4, 4]], [candidate, color("--accent", "#59d991"), [2, 3]]].forEach(([value, stroke, dash]) => {
+        const py = yMspt(value); ctx.beginPath(); ctx.strokeStyle = stroke; ctx.lineWidth = 1; ctx.setLineDash(dash);
+        ctx.moveTo(plot.left, py); ctx.lineTo(plot.right, py); ctx.stroke(); ctx.setLineDash([]);
+      });
+    }
+  }
+  const fmt = (time) => new Date(time).toLocaleString([], { month: "short", day: "numeric", hour: "2-digit", minute: "2-digit" });
+  ctx.fillStyle = color("--muted", "#8d9a9f"); ctx.fillText(fmt(domain.start), plot.left, height - 9);
+  const endText = fmt(domain.end); ctx.fillText(endText, plot.right - ctx.measureText(endText).width, height - 9);
+  queueClientPerformance("recorder_draw", (window.performance?.now?.() || drawStarted) - drawStarted);
+}
+
+function renderRecorderTable(result, samples) {
+  const body = byId("stats-recorder-table");
+  body.replaceChildren();
+  const context = recorderContext(result);
+  const causes = [...context.jobs.map((job) => ({ time: job.start, label: job.kind })),
+    ...context.series.gc_pause.map((item) => ({ time: item.time, label: "GC pause" }))];
+  samples.slice(-120).forEach((sample) => {
+    const row = document.createElement("tr");
+    const nearby = [...new Set(causes.filter((item) => Math.abs(item.time - sample.time) <= 60_000)
+      .map((item) => item.label))];
+    const cause = nearby.length ? nearby.join(", ") : "—";
+    [new Date(sample.time).toLocaleString(), sample.state, sample.tps == null ? "—" : sample.tps.toFixed(2), sample.mspt == null ? "—" : `${sample.mspt.toFixed(2)} ms`, cause].forEach((value) => {
+      const cell = document.createElement("td"); cell.textContent = value; row.append(cell);
+    });
+    body.append(row);
+  });
+  if (!body.children.length) { const row = document.createElement("tr"); const cell = document.createElement("td"); cell.colSpan = 5; cell.className = "empty-state"; cell.textContent = "No telemetry in this window."; row.append(cell); body.append(row); }
+}
+
+function renderComparisonOptions(result) {
+  const select = byId("stats-comparison");
+  if (!select) return;
+  const comparisons = result?.comparisons && typeof result.comparisons === "object" ? result.comparisons : {};
+  const definitions = {
+    yesterday: ["Yesterday vs today", "Yesterday unavailable", (item) => Array.isArray(item?.samples) && recorderSamples({ samples: item.samples }).length > 0],
+    restart: ["Before vs after restart", "Restart comparison unavailable", (item) => Array.isArray(item?.samples) && recorderSamples({ samples: item.samples }).length > 0],
+    preset: ["Preset vs preset", "Preset comparison unavailable", (item) => {
+      const metric = item?.metrics?.mspt_p95; const baseline = metric?.baseline; const candidate = metric?.candidate;
+      return typeof baseline === "number" && Number.isFinite(baseline) && baseline >= 0 && typeof candidate === "number" && Number.isFinite(candidate) && candidate >= 0;
+    }],
+    previous: ["Previous active run", "Previous run unavailable", (item) => Array.isArray(item?.samples) && recorderSamples({ samples: item.samples }).length > 0],
+  };
+  Object.entries(definitions).forEach(([key, [availableLabel, unavailableLabel, validate]]) => {
+    const option = select.querySelector(`option[value="${key}"]`); if (!option) return;
+    const available = validate(comparisons[key]); option.disabled = !available;
+    option.textContent = available ? availableLabel : unavailableLabel;
+  });
+  if (select.value !== "none" && select.selectedOptions[0]?.disabled) select.value = "none";
+  const selected = comparisons[select.value];
+  const note = byId("stats-comparison-note");
+  if (!note) return;
+  if (select.value === "preset" && selected) {
+    const safePreset = (value) => typeof value === "string" && /^[a-z0-9_-]{1,32}$/.test(value) ? value : "preset";
+    const metric = selected.metrics.mspt_p95;
+    note.textContent = `${safePreset(selected.baseline_preset)} ${metric.baseline.toFixed(2)} ms p95 · ${safePreset(selected.candidate_preset)} ${metric.candidate.toFixed(2)} ms p95`;
+  } else if (select.value !== "none" && selected) {
+    note.textContent = typeof selected.label === "string" && selected.label.length <= 64 ? selected.label : "Comparison loaded.";
+  } else note.textContent = "No comparison selected.";
+}
+
+function renderStatsTpsUnavailable(message, { preserve = false } = {}) {
+  const block = byId("stats-tps-title")?.closest(".stats-tps-block");
+  if (block) { block.dataset.signal = "stale"; block.setAttribute("aria-busy", "false"); }
+  byId("stats-live-state").textContent = "Stale";
+  byId("stats-tps-note").textContent = message;
+  if (!preserve) {
+    byId("stats-tps-current").textContent = "—"; byId("stats-mspt-current").textContent = "—";
+    byId("stats-runtime-current").textContent = "—"; renderRecorderTable({}, []); drawFlightRecorder({}, []);
+  }
 }
 
 function renderStatsUnavailable(message) {
@@ -1159,122 +1791,88 @@ function renderStatsUnavailable(message) {
   byId("stats-leaderboard").closest(".stats-block").hidden = false;
   byId("stats-heatmap").closest(".stats-block").hidden = false;
   byId("stats-occupancy-block").hidden = true;
-  renderStatsSummary({});
-  renderStatsLeaderboard([]);
-  renderStatsHeatmap({ buckets: [] });
-  renderStatsTpsUnavailable(message);
+  if (!state.statsCache.get(state.detail.id)?.base) {
+    renderStatsSummary({}); renderStatsLeaderboard([]); renderStatsHeatmap({ buckets: [] });
+  }
+  renderStatsTpsUnavailable(message, { preserve: Boolean(state.statsCache.get(state.detail.id)?.tps) });
 }
 
 function renderStatsTps(result) {
-  const note = byId("stats-tps-note");
-  const samples = (Array.isArray(result?.samples) ? result.samples : [])
-    .map((sample) => ({ ...sample, time: Date.parse(sample.ts || sample.timestamp), tps: Number(sample.tps), mspt: Number(sample.mspt) }))
-    .filter((sample) => Number.isFinite(sample.time) && Number.isFinite(sample.tps) && Number.isFinite(sample.mspt))
-    .sort((a, b) => a.time - b.time);
-  const latest = samples.at(-1);
-  const hours = STATS_WINDOWS[byId("stats-window").value] || 24;
-  const domainEnd = Date.now();
-  const domainStart = domainEnd - hours * 60 * 60 * 1000;
-  const visible = samples.filter((sample) => sample.time >= domainStart && sample.time <= domainEnd);
-  const latestApi = result?.latest_ts ? Date.parse(result.latest_ts) : NaN;
-  const stale = result?.stale === true || result?.state === "unknown" || (latest && domainEnd - latest.time > 120000);
-  const firstText = samples[0] ? new Date(samples[0].time).toLocaleString() : "—";
-  const lastText = latest ? new Date(latest.time).toLocaleString() : "—";
-  const clusters = visible.reduce((count, sample, index) => count + (index === 0 || sample.time - visible[index - 1].time > 120000 ? 1 : 0), 0);
-  byId("stats-tps-current").textContent = latest ? `${stale ? "LAST OBSERVED " : "CURRENT "}${Math.min(20, latest.tps).toFixed(2)} TPS` : "—";
-  byId("stats-mspt-current").textContent = latest ? `${latest.mspt.toFixed(2)} ms/tick` : "—";
-  note.textContent = !latest ? "" : stale
-    ? `Observed ${new Date(Number.isFinite(latestApi) ? latestApi : latest.time).toLocaleString()} · current tick telemetry is unknown.`
-    : `${samples.length} returned samples · first ${firstText} · last ${lastText} · ${clusters} observed clusters`;
-  byId("stats-tps-status").textContent = visible.length ? "" : "No tick samples in this wall-clock range.";
-  const svg = byId("stats-tps-chart");
-  const group = svg?.querySelector(".tps-chart-lines");
-  const areas = svg?.querySelector(".tps-chart-areas");
-  const points = svg?.querySelector(".tps-chart-points");
-  if (!svg || !group) return;
-  group.replaceChildren();
-  areas?.replaceChildren();
-  points?.replaceChildren();
-  svg.querySelector(".chart-ymax").textContent = "20";
-  svg.querySelector(".chart-ymid").textContent = "10";
-  const fmt = (time) => new Date(time).toLocaleString([], hours >= 24
-    ? { weekday: "short", hour: "numeric", minute: "2-digit" }
-    : { hour: "numeric", minute: "2-digit" });
-  svg.querySelector(".chart-x0").textContent = fmt(domainStart);
-  svg.querySelector(".chart-x1").textContent = fmt(domainEnd);
-  if (!samples.length) return;
-  const gapLimit = 120000;
-  const segments = [];
-  let segment = [];
-  visible.forEach((sample, index) => {
-    if (index && sample.time - visible[index - 1].time > gapLimit) { if (segment.length) segments.push(segment); segment = []; }
-    segment.push(sample);
-  });
-  if (segment.length) segments.push(segment);
-  const x = (time) => 48 + Math.min(1, Math.max(0, (time - domainStart) / Math.max(1, domainEnd - domainStart))) * 456;
-  const y = (value) => 144 - Math.min(20, Math.max(0, value)) / 20 * 128;
-  segments.forEach((items) => {
-    const coords = items.map((sample) => `${x(sample.time).toFixed(1)},${y(sample.tps).toFixed(1)}`);
-    if (items.length > 1) {
-      const line = document.createElementNS("http://www.w3.org/2000/svg", "polyline");
-      line.classList.add("chart-line");
-      line.setAttribute("points", coords.join(" "));
-      group.append(line);
-    }
-    if (points && items.length === 1) {
-      const point = document.createElementNS("http://www.w3.org/2000/svg", "circle");
-      point.classList.add("chart-point");
-      point.setAttribute("cx", x(items[0].time).toFixed(1));
-      point.setAttribute("cy", y(items[0].tps).toFixed(1));
-      point.setAttribute("r", "3");
-      points.append(point);
-    }
-  });
+  const samples = recorderSamples(result); const latest = recorderLatestObservation(result, samples);
+  const signal = recorderSignal(result, samples); const block = byId("stats-tps-title")?.closest(".stats-tps-block");
+  if (block) { block.dataset.signal = signal; block.setAttribute("aria-busy", "false"); }
+  byId("stats-live-state").textContent = signal === "live" ? "Live" : signal === "offline" ? "Server stopped" : "Stale";
+  byId("stats-tps-current").textContent = latest?.tps != null ? `${latest.tps.toFixed(2)} TPS` : "—";
+  byId("stats-mspt-current").textContent = latest?.mspt != null ? `${latest.mspt.toFixed(2)} ms/tick` : "—";
+  const basis = result?.time_basis || {}; const active = Number(basis.active_runtime_seconds); const wall = Number(basis.wall_clock_seconds);
+  byId("stats-runtime-current").textContent = Number.isFinite(active) && Number.isFinite(wall) ? `${Math.round(active / 60)}m / ${Math.round(wall / 3600)}h` : "—";
+  const effective = result?.resolution || "raw"; byId("stats-effective-resolution").textContent = `${effective} · ${samples.length}/${result?.limit || 720}`;
+  const observedAt = latest?.time ? new Date(latest.time).toLocaleString() : null;
+  byId("stats-tps-note").textContent = signal === "offline" ? (observedAt
+    ? `The server is stopped. Last tick observation: ${observedAt}. Offline time is shaded, not plotted as zero.`
+    : "The server is stopped. Offline time is shaded, not plotted as zero.")
+    : signal === "stale" ? (observedAt
+      ? `No tick samples fall inside this window. Last observation: ${observedAt}.`
+      : "The latest tick sample is stale. No last observation is available.")
+      : "Current tick signal is fresh. Markers show nearby resource and maintenance activity.";
+  renderComparisonOptions(result); drawFlightRecorder(result, samples); renderRecorderTable(result, samples);
 }
 
-async function loadStats(id) {
-  if (!id || state.detail.tab !== "stats") return;
+async function loadStats(id, { includeBase = true } = {}) {
+  if (!pageVisible() || !id || state.detail.tab !== "stats") return;
   const request = ++state.detail.statsRequest;
+  const fetchStarted = window.performance?.now?.() || 0;
+  state.detail.statsAbort?.abort();
+  const controller = new AbortController(); state.detail.statsAbort = controller;
   if (!STATS_PROFILES.has(id)) { renderStatsUnavailable("Player stats not available for this game."); return; }
   const base = `/api/v1/profiles/${encodeURIComponent(id)}/stats`;
-  renderStatsHeader(id);
-  const tpsBlock = byId("stats-tps-title").closest(".stats-tps-block");
-  tpsBlock.hidden = !TICK_PROFILES.has(id);
-  const jobs = [
-    api(`${base}/summary?days=90`).then((summary) => {
-      if (request === state.detail.statsRequest) {
-        renderStatsSummary(summary);
-        renderStatsLeaderboard(summary.leaderboard);
-        byId("stats-summary-status").textContent = "";
-      }
-    }).catch(() => { if (request === state.detail.statsRequest) byId("stats-summary-status").textContent = "Player summary could not be loaded."; }),
-    api(`${base}/heatmap?days=90`).then((heatmap) => {
-      if (request === state.detail.statsRequest) {
-        renderStatsHeatmap(heatmap);
-        byId("stats-heatmap-status").textContent = "";
-      }
-    }).catch(() => { if (request === state.detail.statsRequest) byId("stats-heatmap-status").textContent = "Player-hours by time of week could not be loaded."; }),
-  ];
-  if (TICK_PROFILES.has(id)) jobs.push(loadStatsTps(id));
-  await Promise.allSettled(jobs);
-}
-
-async function loadStatsTps(id) {
-  if (!id || state.detail.tab !== "stats" || !TICK_PROFILES.has(id)) return;
-  const request = ++state.detail.statsTpsRequest;
-  const selected = byId("stats-window")?.value || "24h";
+  const windowKey = byId("stats-window")?.value || "24h";
+  const resolution = byId("stats-resolution")?.value || "auto";
   try {
-    const tps = await api(`/api/v1/profiles/${encodeURIComponent(id)}/stats/tps?window=${encodeURIComponent(selected)}`);
-    if (request === state.detail.statsTpsRequest && state.detail.id === id && state.detail.tab === "stats") renderStatsTps(tps);
-  } catch {
-    if (request === state.detail.statsTpsRequest && state.detail.id === id && state.detail.tab === "stats") renderStatsTpsUnavailable("Tick evidence could not be loaded.");
+    const hours = STATS_WINDOWS[windowKey] || 24;
+    const requests = [];
+    if (includeBase || !state.detail.statsBaseLoaded) {
+      requests.push(api(`${base}/summary?hours=${hours}`, { signal: controller.signal }), api(`${base}/heatmap?hours=${hours}`, { signal: controller.signal }));
+    }
+    if (TICK_PROFILES.has(id)) requests.push(api(`${base}/tps?window=${encodeURIComponent(windowKey)}&resolution=${encodeURIComponent(resolution)}&limit=720`, { signal: controller.signal }));
+    const results = await Promise.all(requests);
+    if (request !== state.detail.statsRequest || state.detail.id !== id) return;
+    let offset = 0;
+    if (includeBase || !state.detail.statsBaseLoaded) {
+      const [summary, heatmap] = results;
+      state.detail.statsBaseLoaded = true;
+      renderStatsSummary(summary); renderStatsLeaderboard(summary.leaderboard); renderStatsHeatmap(heatmap);
+      const cached = state.statsCache.get(id) || {}; cached.base = { summary, heatmap }; state.statsCache.set(id, cached);
+      offset = 2;
+    }
+    const tpsBlock = byId("stats-tps-title").closest(".stats-tps-block");
+    tpsBlock.hidden = !TICK_PROFILES.has(id);
+    if (TICK_PROFILES.has(id)) {
+      const cached = state.statsCache.get(id) || {}; cached.tps = results[offset]; state.statsCache.set(id, cached);
+      renderStatsTps(results[offset]);
+    }
+    queueClientPerformance("stats_fetch", (window.performance?.now?.() || fetchStarted) - fetchStarted);
+  } catch (error) {
+    if (controller.signal.aborted || error?.name === "AbortError") return;
+    if (request !== state.detail.statsRequest) return;
+    renderStatsUnavailable(error.message || "Stats unavailable.");
+    notify(error.message || "Stats unavailable.");
+  } finally {
+    if (state.detail.statsAbort === controller) state.detail.statsAbort = null;
   }
 }
 
 function startStatsRefresh(id) {
   clearStatsTimer();
-  loadStats(id);
-  state.detail.statsTimer = window.setInterval(() => loadStats(id), 60000);
+  const cached = state.statsCache.get(id);
+  state.detail.statsBaseLoaded = Boolean(cached?.base);
+  if (cached?.base) { renderStatsSummary(cached.base.summary); renderStatsLeaderboard(cached.base.summary?.leaderboard); renderStatsHeatmap(cached.base.heatmap); }
+  if (cached?.tps) renderStatsTps(cached.tps);
+  loadStats(id, { includeBase: true });
+  // Recurring timer: live recorder refresh only; callback is visibility-gated.
+  state.detail.statsTimer = window.setInterval(() => {
+    if (pageVisible()) loadStats(id, { includeBase: false });
+  }, 4000);
 }
 
 function clearBenchmarkTimer() {
@@ -1339,7 +1937,9 @@ function renderBenchmarks(id, overview) {
   else if (candidate.options.length > 1) candidate.selectedIndex = 1;
 
   const runs = Array.isArray(overview.runs) ? overview.runs : [];
-  const latest = runs.find((run) => run.state === "succeeded");
+  state.detail.benchmarkRuns = state.detail.benchmarkCursor ? state.detail.benchmarkRuns.concat(runs) : runs;
+  const allRuns = state.detail.benchmarkRuns;
+  const latest = allRuns.find((run) => run.state === "succeeded");
   const verdict = byId("benchmark-verdict");
   verdict.dataset.verdict = latest?.overall_verdict || (overview.available ? "inconclusive" : "unavailable");
   verdict.textContent = latest?.overall_verdict || (overview.available ? "No verdict" : "Unavailable");
@@ -1347,10 +1947,15 @@ function renderBenchmarks(id, overview) {
     ? `${latest.baseline_preset} → ${latest.candidate_preset} · ${new Date(latest.finished_at || latest.created_at).toLocaleString()}`
     : "No completed comparison.";
   const diagnostics = latest?.candidate_diagnostics;
-  byId("benchmark-bottleneck").textContent = diagnostics?.dominant_bottleneck || "—";
-  byId("benchmark-leak").textContent = diagnostics?.leak_suspected == null ? "—" : diagnostics.leak_suspected ? "Suspected" : "Not detected";
-  byId("benchmark-load").textContent = diagnostics?.load_reached_target == null ? "—" : diagnostics.load_reached_target ? `Reached · ${Number(diagnostics.peak_connected_clients_median || 0).toFixed(0)} clients` : "Not reached";
-  byId("benchmark-duration").textContent = Number.isFinite(Number(diagnostics?.process_duration_seconds_median)) ? `${Number(diagnostics.process_duration_seconds_median).toFixed(1)} s` : "—";
+  const baselineDiagnostics = latest?.baseline_diagnostics;
+  const setDiagnostics = (prefix, value) => {
+    byId(`benchmark-${prefix}-bottleneck`).textContent = value?.dominant_bottleneck || "—";
+    byId(`benchmark-${prefix}-leak`).textContent = value?.leak_suspected == null ? "—" : value.leak_suspected ? "Suspected" : "Not detected";
+    byId(`benchmark-${prefix}-load`).textContent = value?.load_reached_target == null ? "—" : value.load_reached_target ? `Reached · ${Number(value.peak_connected_clients_median || 0).toFixed(0)} clients` : "Not reached";
+    byId(`benchmark-${prefix}-duration`).textContent = Number.isFinite(Number(value?.process_duration_seconds_median)) ? `${Number(value.process_duration_seconds_median).toFixed(1)} s` : "—";
+  };
+  setDiagnostics("baseline", baselineDiagnostics);
+  setDiagnostics("candidate", diagnostics);
   const metrics = byId("benchmark-metrics"); metrics.replaceChildren();
   (latest?.metrics || []).forEach((metric) => {
     const row = document.createElement("tr");
@@ -1365,7 +1970,7 @@ function renderBenchmarks(id, overview) {
     const row = document.createElement("tr"); const empty = document.createElement("td"); empty.className = "empty-state"; empty.colSpan = 5; empty.textContent = "No benchmark metrics recorded."; row.append(empty); metrics.append(row);
   }
   const history = byId("benchmark-history"); history.replaceChildren();
-  runs.forEach((run) => {
+  allRuns.forEach((run) => {
     const row = document.createElement("li");
     const label = document.createElement("strong"); label.textContent = `${run.baseline_preset} → ${run.candidate_preset}`;
     const stateNode = document.createElement("span"); stateNode.textContent = run.overall_verdict || run.state;
@@ -1373,18 +1978,42 @@ function renderBenchmarks(id, overview) {
     row.append(label, stateNode, time); history.append(row);
   });
   if (!history.children.length) { const empty = document.createElement("li"); empty.className = "empty-state"; empty.textContent = "No benchmark runs recorded."; history.append(empty); }
+  const more = byId("benchmark-load-more");
+  more.hidden = !overview.next_cursor;
+  more.dataset.cursor = overview.next_cursor || "";
+  state.detail.benchmarkCursor = overview.next_cursor || null;
+  const warning = byId("benchmark-corrupt-warning");
+  warning.hidden = !(overview.corrupt_runs > 0);
+  warning.textContent = overview.corrupt_runs > 0 ? `${overview.corrupt_runs} historical run(s) could not be decoded and were omitted.` : "";
+  byId("benchmark-history-meta").textContent = `${allRuns.length} loaded · trends ${Array.isArray(overview.trends) ? overview.trends.length : 0}`;
+  const trend = byId("benchmark-trend"); trend.replaceChildren();
+  (Array.isArray(overview.trends) ? overview.trends : []).slice().reverse().forEach((point) => {
+    const group = document.createElement("div"); group.className = "benchmark-trend-run";
+    group.setAttribute("aria-label", `${point.verdict || "inconclusive"} run ${new Date(point.finished_at || 0).toLocaleString()}`);
+    (point.metrics || []).slice(0, 4).forEach((metric) => {
+      const item = document.createElement("span"); item.className = "benchmark-trend-point";
+      item.dataset.verdict = metric.verdict || point.verdict || "inconclusive";
+      item.textContent = `${metric.name}: ${benchmarkValue(metric.name, metric.candidate_median)} (${benchmarkDelta(metric)})`;
+      item.title = `${metric.name}: baseline ${benchmarkValue(metric.name, metric.baseline_median)} · candidate ${benchmarkValue(metric.name, metric.candidate_median)} · ${metric.verdict}`;
+      item.setAttribute("aria-label", item.title); group.append(item);
+    });
+    if (group.children.length) trend.append(group);
+  });
   validateBenchmarkForm();
 }
 
-async function loadBenchmarks(id) {
-  if (!id || state.detail.tab !== "benchmarks") return;
+async function loadBenchmarks(id, append = false) {
+  if (!pageVisible() || !id || state.detail.tab !== "benchmarks") return;
   clearBenchmarkTimer();
+  if (!append) { state.detail.benchmarkCursor = null; state.detail.benchmarkRuns = []; }
   try {
-    const overview = await api(`/api/v1/profiles/${encodeURIComponent(id)}/benchmarks`);
+    const cursor = state.detail.benchmarkCursor ? `?cursor=${encodeURIComponent(state.detail.benchmarkCursor)}&limit=20` : "";
+    const overview = await api(`/api/v1/profiles/${encodeURIComponent(id)}/benchmarks${cursor}`);
     if (state.detail.id !== id || state.detail.tab !== "benchmarks") return;
     renderBenchmarks(id, overview);
     if ((overview.runs || []).some((run) => run.state === "running")) {
-      state.detail.benchmarkTimer = window.setTimeout(() => loadBenchmarks(id), 5000);
+      // One-shot continuation of a running benchmark; visibility-gated and resumed on return.
+      state.detail.benchmarkTimer = window.setTimeout(() => { if (pageVisible()) loadBenchmarks(id, false); }, 5000);
     }
   } catch (error) {
     byId("benchmark-status").textContent = error.message || "Benchmark evidence is unavailable.";
@@ -1405,7 +2034,7 @@ async function runBenchmark(event) {
     });
     byId("benchmark-status").textContent = `Benchmark ${result.job_id || "job"} accepted. Production starts remain blocked until it finishes.`;
     notify(`SwagBench comparison accepted for ${profileLabel(id)}.`);
-    state.detail.benchmarkTimer = window.setTimeout(() => loadBenchmarks(id), 1500);
+    state.detail.benchmarkTimer = window.setTimeout(() => { if (pageVisible()) loadBenchmarks(id, false); }, 1500);
   } catch (error) {
     byId("benchmark-status").textContent = error.message || "Benchmark request failed.";
     validateBenchmarkForm();
@@ -1434,6 +2063,9 @@ function commandCatalog(id) {
 
 function renderCommandCatalog(id) {
   const commands = commandCatalog(id);
+  const key = `${id}:${JSON.stringify(commands)}`;
+  if (state.detail.commandCatalogKey === key) return;
+  state.detail.commandCatalogKey = key;
   const datalist = byId("command-suggestions");
   const catalog = byId("command-catalog");
   datalist.replaceChildren();
@@ -1467,6 +2099,7 @@ function setDetailTab(tab) {
   clearStatsTimer();
   clearBenchmarkTimer();
   state.detail.tab = next;
+  if (next !== "stats") state.detail.statsBaseLoaded = false;
   document.querySelectorAll("[data-detail-tab]").forEach((button) => {
     const selected = button.dataset.detailTab === next;
     button.setAttribute("aria-selected", String(selected));
@@ -1510,7 +2143,6 @@ function patchDetail(id) {
   const operationSet = new Set(profile.operations || []);
   byId("tab-benchmarks").hidden = !operationSet.has("benchmark");
   if (state.detail.tab === "benchmarks") validateBenchmarkForm();
-  if (state.detail.tab === "stats") renderStatsHeader(id);
   const running = current === "running";
   const transitional = ["starting", "stopping"].includes(current);
   byId("detail-start").hidden = running || transitional;
@@ -1560,19 +2192,23 @@ function patchDetail(id) {
     .filter((line) => item?.hideNoise === false || !isNoise(line));
   const hidden = (item?.lines || []).filter((line) => !item?.clearedAt || Date.parse(line.timestamp || 0) > item.clearedAt).filter(isNoise).length;
   const consoleOutput = byId("console-output");
+  const consoleKey = `${item?.hideNoise !== false}:${item?.clearedAt || ""}:${lines.slice(-200).map((line) => `${line.timestamp}|${line.severity}|${line.message}`).join("\u0001")}`;
   if (consoleOutput && !consoleOutput.matches(":focus-within") && !item?.loading) {
-    consoleOutput.replaceChildren();
-    lines.slice(-200).forEach((line) => {
-      const row = document.createElement("div");
-      row.className = `console-line severity-${line.severity || "info"}`;
-      const time = document.createElement("time");
-      time.textContent = line.timestamp ? new Date(line.timestamp).toLocaleTimeString() : "—";
-      const message = document.createElement("span");
-      message.textContent = line.message || "";
-      row.append(time, message);
-      consoleOutput.append(row);
-    });
-    if (!item || item.autoScroll !== false) consoleOutput.scrollTop = consoleOutput.scrollHeight;
+    if (item?.consoleKey !== consoleKey) {
+      consoleOutput.replaceChildren();
+      lines.slice(-200).forEach((line) => {
+        const row = document.createElement("div");
+        row.className = `console-line severity-${line.severity || "info"}`;
+        const time = document.createElement("time");
+        time.textContent = line.timestamp ? new Date(line.timestamp).toLocaleTimeString() : "—";
+        const message = document.createElement("span");
+        message.textContent = line.message || "";
+        row.append(time, message);
+        consoleOutput.append(row);
+      });
+      if (item) item.consoleKey = consoleKey;
+      if (!item || item.autoScroll !== false) consoleOutput.scrollTop = consoleOutput.scrollHeight;
+    }
     byId("console-jump").hidden = !item || item.autoScroll !== false;
   }
   const noiseToggle = byId("console-noise-toggle");
@@ -1666,25 +2302,24 @@ function scheduleDateLabel(value, compact = false) {
     const weekday = date.toLocaleDateString(undefined, { weekday: "short" });
     const hours = String(date.getHours()).padStart(2, "0");
     const minutes = String(date.getMinutes()).padStart(2, "0");
-    return `${weekday} ${hours}:${minutes} local`;
+    return `${weekday} ${hours}:${minutes}`;
   }
-  return date.toLocaleDateString(undefined, { weekday: "short", month: "short", day: "numeric", year: "numeric" });
+  return date.toLocaleString(undefined, { weekday: "short", month: "short", day: "numeric", hour: "numeric", minute: "2-digit" });
 }
 
 function renderAutomationSummary(items) {
-  const text = byId("automation-summary-text");
+  const text = byId("session-automation");
   if (!text) return;
-  if (!Array.isArray(items)) { text.textContent = "Schedules unavailable"; return; }
+  if (!Array.isArray(items)) { text.textContent = "Unavailable"; return; }
   const soonest = items
     .filter((item) => item?.enabled !== false && item.next_fire && !Number.isNaN(new Date(item.next_fire).getTime()))
     .sort((left, right) => new Date(left.next_fire) - new Date(right.next_fire))[0];
-  text.textContent = soonest
-    ? `Next: ${profileLabel(soonest.profile)} ${scheduleDateLabel(soonest.next_fire, true)}`
-    : "No scheduled switches";
+  text.textContent = soonest ? `${profileLabel(soonest.profile)} · ${scheduleDateLabel(soonest.next_fire, true)}` : "None scheduled";
 }
 
 function renderScheduleRows(items) {
   const list = byId("schedule-list");
+  if (!list) return;
   list.replaceChildren();
   if (!items.length) {
     const empty = document.createElement("p"); empty.className = "empty-state"; empty.textContent = "No scheduled switches."; list.append(empty); return;
@@ -1708,11 +2343,12 @@ function renderScheduleRows(items) {
 }
 
 async function renderSchedules() {
+  if (!byId("schedule-list")) return;
   renderScheduleProfiles();
   try {
     state.detail.schedules = await loadSchedules();
     renderScheduleRows(state.detail.schedules);
-    byId("schedule-status").textContent = "Schedules are active without a slotd restart.";
+    byId("schedule-status").textContent = "Schedule changes apply without restarting Horizon.";
   } catch (error) {
     byId("schedule-list").replaceChildren();
     const message = document.createElement("p"); message.className = "empty-state"; message.textContent = error.message || "Schedules unavailable."; byId("schedule-list").append(message);
@@ -1743,7 +2379,7 @@ async function addSchedule(event) {
   const cron = byId("schedule-cron").value.trim();
   const profile = byId("schedule-profile").value;
   if (!cron || !profile) return;
-  const entries = [...(state.detail.schedules || []).map(({ cron: value, profile: id, enabled }) => ({ cron: value, profile: id, enabled: enabled !== false })), { cron, profile, enabled: true }];
+  const entries = [...(state.detail.schedules || []).map(({ cron: value, profile: id, enabled, backup_destination }) => ({ cron: value, profile: id, enabled: enabled !== false, ...(backup_destination ? { backup_destination } : {}) })), { cron, profile, enabled: true }];
   try {
     const changed = await replaceSchedules(entries, `Add schedule ${cron} for ${profileLabel(profile)}?`);
     if (changed) {
@@ -1754,7 +2390,7 @@ async function addSchedule(event) {
 }
 
 async function removeSchedule(index, item) {
-  const entries = (state.detail.schedules || []).filter((_, candidate) => candidate !== index).map(({ cron, profile, enabled }) => ({ cron, profile, enabled: enabled !== false }));
+  const entries = (state.detail.schedules || []).filter((_, candidate) => candidate !== index).map(({ cron, profile, enabled, backup_destination }) => ({ cron, profile, enabled: enabled !== false, ...(backup_destination ? { backup_destination } : {}) }));
   const nextFocusIndex = Math.min(index, entries.length - 1);
   try {
     const changed = await replaceSchedules(entries, `Remove schedule ${item.cron} for ${profileLabel(item.profile)}?`);
@@ -1762,14 +2398,12 @@ async function removeSchedule(index, item) {
       const next = nextFocusIndex >= 0 ? byId("schedule-list").querySelectorAll("[data-schedule-remove]")[nextFocusIndex] : null;
       (next || byId("schedule-cron")).focus();
     }
-  }
-  catch (error) { byId("schedule-status").textContent = error.message || "Schedule update failed."; }
+  } catch (error) { byId("schedule-status").textContent = error.message || "Schedule update failed."; }
 }
 
 async function toggleSchedule(index, item, control) {
-  const enabled = item.enabled !== false;
-  const nextEnabled = !enabled;
-  const entries = (state.detail.schedules || []).map(({ cron, profile, enabled: current }) => ({ cron, profile, enabled: current !== false }));
+  const nextEnabled = item.enabled === false;
+  const entries = (state.detail.schedules || []).map(({ cron, profile, enabled, backup_destination }) => ({ cron, profile, enabled: enabled !== false, ...(backup_destination ? { backup_destination } : {}) }));
   entries[index].enabled = nextEnabled;
   try {
     const changed = await replaceSchedules(entries, `${nextEnabled ? "Enable" : "Disable"} schedule ${item.cron} for ${profileLabel(item.profile)}?`);
@@ -1826,16 +2460,27 @@ async function saveIdleStop(event) {
 }
 
 async function loadDetailLogs(id) {
-  if (!id) return;
-  const item = state.logs.get(id) || { query: "", severity: "all", paused: false, lines: [], autoScroll: true, clearedAt: null, hideNoise: true };
+  if (!pageVisible() || !id) return;
+  const item = state.logs.get(id) || { query: "", severity: "all", paused: false, lines: [], autoScroll: true, clearedAt: null, hideNoise: true, nextCursor: null };
+  if (item.loading) return;
   item.loading = true;
   state.logs.set(id, item);
   byId("detail-log-query").value = item.query;
   byId("detail-log-severity").value = item.severity;
   byId("detail-log-pause").textContent = item.paused ? "Resume live logs" : "Pause live logs";
   try {
-    const page = await api(`/api/v1/profiles/${encodeURIComponent(id)}/logs?limit=200&severity=all`);
-    if (!item.paused && Array.isArray(page.items)) item.lines = page.items;
+    const params = new URLSearchParams({ limit: "200", severity: "all" });
+    if (item.nextCursor) params.set("cursor", item.nextCursor);
+    else if (item.lines.length) params.set("since", item.lines.at(-1)?.timestamp || new Date().toISOString());
+    const page = await api(`/api/v1/profiles/${encodeURIComponent(id)}/logs?${params}`);
+    if (!item.paused && Array.isArray(page.items)) {
+      if (item.nextCursor || item.lines.length) {
+        const existing = new Set(item.lines.map(detailLogKey));
+        item.lines.push(...page.items.filter((line) => !existing.has(detailLogKey(line))));
+      } else item.lines = page.items;
+      item.lines = item.lines.slice(-DETAIL_LOG_BUFFER_LIMIT);
+      item.nextCursor = page.next_cursor || null;
+    }
   } catch (error) { notify(error.message || "Logs unavailable."); }
   item.loading = false;
   renderDetailLogs(item);
@@ -1932,9 +2577,11 @@ async function checkForUpdate(id) {
       notify(`No update available for ${profileLabel(id)}.`);
       return;
     }
-    const prepared = await api(`/api/v1/profiles/${encodeURIComponent(id)}/update/prepare`, { method: "POST", body: "{}" });
-    await api("/api/v1/update/confirm", { method: "POST", body: JSON.stringify({ confirmation_id: prepared.confirmation_id }) });
-    notify(`Update requested for ${profileLabel(id)}.`);
+    state.updateProfile = id;
+    byId("update-profile").textContent = profileLabel(id);
+    byId("update-installed").textContent = formatVersion(status.installed_version);
+    byId("update-available").textContent = formatVersion(status.available_version);
+    setupDialog(byId("update-dialog"), byId("check-update"));
   } catch (error) { notify(error.message || "Update check failed."); }
 }
 
@@ -1944,15 +2591,41 @@ function renderDetailLogs(item) {
   const hidden = matching.filter(isNoise).length;
   const lines = matching.filter((line) => item.hideNoise === false || !isNoise(line));
   const list = byId("detail-log-list");
-  list.replaceChildren();
-  lines.forEach((line) => {
-    const row = document.createElement("li"); row.className = `log-line severity-${line.severity}`;
-    const time = document.createElement("time"); time.textContent = line.timestamp ? new Date(line.timestamp).toLocaleTimeString() : "—";
-    const severity = document.createElement("span"); severity.className = "log-severity"; severity.textContent = line.severity;
-    const message = document.createElement("span"); message.textContent = line.message || "";
-    row.append(time, severity, message); list.append(row);
+  const rows = item.detailLogRows || new Map();
+  const retainedKeys = new Set(item.lines.map(detailLogKey));
+  rows.forEach((row, key) => {
+    if (!retainedKeys.has(key)) { row.remove(); rows.delete(key); }
   });
-  if (!lines.length) { const empty = document.createElement("li"); empty.className = "empty-state"; empty.textContent = "No matching log lines."; list.append(empty); }
+  const desired = [];
+  const desiredKeys = new Set();
+  lines.forEach((line) => {
+    const key = detailLogKey(line);
+    let row = rows.get(key);
+    if (!row) {
+      row = document.createElement("li"); row.className = `log-line severity-${line.severity}`;
+      const time = document.createElement("time"); time.textContent = line.timestamp ? new Date(line.timestamp).toLocaleTimeString() : "—";
+      const severity = document.createElement("span"); severity.className = "log-severity"; severity.textContent = line.severity;
+      const message = document.createElement("span"); message.textContent = line.message || "";
+      row.append(time, severity, message);
+      rows.set(key, row);
+    }
+    desired.push(row);
+    desiredKeys.add(key);
+  });
+  rows.forEach((row, key) => { if (!desiredKeys.has(key)) row.remove(); });
+  if (!lines.length) {
+    let empty = item.detailLogEmpty;
+    if (!empty) { empty = document.createElement("li"); empty.className = "empty-state"; empty.textContent = "No matching log lines."; item.detailLogEmpty = empty; }
+    if (list.children.length !== 1 || list.firstElementChild !== empty) {
+      list.replaceChildren(empty);
+    }
+  } else {
+    item.detailLogEmpty?.remove();
+    desired.forEach((row, index) => {
+      if (list.children[index] !== row) list.insertBefore(row, list.children[index] || null);
+    });
+  }
+  item.detailLogRows = rows;
   byId("detail-log-footer").textContent = `${lines.length} lines · ${hidden} network-noise lines hidden · secrets redacted`;
   byId("detail-noise-toggle").checked = item.hideNoise !== false;
   byId("detail-noise-label").textContent = `Hide network noise · ${hidden} hidden`;
@@ -1981,17 +2654,17 @@ async function loadBackups(id) {
 }
 
 async function renderAggregateBackups() {
+  if (!pageVisible()) return;
   const list = byId("aggregate-backup-list");
   const requestId = ++aggregateBackupRequest;
-  list.replaceChildren();
-  const profileItems = await Promise.all([...state.profiles].map(async ([id, profile]) => {
-    try {
-      const page = await api(`/api/v1/profiles/${encodeURIComponent(id)}/backups?limit=200`);
-      return (Array.isArray(page.items) ? page.items : []).map((backup) => ({ ...backup, profile_id: id, profile_name: profile.display_name || id }));
-    } catch { return []; }
-  }));
+  let page;
+  try { page = await api("/api/v1/backups?limit=500"); } catch { page = { items: [] }; }
   if (requestId !== aggregateBackupRequest) return;
-  const items = profileItems.flat();
+  list.replaceChildren();
+  const items = (Array.isArray(page.items) ? page.items : []).map((backup) => ({
+    ...backup,
+    profile_name: state.profiles.get(backup.profile_id)?.display_name || backup.profile_id || "Server",
+  }));
   const uniqueItems = [...new Map(items.map((backup) => [`${backup.profile_id}:${backup.id || ""}`, backup])).values()];
   uniqueItems.forEach((backup) => {
     const row = document.createElement("li"); row.className = "backup-row";
@@ -2020,7 +2693,7 @@ function route() {
     state.detail.id = null;
     showView(parsed.view);
     if (parsed.view === "backups") renderAggregateBackups();
-    if (parsed.view === "events") loadActivity("events");
+    if (parsed.view === "events") { loadIncidents(); loadActivity("events"); }
     if (parsed.view === "audit") loadActivity("audit");
     if (parsed.view === "settings") {
       loadNotifications(byId("notification-profile")?.value || [...state.profiles.keys()][0]);
@@ -2098,20 +2771,43 @@ function setupDetail() {
   byId("detail-log-query").addEventListener("input", () => { const item = state.logs.get(state.detail.id); if (item) { item.query = byId("detail-log-query").value; renderDetailLogs(item); } });
   byId("detail-log-severity").addEventListener("change", () => { const item = state.logs.get(state.detail.id); if (item) { item.severity = byId("detail-log-severity").value; renderDetailLogs(item); } });
   byId("detail-log-pause").addEventListener("click", () => { const item = state.logs.get(state.detail.id); if (item) { item.paused = !item.paused; byId("detail-log-pause").textContent = item.paused ? "Resume live logs" : "Pause live logs"; } });
-  byId("stats-window").addEventListener("change", () => { if (state.detail.tab === "stats") loadStatsTps(state.detail.id); });
+  byId("stats-window").addEventListener("change", () => { if (state.detail.tab === "stats") { state.detail.statsBaseLoaded = false; loadStats(state.detail.id, { includeBase: true }); } });
+  byId("stats-resolution")?.addEventListener("change", () => { if (state.detail.tab === "stats") loadStats(state.detail.id, { includeBase: false }); });
+  byId("stats-comparison")?.addEventListener("change", () => {
+    const cached = state.statsCache.get(state.detail.id)?.tps;
+    if (cached) { byId("stats-tps-chart").dataset.signature = ""; renderStatsTps(cached); }
+  });
   byId("benchmark-form")?.addEventListener("submit", runBenchmark);
+  byId("benchmark-load-more")?.addEventListener("click", () => { state.detail.benchmarkCursor = byId("benchmark-load-more").dataset.cursor || null; loadBenchmarks(state.detail.id, true); });
+  byId("benchmark-export-json")?.addEventListener("click", () => { if (state.detail.id) window.open(`/api/v1/benchmarks/${encodeURIComponent(state.detail.id)}/export?format=json`, "_blank", "noopener"); });
+  byId("benchmark-export-csv")?.addEventListener("click", () => { if (state.detail.id) window.open(`/api/v1/benchmarks/${encodeURIComponent(state.detail.id)}/export?format=csv`, "_blank", "noopener"); });
   byId("benchmark-baseline")?.addEventListener("change", validateBenchmarkForm);
   byId("benchmark-candidate")?.addEventListener("change", validateBenchmarkForm);
   byId("config-form")?.addEventListener("submit", applyConfig);
   byId("schedule-form")?.addEventListener("submit", addSchedule);
   byId("detail-noise-toggle").addEventListener("change", (event) => { const item = state.logs.get(state.detail.id); if (item) { item.hideNoise = event.currentTarget.checked; renderDetailLogs(item); patchDetail(state.detail.id); } });
+  // Recurring timer: console/log append poll; callback is visibility-gated.
   window.setInterval(() => {
+    if (!pageVisible()) return;
     const id = state.detail.id;
     const item = id ? state.logs.get(id) : null;
     if (id && item && !item.paused && ["console", "logs"].includes(state.detail.tab)) loadDetailLogs(id);
   }, 3000);
   byId("retry-load")?.addEventListener("click", () => load().finally(route));
   byId("logout")?.addEventListener("click", async () => { try { await api("/api/v1/session/revoke", { method: "POST", body: "{}" }); location.reload(); } catch (error) { notify(error.message || "Logout failed."); } });
+}
+
+function refreshVisiblePanels() {
+  if (!pageVisible() || !state.detail.id) return;
+  const id = state.detail.id;
+  if (["console", "logs"].includes(state.detail.tab)) {
+    const item = state.logs.get(id);
+    if (!item?.paused) loadDetailLogs(id);
+  } else if (state.detail.tab === "stats") {
+    loadStats(id, { includeBase: !state.detail.statsBaseLoaded });
+  } else if (state.detail.tab === "benchmarks") {
+    loadBenchmarks(id);
+  }
 }
 
 function paletteRoute(id, tab = "console") {
@@ -2191,15 +2887,29 @@ function paletteCommands() {
 window.HORIZON_PALETTE = { getCommands: paletteCommands };
 
 window.addEventListener("game-control-status", (event) => applyStatus(event.data || event.detail));
-document.addEventListener("visibilitychange", () => {
-  if (document.visibilityState !== "visible") return;
-  api("/api/v1/status").then(applyStatus).catch(() => {});
-  if (!stream.source || stream.source.readyState === window.EventSource?.CLOSED || Date.now() - stream.lastEventAt > 45000) connectStream();
+window.addEventListener("resize", () => {
+  if (state.detail.tab !== "stats" || !state.detail.id) return;
+  const cached = state.statsCache.get(state.detail.id)?.tps;
+  if (cached) renderStatsTps(cached);
 });
-window.addEventListener("online", () => connectStream());
+document.addEventListener("visibilitychange", () => {
+  if (document.visibilityState !== "visible") {
+    state.detail.statsAbort?.abort();
+    suspendStream();
+    return;
+  }
+  flushClientPerformance();
+  refreshVisiblePanels();
+  resumeStream();
+});
+window.addEventListener("online", () => {
+  if (!pageVisible()) return;
+  if (stream.suspended) resumeStream(); else connectStream();
+});
 window.__horizonOpenLogs = openLogs;
 window.addEventListener("hashchange", route);
 setupShell();
+setupSessionDeck();
 wireDialogForms();
 setupDetail();
 load().finally(route);

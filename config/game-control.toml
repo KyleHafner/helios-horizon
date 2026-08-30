@@ -2,18 +2,49 @@ profiles_dir = "/etc/game-control/profiles.d"
 state_db = "/var/lib/game-control/state.db"
 reservation_path = "/run/game-control/reservation.json"
 # Keep boot_profile and boot_autostart at TOML root, before the first [section].
-# Resume the last successfully active profile after a future slotd restart.
-# The controller owns this start and applies normal reservation/health gates.
+# The VM remains cold across controller restarts until an operator starts a profile.
 boot_profile = "resume-last-active"
-boot_autostart = true
-# Optional [[schedule]] entries are parsed at slotd startup; restart slotd to reload.
-# Example: [[schedule]] / cron = "0 20 * * 5" / profile = "pz-rising"
+boot_autostart = false
+# Active daily protected application backups use the fixed typed B2 destination.
+[[schedule]]
+# Avoid the modpack's own 03:00 UTC FTB backup/save-freeze window.
+cron = "10 3 * * *"
+profile = "minecraft-sunlit-cobblemon"
+backup_destination = "horizon-b2"
 
-[crafty]
-base_url = "https://127.0.0.1:8443"
-token_path = "/etc/game-control/secrets.d/crafty-token"
-verify = false
+[[schedule]]
+cron = "20 3 * * *"
+profile = "terraria-vanilla"
+backup_destination = "horizon-b2"
+
+[[schedule]]
+cron = "40 3 * * *"
+profile = "terraria-tmod"
+backup_destination = "horizon-b2"
 
 [stats]
 exporter_url = "http://127.0.0.1:19565/metrics"
 tps_interval_seconds = 30
+log_checkpoint_dir = "/var/lib/game-control/log-checkpoints"
+
+[rcon]
+host = "127.0.0.1"
+port = 25575
+password_path = "/etc/game-control/secrets.d/minecraft-rcon-password"
+
+# Horizon receives and exposes preset IDs only. The separate root-owned driver
+# JSON owns JVM arguments and the isolated benchmark details.
+[[benchmark]]
+profile = "minecraft-sunlit-cobblemon"
+driver = "/usr/local/libexec/swagbench-ab"
+config = "/etc/game-control/swagbench.json"
+report_root = "/srv/game-servers/minecraft-sunlit-benchmark/.horizon-reports"
+timeout_seconds = 21600
+
+[[benchmark.presets]]
+id = "current"
+label = "Current production"
+
+[[benchmark.presets]]
+id = "balanced-g1"
+label = "Balanced G1 candidate"

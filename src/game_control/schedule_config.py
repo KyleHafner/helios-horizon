@@ -31,6 +31,17 @@ def _schedule_block(entries: Iterable[dict[str, Any]]) -> str:
         )
         if entry.get("backup_destination") is not None:
             block += f'backup_destination = "{entry["backup_destination"]}"\n'
+        if entry.get("operation") not in {None, "backup" if entry.get("backup_destination") is not None else "switch"}:
+            block += f'operation = "{entry["operation"]}"\n'
+        for key in ("baseline_preset", "candidate_preset", "campaign"):
+            if entry.get(key) is not None:
+                block += f'{key} = "{entry[key]}"\n'
+        if entry.get("maintenance_window"):
+            block += "maintenance_window = true\n"
+        if entry.get("rollback_safe"):
+            block += "rollback_safe = true\n"
+        if entry.get("public_wake_policy") not in {None, "disabled"}:
+            block += f'public_wake_policy = "{entry["public_wake_policy"]}"\n'
         if not entry.get("enabled", True):
             block += "enabled = false\n"
         blocks.append(block)
@@ -60,7 +71,7 @@ def _validate_entries(entries: Any) -> list[dict[str, Any]]:
     for entry in entries:
         if not isinstance(entry, dict):
             raise ScheduleConfigError("invalid schedule entry")
-        if not {"cron", "profile"}.issubset(entry) or not set(entry).issubset({"cron", "profile", "enabled", "backup_destination"}):
+        if not {"cron", "profile"}.issubset(entry) or not set(entry).issubset({"cron", "profile", "enabled", "backup_destination", "operation", "baseline_preset", "candidate_preset", "campaign", "maintenance_window", "rollback_safe", "public_wake_policy"}):
             raise ScheduleConfigError("unknown schedule field")
         enabled = entry.get("enabled", True)
         if not isinstance(enabled, bool):
@@ -80,6 +91,7 @@ def _validate_entries(entries: Any) -> list[dict[str, Any]]:
             "profile": profile,
             "enabled": enabled,
             **({"backup_destination": destination} if destination is not None else {}),
+            **{key: entry[key] for key in ("operation", "baseline_preset", "candidate_preset", "campaign", "maintenance_window", "rollback_safe", "public_wake_policy") if key in entry},
         })
     try:
         parse_schedule(normalized)

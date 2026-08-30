@@ -10,10 +10,26 @@ from pathlib import Path
 from typing import Any, Awaitable, Callable, Iterable, Mapping
 
 import psutil
+import shutil
 
 from .adapters.base import AdapterError
+from .adapters.crafty import parse_version_text
 from .models import HealthState, ObservedState
+from .introspection import signature_parameters
 from .protocol import ProfileStatus, StatusSnapshot
+
+
+# Slotd owns telemetry cadence separately from its 30-second maintenance tick.
+# Keep the historical constants for compatibility with callers that import
+# them, but do not use them as a write gate: TelemetrySampler is the sole
+# cadence owner.
+TELEMETRY_TARGET_INTERVAL_SECONDS = 30.0
+TELEMETRY_MIN_INTERVAL_SECONDS = 20.0
+TELEMETRY_MAX_INTERVAL_SECONDS = 45.0
+
+# Browser/API status demand shares a short-lived projection.  Maintenance and
+# lifecycle preflights can explicitly bypass it.
+STATUS_SNAPSHOT_TTL_SECONDS = 2.0
 
 
 def derive_state(
@@ -58,6 +74,12 @@ class StatusService:
         connection_provider: Callable[..., Any] = psutil.net_connections,
         generation: int | Callable[[], int] = 0,
         clock: Callable[[], datetime] | None = None,
+        telemetry_db: Any | None = None,
+        monotonic: Callable[[], float] = time.monotonic,
+        telemetry_sampler: Any | None = None,
+        capability_evidence: Callable[[], bool] | None = None,
+        ups_health: Callable[[], bool] | None = None,
+        storage_paths: Iterable[str] = ("/srv/game-servers", "/var/lib/game-control"),
     ):
         self.profiles = tuple(profiles)
         self.adapters = adapters or {}
@@ -75,13 +97,73 @@ class StatusService:
         self._last_running: dict[str, bool] = {}
         self._version_cache: dict[str, tuple[tuple[int, int], str | None]] = {}
         self._snapshot_cache: StatusSnapshot | None = None
+        self._snapshot_cached_at: float | None = None
         self._refresh_lock = asyncio.Lock()
+        self.telemetry_db = telemetry_db
+        self.telemetry_sampler = telemetry_sampler
+        self.capability_evidence = capability_evidence
+        self.ups_health = ups_health
+        self.storage_paths = tuple(storage_paths)
+        # Production maintenance is fixed at a 30-second target. Keep this
+        # contract non-configurable so callers cannot create 60-second aliasing
+        # or intervals outside the documented 20–45 second envelope.
+        self.telemetry_min_interval_seconds = TELEMETRY_MIN_INTERVAL_SECONDS
+        self._monotonic = monotonic
+        self._telemetry_last_sample: dict[str, float] = {}
 
-    async def snapshot(self) -> StatusSnapshot:
-        """Refresh and publish the projection used by all status reads."""
+    async def snapshot(self, *, persist: bool = False, force: bool = False) -> StatusSnapshot:
+        """Return one short-lived projection, with one in-flight probe.
+
+        The lock is held through the probe so concurrent demand observes the
+        just-published result instead of starting a second adapter probe.
+        Lifecycle gates use ``force`` when stale status is unacceptable.
+        """
         async with self._refresh_lock:
-            snapshot = await self._sample()
+            # Persistence cadence already owns its own monotonic clock read;
+            # only demand snapshots participate in the short TTL cache.
+            now = self._monotonic() if not persist else None
+            if (
+                not persist
+                and not force
+                and self._snapshot_cache is not None
+                and self._snapshot_cached_at is not None
+                and now is not None
+                and now - self._snapshot_cached_at < STATUS_SNAPSHOT_TTL_SECONDS
+            ):
+                return self._snapshot_cache
+            async def supervise_sample() -> tuple[bool, StatusSnapshot | BaseException]:
+                try:
+                    return True, await self._sample(persist=persist)
+                except BaseException as error:
+                    # Keep the shielded task itself non-throwing.  A provider
+                    # can fail after its caller is cancelled; storing the
+                    # outcome prevents Python from reporting a late shield
+                    # Future exception while preserving normal error behavior.
+                    return False, error
+
+            sample_task = asyncio.create_task(supervise_sample())
+            try:
+                ok, outcome = await asyncio.shield(sample_task)
+            except asyncio.CancelledError:
+                # Do not release the single-flight lock while a worker thread
+                # is still probing external state. Await completion so a
+                # subsequent refresh cannot overlap or publish stale output.
+                # Drain both futures: a provider may fail after cancellation,
+                # but shutdown must retain the caller's CancelledError and
+                # never leave an unhandled task exception behind.
+                try:
+                    await sample_task
+                except BaseException:
+                    pass
+                raise
+            if not ok:
+                raise outcome
+            snapshot = outcome
             self._snapshot_cache = snapshot
+            # Anchor the short demand TTL at probe start.  This avoids a
+            # second clock read (important for deterministic injected clocks)
+            # and never extends freshness across a slow observation.
+            self._snapshot_cached_at = now
             return snapshot
 
     async def cached_snapshot(self) -> StatusSnapshot:
@@ -89,9 +171,50 @@ class StatusService:
         cached = self._snapshot_cache
         if cached is not None:
             return cached
-        return await self.snapshot()
+        # Pure API reads must not unexpectedly probe adapters or enqueue
+        # telemetry.  The slotd sampler/maintenance path is responsible for
+        # establishing the first authoritative snapshot.
+        now = self.clock()
+        if now.tzinfo is None:
+            now = now.replace(tzinfo=timezone.utc)
+        generation = self.generation() if callable(self.generation) else self.generation
+        # A cold cached read is deliberately projection-only: do not perform
+        # version-file or adapter probes while maintenance is in flight.
+        versions = tuple(
+            parse_version_text(value) if isinstance(value := getattr(profile, "installed_version", None), str) and value else None
+            for profile in self.profiles
+        )
+        profiles = tuple(
+            ProfileStatus(
+                profile_id=getattr(profile, "id"), state=ObservedState.STOPPED,
+                health=HealthState.UNKNOWN, slot_owner=None, active_job_id=None,
+                pid=None, started_at=None, uptime_seconds=None, cpu_percent=None,
+                rss_bytes=None, players_online=None,
+                installed_version=version,
+                restart_required=False, required_ports_ready=False,
+            )
+            for profile, version in zip(self.profiles, versions)
+        )
+        return StatusSnapshot(generation=int(generation), observed_at=now, profiles=profiles)
 
-    async def _sample(self) -> StatusSnapshot:
+    async def benchmark_eligibility(self, *, maintenance_window: bool, rollback_safe: bool, public_wake_policy: str) -> dict[str, bool]:
+        """Bounded, secret-free evidence for scheduled benchmark execution."""
+        snapshot = await self.cached_snapshot()
+        stopped = all(getattr(item.state, "value", item.state) == "stopped" and item.players_online == 0 and item.active_job_id is None for item in snapshot.profiles)
+        storage_results = await asyncio.gather(*(self._call(shutil.disk_usage, path) for path in self.storage_paths), return_exceptions=True)
+        storage_ok = all(not isinstance(result, BaseException) and result.free >= 5 * 1024**3 for result in storage_results)
+        ups_ok = bool(self.ups_health and await self._call(self.ups_health))
+        quiet = False
+        connection = getattr(self.session_store, "connection", None)
+        no_wake = False
+        if connection is not None:
+            latest = connection.execute("SELECT ended_at FROM player_sessions WHERE ended_at IS NOT NULL ORDER BY ended_at DESC LIMIT 1").fetchone()
+            quiet = latest is None or datetime.fromisoformat(latest[0].replace("Z", "+00:00")).timestamp() <= self.clock().timestamp() - 900
+            no_wake = connection.execute("SELECT 1 FROM player_sessions WHERE ended_at IS NULL LIMIT 1").fetchone() is None
+        no_wake = no_wake and bool(self.capability_evidence and await self._call(self.capability_evidence))
+        return {"maintenance_window": maintenance_window, "storage_acceptable": storage_ok, "ups_acceptable": ups_ok, "quiet_period": quiet, "no_wake_session": no_wake, "no_conflicting_jobs": stopped, "rollback_safe_public_wake": rollback_safe and public_wake_policy == "safe"}
+
+    async def _sample(self, *, persist: bool = False) -> StatusSnapshot:
         now = self.clock()
         if now.tzinfo is None:
             now = now.replace(tzinfo=timezone.utc)
@@ -114,9 +237,9 @@ class StatusService:
             for profile, _profile_id, key, job, _full_probe in contexts:
                 previous_job = self._last_jobs.get(key, object())
                 if previous_job != job and job in {"start", "stop"}:
-                    invalidate(getattr(profile, "systemd_unit", None))
+                    await self._call(invalidate, getattr(profile, "systemd_unit", None))
                 self._last_jobs[key] = job
-        connections = self._connections_for_snapshot(
+        connections = await self._connections_for_snapshot(
             profile for profile, _profile_id, _key, _job, full_probe in contexts if full_probe
         )
         statuses: list[ProfileStatus] = []
@@ -144,7 +267,7 @@ class StatusService:
                         cpu_percent=None,
                         rss_bytes=None,
                         players_online=None,
-                        installed_version=self._cached_installed_version(profile),
+                        installed_version=await self._cached_installed_version(profile),
                         restart_required=False,
                         required_ports_ready=False,
                         disk_free_bytes=getattr(cached_disk, "profile_data_free_bytes", None),
@@ -152,6 +275,8 @@ class StatusService:
                         disk_write_bps=None,
                     )
                 )
+                if persist:
+                    self._record_telemetry(profile_id, None, now=now, state="inactive")
                 continue
             adapter = self.adapters.get(profile_id, self.adapters.get(key, self.default_adapter))
             observation_error = False
@@ -162,17 +287,32 @@ class StatusService:
                 observation = type("Observation", (), {"running": False, "healthy": None})()
             running = bool(getattr(observation, "running", False))
             if not observation_error and not running:
-                if self.session_store is not None and self._last_running.get(key, False):
+                if persist and self.session_store is not None and self._last_running.get(key, False):
                     self.session_store.profile_stopped(key, now=_iso(now))
                 if self.player_tracker is not None:
                     reset = getattr(self.player_tracker, "reset", None)
                     if callable(reset):
+                        # PlayerTracker state is owned by the event loop and is
+                        # updated by ingest_event on that same loop.  Keep
+                        # reset serialized with those mutations; only
+                        # genuinely blocking injected probes use _call.
                         reset(key)
             self._last_running[key] = running if not observation_error else self._last_running.get(key, False)
             process_alive = False
             health = None
             required_ports = getattr(observation, "required_ports_ready", None)
             health_error = False
+            sampled = None
+            # Avoid process/cgroup probes for stopped profiles.  Inactive
+            # samples are represented explicitly below and the sampler can
+            # continue collecting other profiles independently.
+            if running and self.metrics is not None:
+                sampled = await self._call_optional(
+                    self.metrics.sample,
+                    profile,
+                    pid=getattr(observation, "pid", None),
+                    connections=connections,
+                )
             if self.health_checker is not None and not observation_error:
                 checker = self.health_checker
                 if isinstance(checker, Mapping):
@@ -180,7 +320,11 @@ class StatusService:
                 if checker is not None:
                     try:
                         result = await self._call_optional(
-                            checker.check, profile, connections=connections
+                            checker.check,
+                            profile,
+                            observation=observation,
+                            connections=connections,
+                            process_metrics=sampled,
                         )
                     except (AdapterError, RuntimeError):
                         health_error = True
@@ -205,14 +349,6 @@ class StatusService:
                     else HealthState.UNKNOWN
                 )
             health = HealthState(getattr(health, "value", health))
-            sampled = None
-            if self.metrics is not None:
-                sampled = await self._call_optional(
-                    self.metrics.sample,
-                    profile,
-                    pid=getattr(observation, "pid", None),
-                    connections=connections,
-                )
             pid = getattr(sampled, "pid", None)
             rss = getattr(sampled, "rss_bytes", None)
             cpu = getattr(sampled, "cpu_percent", None)
@@ -231,7 +367,7 @@ class StatusService:
                     adapter,
                     running=bool(getattr(observation, "running", False)),
                 )
-            if running and self.session_store is not None:
+            if persist and running and self.session_store is not None:
                 names = getattr(observation, "player_names", None)
                 if names is None and self.player_tracker is not None:
                     names = self.player_tracker.names(key)
@@ -245,7 +381,13 @@ class StatusService:
                 )
             version = getattr(observation, "installed_version", None)
             if version is None:
-                version = self._cached_installed_version(profile)
+                version = await self._cached_installed_version(profile)
+            telemetry_state = "inactive" if not running else "available" if sampled is not None and any(
+                getattr(sampled, name, None) is not None
+                for name in ("cpu_percent", "rss_bytes", "disk_read_bps", "disk_write_bps")
+            ) else "unavailable"
+            if persist:
+                self._record_telemetry(profile_id, sampled, now=now, state=telemetry_state)
             statuses.append(
                 ProfileStatus(
                     profile_id=profile_id,
@@ -270,6 +412,53 @@ class StatusService:
         generation = self.generation() if callable(self.generation) else self.generation
         return StatusSnapshot(generation=int(generation), observed_at=now, profiles=tuple(statuses))
 
+    def _record_telemetry(self, profile_id: Any, sample: Any | None, *, now: datetime, state: str) -> None:
+        if self.telemetry_db is None:
+            return
+        key = getattr(profile_id, "value", profile_id)
+        current = self._monotonic()
+        ts_ms = int(now.timestamp() * 1000)
+        try:
+            enqueue = getattr(self.telemetry_db, "enqueue_process_sample", None)
+            if callable(enqueue):
+                accepted = enqueue(profile_id, sample, ts_ms=ts_ms, state=state)
+                if accepted:
+                    self._telemetry_last_sample[str(key)] = current
+            else:
+                recorder = getattr(self.telemetry_db, "record_failure", None)
+                if callable(recorder):
+                    recorder(RuntimeError("telemetry writer enqueue interface is required"))
+        except Exception as error:
+            recorder = getattr(self.telemetry_db, "record_failure", None)
+            if callable(recorder):
+                recorder(error)
+
+    def telemetry_health(self) -> dict[str, Any]:
+        if self.telemetry_db is None:
+            health: dict[str, Any] = {
+                "ok": False,
+                "last_sample_age_ms": None,
+                "last_error": "not_configured",
+            }
+            sampler = self.telemetry_sampler
+            if sampler is not None and hasattr(sampler, "health"):
+                health["sampler"] = dict(sampler.health())
+            collectors = getattr(self, "telemetry_collectors", None)
+            if collectors is not None and hasattr(collectors, "health"):
+                health["collectors"] = dict(collectors.health())
+            return health
+        try:
+            health = dict(self.telemetry_db.health())
+            sampler = self.telemetry_sampler
+            if sampler is not None and hasattr(sampler, "health"):
+                health["sampler"] = dict(sampler.health())
+            collectors = getattr(self, "telemetry_collectors", None)
+            if collectors is not None and hasattr(collectors, "health"):
+                health["collectors"] = dict(collectors.health())
+            return health
+        except Exception as error:
+            return {"ok": False, "last_sample_age_ms": None, "last_error": type(error).__name__[:64]}
+
     def _job_for(self, profile_id: Any, key: Any) -> str | None:
         if callable(self.active_jobs):
             return self.active_jobs(profile_id)
@@ -278,10 +467,10 @@ class StatusService:
             value = value.get("operation", value.get("state"))
         return getattr(value, "value", value)
 
-    def _cached_installed_version(self, profile: Any) -> str | None:
+    async def _cached_installed_version(self, profile: Any) -> str | None:
         direct = getattr(profile, "installed_version", None)
         if isinstance(direct, str) and direct:
-            return direct
+            return parse_version_text(direct)
         paths = getattr(profile, "paths", None)
         raw_path = getattr(paths, "version_file", None) if paths is not None else None
         if raw_path is None:
@@ -289,7 +478,7 @@ class StatusService:
         path = Path(raw_path)
         key = str(path)
         try:
-            stat = path.stat()
+            stat = await asyncio.to_thread(path.stat)
             fingerprint = (int(stat.st_mtime_ns), int(stat.st_size))
         except OSError:
             return None
@@ -297,7 +486,7 @@ class StatusService:
         if cached is not None and cached[0] == fingerprint:
             return cached[1]
         try:
-            value = path.read_text(encoding="utf-8").strip() or None
+            value = parse_version_text(await asyncio.to_thread(path.read_text, encoding="utf-8"))
         except OSError:
             value = None
         self._version_cache[key] = (fingerprint, value)
@@ -308,7 +497,7 @@ class StatusService:
             return type("Observation", (), {"running": False, "healthy": None})()
         return await self._call(adapter.observe, profile)
 
-    def _connections_for_snapshot(self, profiles: Iterable[Any]) -> dict[str, list[Any]]:
+    async def _connections_for_snapshot(self, profiles: Iterable[Any]) -> dict[str, list[Any]]:
         protocols = {
             getattr(spec, "protocol", None)
             for profile in profiles
@@ -320,7 +509,7 @@ class StatusService:
             if protocol not in protocols:
                 continue
             try:
-                value = self.connection_provider(kind=protocol)
+                value = await self._call(self.connection_provider, kind=protocol)
                 rows[protocol] = list(value)
             except (OSError, psutil.Error, TypeError, ValueError):
                 rows[protocol] = []
@@ -328,7 +517,7 @@ class StatusService:
 
     async def _call_optional(self, function: Callable[..., Any], *args: Any, **kwargs: Any) -> Any:
         try:
-            parameters = inspect.signature(function).parameters.values()
+            parameters = signature_parameters(function)
             accepts_kwargs = any(parameter.kind is inspect.Parameter.VAR_KEYWORD for parameter in parameters)
             supported = {parameter.name for parameter in parameters}
         except (TypeError, ValueError):
@@ -341,7 +530,8 @@ class StatusService:
     async def _call(function: Callable[..., Any] | None, *args: Any, **kwargs: Any) -> Any:
         if function is None:
             return None
-        value = function(*args, **kwargs)
+        callable_async = inspect.iscoroutinefunction(function) or inspect.iscoroutinefunction(getattr(function, "__call__", None))
+        value = function(*args, **kwargs) if callable_async else await asyncio.to_thread(function, *args, **kwargs)
         return await value if inspect.isawaitable(value) else value
 
 

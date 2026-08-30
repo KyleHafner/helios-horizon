@@ -127,6 +127,29 @@ def test_matching_reservation_can_acquire_and_expiry_is_ignored(slot_env):
     assert slot_env.store.valid_for_runner("minecraft") is None
 
 
+def test_owns_live_requires_exact_generation_and_live_owner(slot_env):
+    now = [100.0]
+    store = ReservationStore(
+        slot_env.operation_path,
+        slot_env.reservation_path,
+        clock=lambda: now[0],
+    )
+    ticks = store.pid_start_ticks(os.getpid())
+    store.reserve("minecraft", "op-live", ttl=10, state_generation=7,
+                  controller_start_ticks=ticks)
+    assert store.owns_live("minecraft", "op-live", 7)
+    assert not store.owns_live("minecraft", "op-live", 6)
+    now[0] = 111.0
+    assert not store.owns_live("minecraft", "op-live", 7)
+
+
+def test_owns_live_rejects_dead_controller_even_before_expiry(slot_env):
+    store = ReservationStore(slot_env.operation_path, slot_env.reservation_path)
+    store.reserve("minecraft", "op-dead", ttl=30, controller_pid=999999,
+                  controller_start_ticks=1)
+    assert not store.owns_live("minecraft", "op-dead")
+
+
 def test_unrepresentable_expiry_is_treated_as_stale(slot_env):
     slot_env.reservation_path.write_text(
         json.dumps(

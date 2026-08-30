@@ -3,7 +3,10 @@
 The capability surface is deliberately separate from the operator session
 surface.  Tokens are bearer credentials, so only a hash and fixed metadata are
 ever persisted.  The public request model has no profile, unit, path, command,
-or confirmation fields; those values are selected by this module.
+or confirmation fields; those values are selected by this module.  Successful
+status replays are retained for ten minutes, with caps of 128 rows per token
+and 4096 rows globally.  Retention maintenance runs at most once per minute;
+security events, wake mutations, and failed or rejected requests are durable.
 """
 
 from __future__ import annotations
@@ -14,28 +17,31 @@ import inspect
 import json
 import secrets
 import sqlite3
+from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from enum import StrEnum
-from typing import Any, Awaitable, Callable, Literal
+from typing import Any, Literal
 from uuid import UUID, uuid4
 
-from pydantic import BaseModel, ConfigDict, Field, ValidationError
+from pydantic import BaseModel, ConfigDict, ValidationError
 
-from .models import ObservedState, ProfileId
+from .models import HealthState, ObservedState, ProfileId
+from .introspection import signature_parameters
 from .protocol import (
     ErrorCode,
     GetStatsTps,
     GetStatus,
     JobAccepted,
+    ReadinessResult,
     RpcFailure,
     RpcRequest,
     RpcResponse,
     RpcSuccess,
     Start,
     StatusSnapshot,
+    WaitReadiness,
 )
-
 
 CAPABILITY_PATH_PREFIX = "/api/v1/capability"
 CAPABILITY_MAX_BODY_BYTES = 4096
@@ -48,6 +54,21 @@ CAPABILITY_DEFAULT_WAKE_COOLDOWN = timedelta(seconds=30)
 CAPABILITY_MAX_RATE_WINDOW = timedelta(hours=1)
 CAPABILITY_MAX_WAKE_COOLDOWN = timedelta(hours=1)
 CAPABILITY_START_PROFILE = ProfileId.MINECRAFT_SUNLIT_COBBLEMON
+# Leave ten seconds for the Unix RPC framing and capability HTTP response around
+# the controller-owned readiness wait.  The readiness coordinator itself still
+# enforces the hard five-minute start budget.
+CAPABILITY_READINESS_TIMEOUT_SECONDS = 290.0
+
+# A status request ID is supported for this retry window.  The caps are sized
+# for the normal five-second status cadence while still bounding hostile or
+# accidentally noisy callers.  Audit rows retain both accepted and succeeded
+# entries, hence their caps are twice the replay caps.
+CAPABILITY_STATUS_REPLAY_WINDOW = timedelta(minutes=10)
+CAPABILITY_STATUS_REPLAY_PER_TOKEN_CAP = 128
+CAPABILITY_STATUS_REPLAY_GLOBAL_CAP = 4096
+CAPABILITY_STATUS_AUDIT_PER_TOKEN_CAP = CAPABILITY_STATUS_REPLAY_PER_TOKEN_CAP * 2
+CAPABILITY_STATUS_AUDIT_GLOBAL_CAP = CAPABILITY_STATUS_REPLAY_GLOBAL_CAP * 2
+CAPABILITY_RETENTION_MAINTENANCE_INTERVAL = timedelta(minutes=1)
 
 
 class CapabilityAudience(StrEnum):
@@ -172,6 +193,8 @@ class CapabilityTokenStore:
                 canonical_hash TEXT NOT NULL,
                 response_json TEXT,
                 status TEXT NOT NULL CHECK (status IN ('pending', 'completed')),
+                action_kind TEXT NOT NULL DEFAULT 'unknown' CHECK (action_kind IN ('status', 'wake', 'tps', 'unknown')),
+                successful INTEGER NOT NULL DEFAULT 0 CHECK (successful IN (0, 1)),
                 created_at TEXT NOT NULL,
                 PRIMARY KEY (token_id, request_id)
             );
@@ -186,8 +209,22 @@ class CapabilityTokenStore:
             );
             CREATE INDEX IF NOT EXISTS idx_capability_tokens_hash ON capability_tokens(token_hash);
             CREATE INDEX IF NOT EXISTS idx_capability_requests_created ON capability_requests(created_at);
+            CREATE TABLE IF NOT EXISTS capability_retention_maintenance (
+                name TEXT PRIMARY KEY,
+                last_pruned_at TEXT NOT NULL
+            );
             """
         )
+        request_columns = {row[1] for row in self.db.execute("PRAGMA table_info(capability_requests)")}
+        request_migrations = {
+            "action_kind": "TEXT NOT NULL DEFAULT 'unknown'",
+            "successful": "INTEGER NOT NULL DEFAULT 0",
+        }
+        for name, definition in request_migrations.items():
+            if name not in request_columns:
+                self.db.execute(
+                    f"ALTER TABLE capability_requests ADD COLUMN {name} {definition}"
+                )
         columns = {row[1] for row in self.db.execute("PRAGMA table_info(capability_tokens)")}
         migrations = {
             "rate_window_seconds": "INTEGER NOT NULL DEFAULT 60",
@@ -199,6 +236,22 @@ class CapabilityTokenStore:
         for name, definition in migrations.items():
             if name not in columns:
                 self.db.execute(f"ALTER TABLE capability_tokens ADD COLUMN {name} {definition}")
+        self.db.execute(
+            "INSERT OR IGNORE INTO capability_retention_maintenance(name,last_pruned_at) VALUES(?,?)",
+            ("status", "1970-01-01T00:00:00Z"),
+        )
+        self.db.executescript(
+            """
+            CREATE INDEX IF NOT EXISTS idx_capability_requests_status_retention
+                ON capability_requests(action_kind,status,created_at,token_id);
+            CREATE INDEX IF NOT EXISTS idx_capability_requests_status_retention_v2
+                ON capability_requests(action_kind,status,successful,created_at,token_id);
+            CREATE INDEX IF NOT EXISTS idx_capability_audit_status_retention
+                ON capability_audit(action,result,timestamp,token_id);
+            CREATE INDEX IF NOT EXISTS idx_capability_audit_token_status_retention
+                ON capability_audit(token_id,action,result,timestamp);
+            """
+        )
         self.db.commit()
 
     @staticmethod
@@ -258,6 +311,92 @@ class CapabilityTokenStore:
                 str(detail)[:256],
             ),
         )
+
+    def _prune_status_retention(self, now: datetime) -> None:
+        """Amortized bounded cleanup for successful routine status records."""
+
+        maintenance = self.db.execute(
+            "SELECT last_pruned_at FROM capability_retention_maintenance WHERE name=?",
+            ("status",),
+        ).fetchone()
+        if maintenance is not None:
+            last_pruned_at = self._parse(str(maintenance[0]))
+            if now < last_pruned_at + CAPABILITY_RETENTION_MAINTENANCE_INTERVAL:
+                return
+
+        now_iso = self._iso(now)
+        cutoff_iso = self._iso(now - CAPABILITY_STATUS_REPLAY_WINDOW)
+        self.db.execute(
+            "UPDATE capability_retention_maintenance SET last_pruned_at=? WHERE name=?",
+            (now_iso, "status"),
+        )
+
+        # Age pruning uses the retention index and runs only on the maintenance
+        # interval, not on each five-second status completion.
+        self.db.execute(
+            "DELETE FROM capability_requests WHERE rowid IN ("
+            "SELECT rowid FROM capability_requests "
+            "WHERE action_kind='status' AND status='completed' AND successful=1 AND created_at<?"
+            ")",
+            (cutoff_iso,),
+        )
+        self.db.execute(
+            "DELETE FROM capability_audit WHERE rowid IN ("
+            "SELECT rowid FROM capability_audit "
+            "WHERE action='status' AND result IN ('accepted','succeeded') AND timestamp<?"
+            ")",
+            (cutoff_iso,),
+        )
+
+        # Cap pruning is deliberately separate from age pruning so a busy token
+        # cannot make the tables grow without bound between retry windows.
+        self.db.execute(
+            "DELETE FROM capability_requests WHERE rowid IN ("
+            "SELECT rowid FROM ("
+            "SELECT rowid, ROW_NUMBER() OVER (PARTITION BY token_id ORDER BY created_at DESC, rowid DESC) AS row_number "
+            "FROM capability_requests WHERE action_kind='status' AND status='completed' AND successful=1"
+            ") WHERE row_number>?"
+            ")",
+            (CAPABILITY_STATUS_REPLAY_PER_TOKEN_CAP,),
+        )
+        replay_count = self.db.execute(
+            "SELECT COUNT(*) FROM capability_requests WHERE action_kind='status' AND status='completed' AND successful=1"
+        ).fetchone()[0]
+        replay_excess = max(0, int(replay_count) - CAPABILITY_STATUS_REPLAY_GLOBAL_CAP)
+        if replay_excess:
+            self.db.execute(
+                "DELETE FROM capability_requests WHERE rowid IN ("
+                "SELECT rowid FROM capability_requests "
+                "WHERE action_kind='status' AND status='completed' AND successful=1 "
+                "ORDER BY created_at ASC, rowid ASC LIMIT ?"
+                ")",
+                (replay_excess,),
+            )
+
+        self.db.execute(
+            "DELETE FROM capability_audit WHERE rowid IN ("
+            "SELECT rowid FROM ("
+            "SELECT rowid, ROW_NUMBER() OVER (PARTITION BY token_id ORDER BY timestamp DESC, rowid DESC) AS row_number "
+            "FROM capability_audit WHERE token_id IS NOT NULL "
+            "AND action='status' AND result IN ('accepted','succeeded')"
+            ") WHERE row_number>?"
+            ")",
+            (CAPABILITY_STATUS_AUDIT_PER_TOKEN_CAP,),
+        )
+        audit_count = self.db.execute(
+            "SELECT COUNT(*) FROM capability_audit "
+            "WHERE action='status' AND result IN ('accepted','succeeded')"
+        ).fetchone()[0]
+        audit_excess = max(0, int(audit_count) - CAPABILITY_STATUS_AUDIT_GLOBAL_CAP)
+        if audit_excess:
+            self.db.execute(
+                "DELETE FROM capability_audit WHERE rowid IN ("
+                "SELECT rowid FROM capability_audit "
+                "WHERE action='status' AND result IN ('accepted','succeeded') "
+                "ORDER BY timestamp ASC, rowid ASC LIMIT ?"
+                ")",
+                (audit_excess,),
+            )
 
     def issue(
         self,
@@ -418,7 +557,8 @@ class CapabilityTokenStore:
         canonical_hash = hashlib.sha256(request.canonical().encode("utf-8")).hexdigest()
         request_id = str(request.request_id)
         row = self.db.execute(
-            "SELECT canonical_hash,response_json,status FROM capability_requests WHERE token_id=? AND request_id=?",
+            "SELECT canonical_hash,response_json,status,action_kind,successful,created_at "
+            "FROM capability_requests WHERE token_id=? AND request_id=?",
             (grant.token_id, request_id),
         ).fetchone()
         if row is not None:
@@ -427,15 +567,32 @@ class CapabilityTokenStore:
                 self.db.commit()
                 raise CapabilityError("request_id_conflict", "request id was already used", status=409)
             if row[2] == "completed" and row[1]:
-                try:
-                    return grant, json.loads(row[1])
-                except json.JSONDecodeError as exc:
-                    raise CapabilityError("internal_error", "stored capability response is unavailable", status=503, retryable=True) from exc
-            raise CapabilityError("request_in_progress", "request is still in progress", status=409, retryable=True)
+                replay_expired = (
+                    row[3] == "status"
+                    and row[4] == 1
+                    and self._parse(str(row[5])) + CAPABILITY_STATUS_REPLAY_WINDOW
+                    <= self.clock().astimezone(timezone.utc)
+                )
+                if replay_expired:
+                    # The primary key makes this a point-row expiry check and
+                    # delete; it does not scan the retention tables.
+                    self.db.execute(
+                        "DELETE FROM capability_requests WHERE token_id=? AND request_id=? "
+                        "AND action_kind='status' AND successful=1 AND status='completed'",
+                        (grant.token_id, request_id),
+                    )
+                else:
+                    try:
+                        return grant, json.loads(row[1])
+                    except json.JSONDecodeError as exc:
+                        raise CapabilityError("internal_error", "stored capability response is unavailable", status=503, retryable=True) from exc
+            else:
+                raise CapabilityError("request_in_progress", "request is still in progress", status=409, retryable=True)
         self._consume_budget(grant, request.action.kind)
         self.db.execute(
-            "INSERT INTO capability_requests(token_id,request_id,canonical_hash,status,created_at) VALUES(?,?,?,?,?)",
-            (grant.token_id, request_id, canonical_hash, "pending", self._iso(self.clock())),
+            "INSERT INTO capability_requests(token_id,request_id,canonical_hash,status,action_kind,created_at) "
+            "VALUES(?,?,?,?,?,?)",
+            (grant.token_id, request_id, canonical_hash, "pending", request.action.kind, self._iso(self.clock())),
         )
         self._audit("request", "accepted", token_id=grant.token_id, audience=grant.audience, detail=f"kind={request.action.kind}")
         self.db.commit()
@@ -448,8 +605,9 @@ class CapabilityTokenStore:
             encoded = json.dumps(response, separators=(",", ":"))
             ok = False
         self.db.execute(
-            "UPDATE capability_requests SET response_json=?,status='completed' WHERE token_id=? AND request_id=? AND status='pending'",
-            (encoded, grant.token_id, str(request.request_id)),
+            "UPDATE capability_requests SET response_json=?,status='completed',successful=? "
+            "WHERE token_id=? AND request_id=? AND status='pending'",
+            (encoded, int(ok), grant.token_id, str(request.request_id)),
         )
         self._audit(
             request.action.kind,
@@ -458,6 +616,7 @@ class CapabilityTokenStore:
             audience=grant.audience,
             detail="completed" if ok else "safe failure",
         )
+        self._prune_status_retention(self.clock().astimezone(timezone.utc))
         self.db.commit()
 
 
@@ -479,7 +638,7 @@ class CapabilityService:
 
     async def _call(self, request: RpcRequest) -> RpcResponse:
         try:
-            parameters = inspect.signature(self.rpc).parameters
+            parameters = signature_parameters(self.rpc)
             value = self.rpc(request) if len(parameters) < 2 else self.rpc(request.actor, request.action)
             if inspect.isawaitable(value):
                 value = await value
@@ -514,9 +673,11 @@ class CapabilityService:
         if (
             target is not None
             and target.slot_owner is CAPABILITY_START_PROFILE
-            and target.state in {ObservedState.STARTING, ObservedState.RUNNING}
+            and target.state is ObservedState.RUNNING
+            and target.health is HealthState.HEALTHY
+            and target.required_ports_ready is True
         ):
-            return {"state": target.state.value, "already_active": True}
+            return {"state": "ready", "already_active": True}
         return None
 
     @staticmethod
@@ -575,6 +736,41 @@ class CapabilityService:
                     status=503,
                     retryable=True,
                 )
+            if target.slot_owner is CAPABILITY_START_PROFILE and target.state is ObservedState.STARTING:
+                waited = await self._call(
+                    RpcRequest(
+                        request_id=uuid4(),
+                        actor=actor,
+                        action=WaitReadiness(
+                            kind="wait_readiness",
+                            profile_id=CAPABILITY_START_PROFILE,
+                            timeout_seconds=CAPABILITY_READINESS_TIMEOUT_SECONDS,
+                        ),
+                    )
+                )
+                if isinstance(waited, RpcFailure):
+                    return self._failure_result(waited)
+                try:
+                    readiness = (
+                        waited.result
+                        if isinstance(waited.result, ReadinessResult)
+                        else ReadinessResult.model_validate(waited.result)
+                    )
+                except ValidationError as exc:
+                    raise CapabilityError(
+                        "upstream_unavailable", "control service readiness is unavailable",
+                        status=503, retryable=True,
+                    ) from exc
+                if readiness.outcome == "success":
+                    return {
+                        "state": "ready",
+                        "readiness_generation": readiness.generation,
+                        "already_active": True,
+                    }
+                raise CapabilityError(
+                    "health_failed", "controller health gate failed",
+                    status=503, retryable=readiness.outcome == "timeout",
+                )
             if target.slot_owner is not None:
                 raise CapabilityError("slot_conflict", "game slot is reserved", status=409)
             action = Start(kind="start", profile_id=CAPABILITY_START_PROFILE)
@@ -605,6 +801,21 @@ class CapabilityService:
         if isinstance(response, RpcFailure):
             return self._failure_result(response)
         result = response.result.model_dump(mode="json") if hasattr(response.result, "model_dump") else response.result
+        if kind == "wake":
+            try:
+                readiness = result.get("readiness")
+                generation = result.get("readiness_generation")
+            except AttributeError as exc:
+                raise CapabilityError(
+                    "upstream_unavailable", "control service readiness is unavailable",
+                    status=503, retryable=True,
+                ) from exc
+            if readiness != "success" or not isinstance(generation, int) or isinstance(generation, bool) or generation < 1:
+                raise CapabilityError(
+                    "upstream_unavailable", "control service readiness is unavailable",
+                    status=503, retryable=True,
+                )
+            return {"state": "ready", "readiness_generation": generation}
         status_snapshot = self._status_snapshot(response)
         if grant.role is CapabilityRole.WAKER and kind == "status":
             if status_snapshot is None:
@@ -654,7 +865,13 @@ __all__ = [
     "CAPABILITY_DEFAULT_TTL",
     "CAPABILITY_DEFAULT_WAKE_COOLDOWN",
     "CAPABILITY_PATH_PREFIX",
+    "CAPABILITY_RETENTION_MAINTENANCE_INTERVAL",
     "CAPABILITY_START_PROFILE",
+    "CAPABILITY_STATUS_AUDIT_GLOBAL_CAP",
+    "CAPABILITY_STATUS_AUDIT_PER_TOKEN_CAP",
+    "CAPABILITY_STATUS_REPLAY_GLOBAL_CAP",
+    "CAPABILITY_STATUS_REPLAY_PER_TOKEN_CAP",
+    "CAPABILITY_STATUS_REPLAY_WINDOW",
     "CapabilityAction",
     "CapabilityAudience",
     "CapabilityError",

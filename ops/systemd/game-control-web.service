@@ -2,16 +2,23 @@
 Description=Helios game control web frontend
 After=game-slotd.service
 Requires=game-slotd.service
+OnFailure=horizon-alert-notify@web.service
 
 [Service]
 Type=simple
 User=gamecontrol
 Group=gamecontrol
 WorkingDirectory=/opt/game-control
-ExecStart=/opt/game-control/.venv/bin/uvicorn --factory game_control.web_main:create_app --host 127.0.0.1 --port 8444 --timeout-graceful-shutdown 5
+Environment=HorizonWebHost=192.0.2.10
+ExecStart=/opt/game-control/.venv/bin/uvicorn --factory game_control.web_main:create_app --host ${HorizonWebHost} --port 8444 --timeout-graceful-shutdown 5
 LoadCredential=proxy-token:/etc/game-control/secrets.d/proxy-token
 Restart=on-failure
 RestartSec=2s
+Slice=horizon.slice
+CPUAccounting=yes
+MemoryAccounting=yes
+IOAccounting=yes
+LogNamespace=horizon
 PrivateTmp=yes
 ProtectSystem=strict
 ProtectHome=yes

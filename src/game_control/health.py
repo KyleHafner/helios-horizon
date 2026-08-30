@@ -4,24 +4,117 @@ from __future__ import annotations
 
 import asyncio
 import inspect
+import math
 import socket
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Awaitable, Callable, Mapping
+from enum import StrEnum
 
 import psutil
 
 from .adapters.base import AdapterError
+from .introspection import signature_parameters
 from .models import AdapterKind, HealthState, ProfileId
 
 _MAX_READY_BYTES = 256 * 1024
+_OBSERVATION_UNSET = object()
 _PASSIVE_PUBLIC_PROBE_PROFILES = frozenset(
     {
         ProfileId.TERRARIA_VANILLA,
         ProfileId.TERRARIA_TMOD,
     }
 )
+
+
+class ReadinessOutcome(StrEnum):
+    SUCCESS = "success"
+    FAILURE = "failure"
+    TIMEOUT = "timeout"
+
+
+@dataclass(frozen=True, slots=True)
+class ReadinessTicket:
+    profile_id: str
+    generation: int
+
+
+@dataclass(slots=True)
+class _ReadinessEntry:
+    event: asyncio.Event
+    outcome: ReadinessOutcome | None = None
+    active: bool = True
+
+
+class ReadinessCoordinator:
+    """One bounded asyncio notification slot per internally started profile."""
+
+    def __init__(self) -> None:
+        self._entries: dict[str, tuple[int, _ReadinessEntry]] = {}
+        self._generation = 0
+        self._counts = {outcome: 0 for outcome in ReadinessOutcome}
+
+    @staticmethod
+    def _profile_key(profile_id: Any) -> str:
+        value = getattr(profile_id, "value", profile_id)
+        if not isinstance(value, str) or not value or len(value) > 128:
+            raise ValueError("invalid readiness profile")
+        return value
+
+    def begin(self, profile_id: Any) -> ReadinessTicket:
+        key = self._profile_key(profile_id)
+        self._generation += 1
+        ticket = ReadinessTicket(key, self._generation)
+        self._entries[key] = (ticket.generation, _ReadinessEntry(asyncio.Event()))
+        return ticket
+
+    def notify(self, ticket: ReadinessTicket, outcome: ReadinessOutcome) -> bool:
+        entry = self._entries.get(ticket.profile_id)
+        if entry is None or entry[0] != ticket.generation or entry[1].outcome is not None:
+            return False
+        entry[1].outcome = ReadinessOutcome(outcome)
+        self._counts[entry[1].outcome] += 1
+        entry[1].event.set()
+        return True
+
+    def latest(self, profile_id: Any, *, generation: int | None = None) -> ReadinessTicket:
+        key = self._profile_key(profile_id)
+        entry = self._entries.get(key)
+        if entry is None:
+            raise RuntimeError("readiness notification is unavailable")
+        if generation is not None and (isinstance(generation, bool) or generation != entry[0]):
+            raise RuntimeError("readiness generation is stale")
+        return ReadinessTicket(key, entry[0])
+
+    async def wait(self, ticket: ReadinessTicket, *, timeout: float) -> ReadinessOutcome:
+        if isinstance(timeout, bool) or not isinstance(timeout, (int, float)) or not math.isfinite(timeout) or not 0 < timeout <= 900:
+            raise ValueError("invalid readiness timeout")
+        entry = self._entries.get(ticket.profile_id)
+        if entry is None or entry[0] != ticket.generation:
+            raise RuntimeError("readiness ticket is no longer active")
+        try:
+            await asyncio.wait_for(entry[1].event.wait(), timeout=float(timeout))
+        except asyncio.TimeoutError:
+            if entry[1].outcome is None:
+                self._counts[ReadinessOutcome.TIMEOUT] += 1
+            raise
+        if entry[1].outcome is None:
+            raise RuntimeError("readiness notification is unavailable")
+        return entry[1].outcome
+
+    def finish(self, ticket: ReadinessTicket) -> None:
+        entry = self._entries.get(ticket.profile_id)
+        if entry is not None and entry[0] == ticket.generation:
+            entry[1].active = False
+
+    def health(self) -> dict[str, int]:
+        return {
+            "active": sum(1 for _generation, entry in self._entries.values() if entry.active),
+            "success": self._counts[ReadinessOutcome.SUCCESS],
+            "failure": self._counts[ReadinessOutcome.FAILURE],
+            "timeout": self._counts[ReadinessOutcome.TIMEOUT],
+        }
 
 
 def _uses_passive_public_probe(profile: Any) -> bool:
@@ -94,17 +187,23 @@ class HealthChecker:
         self.public_probe = public_probe
         self.process_checker = process_checker or process_validator
         self.a2s_checker = a2s_checker
+        # One successful marker per profile/process activation. A changed
+        # started_at, pattern, or log path invalidates the entry naturally.
+        self._ready_success: dict[str, tuple[str, str, tuple[str, ...]]] = {}
 
     async def check(
         self,
         profile: Any,
         *,
+        observation: Any = _OBSERVATION_UNSET,
         connections: Mapping[str, list[Any]] | None = None,
+        process_metrics: Any | None = None,
     ) -> HealthResult:
-        try:
-            observation = await self._observe(profile)
-        except (AdapterError, RuntimeError):
-            return HealthResult(state=HealthState.UNKNOWN, process_alive=False)
+        if observation is _OBSERVATION_UNSET:
+            try:
+                observation = await self._observe(profile)
+            except (AdapterError, RuntimeError):
+                return HealthResult(state=HealthState.UNKNOWN, process_alive=False)
         # Adapter ``running`` is not a process identity proof (Crafty can be
         # alive while its controller Python process is the only process).
         process_alive = False
@@ -113,7 +212,11 @@ class HealthChecker:
             try:
                 process_alive = bool(
                     self._call_with_connections(
-                        self.process_checker, profile, observation, connections=connections
+                        self.process_checker,
+                        profile,
+                        observation,
+                        connections=connections,
+                        process_metrics=process_metrics,
                     )
                 )
             except (OSError, ValueError, TypeError):
@@ -185,17 +288,26 @@ class HealthChecker:
         )
 
     @staticmethod
-    def _call_with_connections(function: Callable[..., Any], *args: Any, connections: Any) -> Any:
+    def _call_with_connections(
+        function: Callable[..., Any],
+        *args: Any,
+        connections: Any,
+        process_metrics: Any | None = None,
+    ) -> Any:
         try:
-            parameters = inspect.signature(function).parameters.values()
+            parameters = signature_parameters(function)
             accepts_kwargs = any(parameter.kind is inspect.Parameter.VAR_KEYWORD for parameter in parameters)
             supported = {parameter.name for parameter in parameters}
         except (TypeError, ValueError):
             accepts_kwargs = True
             supported = set()
-        if accepts_kwargs or "connections" in supported:
-            return function(*args, connections=connections)
-        return function(*args)
+        optional = {"connections": connections}
+        if process_metrics is not None:
+            optional["process_metrics"] = process_metrics
+        filtered = optional if accepts_kwargs else {
+            key: value for key, value in optional.items() if key in supported
+        }
+        return function(*args, **filtered)
 
     async def _observe(self, profile: Any) -> Any:
         if self.adapter is None:
@@ -211,6 +323,14 @@ class HealthChecker:
         paths = getattr(getattr(profile, "paths", None), "log_files", ())
         if not paths:
             return None
+        raw_profile_id = getattr(getattr(profile, "id", None), "value", getattr(profile, "id", None))
+        cache_key: str | None = None
+        cache_value: tuple[str, str, tuple[str, ...]] | None = None
+        if isinstance(raw_profile_id, str) and isinstance(started_at, datetime):
+            cache_key = raw_profile_id
+            cache_value = (started_at.isoformat(), str(spec), tuple(str(path) for path in paths))
+            if self._ready_success.get(cache_key) == cache_value:
+                return True
         for raw_path in paths:
             path = Path(raw_path)
             try:
@@ -241,6 +361,8 @@ class HealthChecker:
                                 continue
                         except (AttributeError, TypeError, ValueError):
                             continue
+                    if cache_key is not None and cache_value is not None:
+                        self._ready_success[cache_key] = cache_value
                     return True
             except (OSError, UnicodeError):
                 continue

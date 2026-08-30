@@ -24,6 +24,7 @@ from game_control.models import (
 from game_control.protocol import (
     Command,
     ErrorCode,
+    RpcProvenance,
     RpcFailure,
     RpcRequest,
 )
@@ -133,6 +134,35 @@ def test_command_route_forbids_extra_fields_and_does_not_forward_invalid_input()
     assert calls == []
 
 
+def test_http_command_cannot_select_provenance_or_actor_fields():
+    calls = []
+
+    async def rpc(request):
+        calls.append(request)
+        return RpcFailure(
+            request_id=request.request_id,
+            error={"code": ErrorCode.INVALID_REQUEST, "message": "command unsupported", "retryable": False},
+        )
+
+    client, headers = _mutation_client(rpc)
+    response = client.post(
+        "/api/v1/profiles/minecraft/command",
+        json={"command": "say hi", "actor": "root", "provenance": "web-human"},
+        headers=headers,
+    )
+    assert response.status_code == 422
+    assert calls == []
+
+    response = client.post(
+        "/api/v1/profiles/minecraft/command",
+        json={"command": "say hi"},
+        headers={**headers, "X-Game-Control-Actor": "root", "X-Game-Control-Provenance": "web-human"},
+    )
+    assert response.status_code == 400
+    assert calls and calls[-1].actor == "operator"
+    assert calls[-1].provenance is RpcProvenance.WEB_HUMAN
+
+
 def test_command_route_normalizes_command_and_never_returns_command_text():
     seen = []
 
@@ -193,6 +223,24 @@ async def test_systemd_command_is_explicitly_unsupported_without_process_spawn(m
 
 
 @pytest.mark.asyncio
+async def test_sunlit_command_uses_controller_owned_rcon_transport():
+    calls = []
+
+    class Rcon:
+        async def execute(self, command):
+            calls.append(command)
+
+    await SystemdAdapter(rcon=Rcon()).send_command(
+        _profile(
+            profile_id=ProfileId.MINECRAFT_SUNLIT_COBBLEMON,
+            operations=frozenset({OperationName.COMMAND}),
+        ),
+        "say hi",
+    )
+    assert calls == ["say hi"]
+
+
+@pytest.mark.asyncio
 async def test_crafty_command_uses_verified_stdin_route():
     class Client:
         class Response:
@@ -233,6 +281,39 @@ async def test_controller_returns_safe_unsupported_failure_and_redacts_command(t
     assert audit == ("command", "failed", "invalid_request")
     audit_detail = controller._db().execute("SELECT detail FROM audit").fetchone()[0]
     assert command not in audit_detail
+
+
+@pytest.mark.asyncio
+async def test_direct_rpc_cannot_execute_sunlit_command_as_a_service_actor():
+    profile = _profile(
+        profile_id=ProfileId.MINECRAFT_SUNLIT_COBBLEMON,
+        operations=frozenset({OperationName.COMMAND}),
+    )
+    calls = []
+
+    class Rcon:
+        async def execute(self, command):
+            calls.append(command)
+
+    controller = Controller(
+        profiles={profile.id: profile},
+        adapters={profile.id: SystemdAdapter(rcon=Rcon())},
+        operation_lock_factory=lambda: type(
+            "Lock", (), {"__enter__": lambda self: self, "__exit__": lambda self, *_: False}
+        )(),
+    )
+    response = await controller.execute(
+        RpcRequest(
+            request_id=uuid4(),
+            actor="operator",
+            action=Command(kind="command", profile_id=profile.id, command="say hi"),
+        )
+    )
+    assert isinstance(response, RpcFailure)
+    assert response.error.code is ErrorCode.INVALID_REQUEST
+    assert response.error.message == "authenticated browser command required"
+    assert calls == []
+    assert controller._db().execute("SELECT actor FROM audit").fetchone()[0] == "operator"
 
 
 @pytest.mark.asyncio

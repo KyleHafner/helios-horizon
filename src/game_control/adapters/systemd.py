@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import re
 import time
 from collections import deque
 from datetime import datetime, timedelta, timezone
@@ -21,10 +22,28 @@ _CONSOLE_COMMAND_HELPER = "/usr/local/libexec/game-console-command"
 _CONSOLE_PROFILES = frozenset(
     {"pz-rising", "terraria-vanilla", "terraria-tmod", "terraria-tmod-145-candidate"}
 )
+_RCON_PROFILE = "minecraft-sunlit-cobblemon"
+_RCON_LIST_RESPONSE = re.compile(
+    r"\AThere are (?P<count>\d{1,5}) of a max of (?P<maximum>\d{1,5}) players online:?"
+    r"(?: (?P<names>.*))?\Z"
+)
+_MINECRAFT_PLAYER_NAME = re.compile(r"\A[A-Za-z0-9_]{1,16}\Z")
+
+
+def _systemd_fields(payload: bytes) -> dict[str, str]:
+    fields: dict[str, str] = {}
+    for line in payload.decode("utf-8", "replace").splitlines():
+        key, separator, value = line.partition("=")
+        if separator:
+            fields[key] = value.strip()
+    return fields
 
 
 class SystemdAdapter:
     """Fixed argv-only systemd/journalctl adapter."""
+
+    def __init__(self, *, rcon: Any | None = None):
+        self.rcon = rcon
 
     def command(self, operation: str, profile: Profile) -> tuple[str, ...]:
         unit = self._unit(profile)
@@ -34,6 +53,15 @@ class SystemdAdapter:
             return ("/usr/bin/systemctl", "stop", unit)
         if operation in {"kill", "force_stop"}:
             return ("/usr/bin/systemctl", "kill", "-s", "SIGKILL", unit)
+        if operation == "reset_failed":
+            return ("/usr/bin/systemctl", "reset-failed", unit)
+        if operation == "settle_state":
+            return (
+                "/usr/bin/systemctl",
+                "show",
+                unit,
+                "--property=ActiveState,SubState,Job",
+            )
         if operation == "observe":
             return (
                 "/usr/bin/systemctl",
@@ -44,6 +72,7 @@ class SystemdAdapter:
         if operation == "logs":
             return (
                 "/usr/bin/journalctl",
+                "--namespace=horizon",
                 "-u",
                 unit,
                 "--no-pager",
@@ -123,9 +152,45 @@ class SystemdAdapter:
         )
         if code:
             raise AdapterError("systemd force stop failed", retryable=False, returncode=code)
+        # ``kill`` returns before ExecStopPost has necessarily completed.  Do
+        # not use AdapterObservation.running here: it is already false while a
+        # unit is deactivating, which allowed reset-failed to race the final
+        # stop result and leave the unit failed afterward.
+        deadline = time.monotonic() + min(float(profile.stop_timeout_seconds), 15.0)
+        while time.monotonic() < deadline:
+            if await self._stop_job_settled(profile):
+                break
+            await asyncio.sleep(0.1)
+        else:
+            raise AdapterError("systemd force stop did not settle", retryable=False)
+        code, _, _ = await self._run(self.command("reset_failed", profile))
+        if code:
+            raise AdapterError("systemd force stop cleanup failed", retryable=False, returncode=code)
+        if not await self._stop_job_settled(profile, require_inactive=True):
+            raise AdapterError("systemd force stop cleanup did not settle", retryable=False)
+
+    async def _stop_job_settled(self, profile: Profile, *, require_inactive: bool = False) -> bool:
+        code, stdout, _ = await self._run(self.command("settle_state", profile))
+        if code:
+            return False
+        fields = _systemd_fields(stdout)
+        active = fields.get("ActiveState", "")
+        job = fields.get("Job", "")
+        allowed = {"inactive"} if require_inactive else {"inactive", "failed"}
+        return active in allowed and not job
 
     async def send_command(self, profile: Profile, command: str) -> None:
         profile_id = str(profile.id)
+        if profile_id == _RCON_PROFILE:
+            if self.rcon is None:
+                raise AdapterError("systemd command unsupported", retryable=False)
+            try:
+                await self.rcon.execute(command)
+            except Exception as exc:
+                # The transport owns credential and endpoint redaction. Keep
+                # adapter failures equally opaque to the controller/audit/UI.
+                raise AdapterError("RCON command failed", retryable=True) from exc
+            return
         if (
             profile.adapter is not AdapterKind.SYSTEMD
             or profile_id not in _CONSOLE_PROFILES
@@ -151,11 +216,7 @@ class SystemdAdapter:
         code, stdout, _ = await self._run(self.command("observe", profile))
         if code:
             return AdapterObservation(running=False, healthy=False)
-        fields = {}
-        for line in stdout.decode("utf-8", "replace").splitlines():
-            key, separator, value = line.partition("=")
-            if separator:
-                fields[key] = value.strip()
+        fields = _systemd_fields(stdout)
         active = fields.get("ActiveState", "")
         substate = fields.get("SubState", "")
         pid = _parse_pid(fields.get("MainPID", ""))
@@ -163,7 +224,26 @@ class SystemdAdapter:
         started_at = _parse_started_at(fields.get("ExecMainStartTimestamp", ""))
         if started_at is None:
             started_at = _parse_monotonic_started_at(fields.get("ExecMainStartTimestampMonotonic", ""))
-        return AdapterObservation(running=running, healthy=running, pid=pid, started_at=started_at)
+        players_online = None
+        player_names = None
+        profile_id = getattr(profile.id, "value", str(profile.id))
+        if running and profile_id == _RCON_PROFILE and self.rcon is not None:
+            try:
+                parsed_players = _parse_rcon_player_list(await self.rcon.execute("list"))
+                if parsed_players is not None:
+                    players_online, player_names = parsed_players
+            except Exception:
+                # Unknown must remain fail-closed for stop/switch fencing.
+                players_online = None
+                player_names = None
+        return AdapterObservation(
+            running=running,
+            healthy=running,
+            pid=pid,
+            started_at=started_at,
+            players_online=players_online,
+            player_names=player_names,
+        )
 
     async def recent_logs(
         self,
@@ -179,7 +259,13 @@ class SystemdAdapter:
             if value is not None:
                 if value.tzinfo is None or value.utcoffset() is None:
                     raise AdapterError("log range must be timezone-aware", retryable=False)
-                argv += (flag, value.astimezone(timezone.utc).strftime("%Y-%m-%d %H:%M:%S"))
+                # journalctl treats a timezone-less timestamp as local time.
+                # Keep the normalized UTC value explicit so hosts in a DST
+                # timezone do not shift incremental log windows.
+                argv += (
+                    flag,
+                    value.astimezone(timezone.utc).strftime("%Y-%m-%d %H:%M:%S.%f UTC"),
+                )
         code, stdout, _ = await self._run(argv + ("-n", str(bounded)))
         if code:
             raise AdapterError("journal read failed")
@@ -219,6 +305,34 @@ def _parse_pid(value: str) -> int | None:
     return pid if pid > 0 else None
 
 
+def _parse_rcon_player_count(value: Any) -> int | None:
+    parsed = _parse_rcon_player_list(value)
+    return parsed[0] if parsed is not None else None
+
+
+def _parse_rcon_player_list(value: Any) -> tuple[int, tuple[str, ...] | None] | None:
+    if not isinstance(value, str) or not value or len(value) > 8192:
+        return None
+    match = _RCON_LIST_RESPONSE.fullmatch(value.strip())
+    if match is None:
+        return None
+    count = int(match.group("count"))
+    maximum = int(match.group("maximum"))
+    if maximum > 10_000 or count > maximum:
+        return None
+    raw_names = (match.group("names") or "").strip()
+    if not raw_names:
+        return count, () if count == 0 else None
+    names = tuple(name.strip() for name in raw_names.split(","))
+    if (
+        len(names) != count
+        or len(set(names)) != len(names)
+        or any(_MINECRAFT_PLAYER_NAME.fullmatch(name) is None for name in names)
+    ):
+        return count, None
+    return count, names
+
+
 def _parse_started_at(value: str) -> datetime | None:
     value = value.strip()
     if not value or value in {"n/a", "0"}:
@@ -229,6 +343,8 @@ def _parse_started_at(value: str) -> datetime | None:
         for fmt in ("%a %Y-%m-%d %H:%M:%S %Z", "%a %Y-%m-%d %H:%M:%S %z"):
             try:
                 parsed = datetime.strptime(value, fmt)
+                if fmt.endswith("%Z"):
+                    parsed = parsed.astimezone()
                 break
             except ValueError:
                 continue

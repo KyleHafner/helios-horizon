@@ -55,6 +55,15 @@ class SessionStore:
             self._persist_events(events, source="log")
         self._last_counts.pop(str(profile_id), None)
 
+    def maintain(self, *, now: str) -> None:
+        """Run bounded retention maintenance independently of player samples."""
+        try:
+            current_time = _parse_timestamp(now)
+        except ValueError:
+            return
+        with self.connection:
+            self._maintenance(now, current_time)
+
     def recover(self, *, now: str) -> int:
         with self.connection:
             cursor = self.connection.execute(
@@ -100,6 +109,7 @@ class SessionStore:
         ).total_seconds() < 3600:
             return
         state_db.prune_metric_samples(self.connection, now=now)
+        state_db.prune_completed_rpc_idempotency(self.connection, now=now)
         self._last_prune = current_time
 
 

@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import ipaddress
 from enum import StrEnum
 from pathlib import Path
 from typing import Literal
@@ -79,6 +78,10 @@ class NotificationEvent(StrEnum):
     UPDATE_COMPLETE = "update_complete"
     UPDATE_FAILURE = "update_failure"
     IDLE_STOP = "idle_stop"
+    SUSTAINED_MSPT = "sustained_mspt"
+    MEMORY_GROWTH = "memory_growth"
+    WAKE_SLO = "wake_slo"
+    BENCHMARK_REGRESSION = "benchmark_regression"
 
 
 class StrictFrozenModel(BaseModel):
@@ -146,8 +149,48 @@ class PublicEndpointSpec(StrictFrozenModel):
     relay_unit: str = Field(pattern=r"^[a-z0-9@_.-]+\.service$")
 
 
+class CuratedModpackSpec(StrictFrozenModel):
+    """Pinned identity and filesystem boundary for one reviewed modpack release."""
+
+    version: str = Field(pattern=r"^[A-Za-z0-9][A-Za-z0-9_.+-]{0,127}$")
+    project_id: int = Field(ge=1)
+    file_id: int = Field(ge=1)
+    size_bytes: int = Field(ge=1, le=4 * 1024 * 1024 * 1024)
+    manifest_path: Path
+    release_root: Path
+    state_root: Path
+    active_link: Path
+
+    @field_validator("manifest_path", "release_root", "state_root", "active_link")
+    @classmethod
+    def normalized_absolute_modpack_paths(cls, value: Path) -> Path:
+        if not value.is_absolute() or ".." in value.parts:
+            raise ValueError("curated modpack paths must be normalized and absolute")
+        return value
+
+    @model_validator(mode="after")
+    def roots_are_separate(self):
+        if self.release_root == self.state_root:
+            raise ValueError("curated release and state roots must be separate")
+        if self.release_root in self.state_root.parents or self.state_root in self.release_root.parents:
+            raise ValueError("curated release and state roots must not overlap")
+        if (
+            self.active_link == self.release_root
+            or self.active_link in self.release_root.parents
+            or self.release_root in self.active_link.parents
+        ):
+            raise ValueError("curated active link must be outside the release root")
+        if (
+            self.active_link == self.state_root
+            or self.active_link in self.state_root.parents
+            or self.state_root in self.active_link.parents
+        ):
+            raise ValueError("curated active link must be outside the state root")
+        return self
+
+
 class UpdateSpec(StrictFrozenModel):
-    kind: Literal["manual", "steamcmd_in_place", "release_symlink"]
+    kind: Literal["manual", "steamcmd_in_place", "release_symlink", "curated_modpack"]
     app_id: int | None = Field(default=None, ge=1)
     beta: str | None = Field(default=None, pattern=r"^[A-Za-z0-9_.-]{1,32}$")
     download_url: AnyHttpUrl | None = None
@@ -155,17 +198,12 @@ class UpdateSpec(StrictFrozenModel):
         default=None, pattern=r"^[A-Za-z0-9_.-][A-Za-z0-9_./-]{0,255}$"
     )
     version_command: tuple[str, ...] = ()
+    # Optional until a release artifact digest is acquired and reviewed.
+    sha256: str | None = Field(default=None, pattern=r"^[0-9a-fA-F]{64}$")
+    curated: CuratedModpackSpec | None = None
 
     @model_validator(mode="after")
     def fields_match_kind(self):
-        if self.download_url is not None and self.download_url.scheme == "http":
-            host = self.download_url.host
-            try:
-                local_http = ipaddress.ip_address(host).is_loopback
-            except ValueError:
-                local_http = host.lower() == "localhost"
-            if not local_http:
-                raise ValueError("release update URLs require HTTPS")
         if self.kind == "manual" and any(
             (
                 self.app_id,
@@ -173,17 +211,34 @@ class UpdateSpec(StrictFrozenModel):
                 self.download_url,
                 self.executable_relative_path,
                 self.version_command,
+                self.sha256,
+                self.curated,
             )
         ):
             raise ValueError("manual update has no executable fields")
         if self.kind == "steamcmd_in_place" and (
-            self.app_id is None or self.download_url is not None
+            self.app_id is None
+            or self.download_url is not None
+            or self.sha256 is not None
+            or self.curated is not None
         ):
-            raise ValueError("steamcmd update requires app_id and no URL")
+            raise ValueError("steamcmd update requires app_id, no URL, and no trusted digest")
         if self.kind == "release_symlink" and (
-            self.download_url is None or self.executable_relative_path is None
+            self.download_url is None
+            or self.executable_relative_path is None
+            or self.curated is not None
         ):
             raise ValueError("release update requires fixed URL and executable")
+        if self.kind == "curated_modpack" and (
+            self.download_url is None
+            or self.sha256 is None
+            or self.curated is None
+            or self.app_id is not None
+            or self.beta is not None
+            or self.executable_relative_path is not None
+            or self.version_command
+        ):
+            raise ValueError("curated modpack update requires fixed artifact and layout metadata")
         return self
 
 
@@ -216,6 +271,12 @@ class Profile(StrictFrozenModel):
             raise ValueError("systemd profile requires only systemd_unit")
         if OperationName.UPDATE_APPLY in self.operations and self.update.kind == "manual":
             raise ValueError("manual profile cannot apply updates")
+        if (
+            OperationName.UPDATE_APPLY in self.operations
+            and self.update.kind in {"release_symlink", "curated_modpack"}
+            and self.update.sha256 is None
+        ):
+            raise ValueError("release profile cannot apply updates without a trusted sha256")
         if 0 < self.idle_stop_minutes < 5:
             raise ValueError("idle_stop_minutes must be 0 or between 5 and 1440")
         return self

@@ -32,7 +32,7 @@
           <div class="nav-group system-group">
             <p class="nav-group-label">system</p>
             <a class="nav-item" href="#/backups" data-view="backups"><span>Backups</span></a>
-            <a class="nav-item" href="#/events" data-view="events"><span>Events</span></a>
+            <a class="nav-item" href="#/events" data-view="events"><span>Incidents</span></a>
             <a class="nav-item" href="#/audit" data-view="audit"><span>Audit</span></a>
             <button class="nav-item" id="settings-nav" type="button" data-view="settings"><span>Settings</span></button>
           </div>
@@ -43,32 +43,68 @@
 
       <main id="main-content" class="main-pane">
         <button class="menu-toggle" id="menu-toggle" type="button" aria-label="Open navigation" aria-controls="sidebar" aria-expanded="false">☰</button>
-        <button class="palette-trigger" id="palette-trigger" type="button" aria-haspopup="dialog" aria-controls="command-palette" aria-keyshortcuts="Control+K Meta+K"><span>Command palette</span><kbd>⌘K</kbd></button>
+        <button class="palette-trigger" id="palette-trigger" type="button" aria-label="Command palette" aria-haspopup="dialog" aria-controls="command-palette" aria-keyshortcuts="Control+K Meta+K"><span>Commands</span><kbd>⌘K</kbd></button>
         <div class="view" id="dashboard-view">
       <section class="page-intro" aria-labelledby="page-title">
         <div>
           <h1 id="page-title">Dashboard</h1>
         </div>
         <div class="intro-actions">
-          <p class="section-meta"><span id="last-updated">Awaiting status</span> <span id="conn-state" class="conn-pill" data-state="live">Live</span></p><button class="button button-quiet" id="retry-load" type="button" hidden>Retry load</button>
+          <p class="section-meta"><span id="last-updated">Awaiting status</span> <span id="conn-state" class="conn-pill" data-state="live" aria-live="polite">Live</span></p><button class="button button-quiet" id="retry-load" type="button" hidden>Retry load</button>
           <button class="button button-primary" type="button" id="switch-active" aria-haspopup="dialog">Switch server…</button>
         </div>
       </section>
 
-      <section class="active-slot is-empty" id="active-slot" aria-labelledby="active-slot-title" data-slot-strip>
-        <div class="slot-mark" aria-hidden="true"></div>
-        <div class="slot-copy">
-          <p class="eyebrow">active slot</p>
-          <h2 id="active-slot-title">Nothing is running</h2>
-          <p id="active-slot-summary" aria-live="polite"></p>
-          <p class="automation-summary" id="automation-summary"><span class="automation-summary-label">Automation</span><span class="automation-summary-value" id="automation-summary-text">No scheduled switches</span></p>
-          <a class="manage-link active-manage" id="active-manage" href="#/servers/minecraft/console">Manage →</a>
+      <section class="active-slot session-deck is-empty" id="active-slot" aria-labelledby="active-slot-title" data-slot-strip>
+        <div class="slot-mark session-signal" aria-hidden="true"></div>
+        <div class="session-heading">
+          <div class="slot-copy">
+            <p class="eyebrow">current session</p>
+            <h2 id="active-slot-title">Finding your game…</h2>
+            <p class="session-state-copy" id="active-slot-summary">Horizon is checking the active slot.</p>
+          </div>
+          <div class="session-primary-actions">
+            <button class="button button-primary session-primary" id="session-primary" type="button" disabled>Checking status…</button>
+            <a class="button button-quiet manage-link active-manage" id="active-manage" href="#/servers/minecraft/console">Open console</a>
+          </div>
         </div>
-        <dl class="slot-metrics">
-          <div><dt>Players</dt><dd id="active-players">—</dd></div>
-          <div><dt>Uptime</dt><dd id="active-uptime">—</dd></div>
-          <div><dt>Health</dt><dd id="active-health">—</dd></div>
-        </dl>
+        <p class="session-operation" id="session-operation" role="status" aria-live="polite" hidden></p>
+        <p class="session-readiness-summary" id="session-readiness-summary">Readiness: waiting for status</p>
+        <ol class="session-runway" id="session-runway" aria-label="Server readiness">
+          <li data-session-phase="request" data-state="waiting"><span class="runway-mark" aria-hidden="true"></span><strong>Request</strong><small>waiting</small></li>
+          <li data-session-phase="process" data-state="waiting"><span class="runway-mark" aria-hidden="true"></span><strong>Process</strong><small>waiting</small></li>
+          <li data-session-phase="port" data-state="waiting"><span class="runway-mark" aria-hidden="true"></span><strong>Game port</strong><small>waiting</small></li>
+          <li data-session-phase="ready" data-state="waiting"><span class="runway-mark" aria-hidden="true"></span><strong>Ready</strong><small>waiting</small></li>
+        </ol>
+        <div class="session-facts">
+          <div class="session-endpoint">
+            <span class="eyebrow">join</span>
+            <code id="session-endpoint">Unavailable</code>
+            <button class="button button-small button-quiet" id="session-copy-endpoint" type="button" disabled>Copy</button>
+          </div>
+          <dl class="slot-metrics">
+            <div><dt>Players</dt><dd id="active-players">—</dd></div>
+            <div><dt>Uptime</dt><dd id="active-uptime">—</dd></div>
+            <div><dt>Health</dt><dd id="active-health">—</dd></div>
+            <div><dt>Latest backup</dt><dd id="session-backup">Checking…</dd></div>
+            <div><dt>Next automation</dt><dd id="session-automation">Checking…</dd></div>
+          </dl>
+        </div>
+        <nav class="session-shortcuts" aria-label="Session shortcuts">
+          <a id="session-activity-link" href="#/servers/minecraft/stats">Player activity</a>
+          <a id="session-backups-link" href="#/servers/minecraft/backups">Backups</a>
+          <a href="#/events">Recent events</a>
+          <a href="#/audit">Audit trail</a>
+        </nav>
+      </section>
+
+      <section class="incident-center incident-center-compact" aria-labelledby="incident-center-title">
+        <div class="incident-heading">
+          <div><p class="eyebrow">operator signal</p><h2 id="incident-center-title">Recent incidents</h2></div>
+          <a class="incident-link" href="#/events">Open incident history</a>
+        </div>
+        <p class="incident-summary" id="incident-summary" role="status" aria-live="polite">Checking the controller record…</p>
+        <ol class="incident-rail" id="incident-list-compact" aria-busy="true"><li class="incident-empty">Loading recent failures…</li></ol>
       </section>
 
       <section class="content-grid" aria-labelledby="servers-title">
@@ -150,37 +186,42 @@
               </section>
               <section class="detail-panel stats-panel" id="panel-stats" role="tabpanel" aria-labelledby="tab-stats" tabindex="0" hidden>
                 <div class="stats-heading">
-                  <div><p class="eyebrow">Player activity</p><h2>Session ledger</h2><p class="stats-scope-copy" id="stats-scope-copy" aria-live="polite">Server state is changing or unavailable. Historical observations remain available.</p></div>
-                </div>
-                <div class="stats-summary" id="stats-summary" role="group" aria-label="Player record summary">
-                  <div><span>Player-hours</span><strong id="stats-total-hours">—</strong><span>Players observed</span><strong id="stats-unique-players">—</strong></div>
+                  <div><p class="eyebrow">Flight recorder</p><h2>Is the server slow, and why?</h2><p class="stats-note">Tick health, resource pressure, and maintenance on one clock.</p></div>
+                  <div class="recorder-controls">
+                    <label class="stats-window">Window <select id="stats-window"><option value="1h">1 hour</option><option value="6h" selected>6 hours</option><option value="24h">24 hours</option><option value="7d">7 days</option><option value="30d">30 days</option></select></label>
+                    <label class="stats-window">Detail <select id="stats-resolution"><option value="auto" selected>Automatic</option><option value="raw">Raw</option><option value="1m">1 minute</option><option value="5m">5 minutes</option><option value="1h">1 hour</option></select></label>
+                    <label class="stats-window">Compare <select id="stats-comparison"><option value="none" selected>None</option><option value="yesterday" disabled>Yesterday unavailable</option><option value="restart" disabled>Restart comparison unavailable</option><option value="preset" disabled>Preset comparison unavailable</option><option value="previous" disabled>Previous run unavailable</option></select></label>
+                  </div>
                 </div>
                 <div class="stats-sections">
+                  <section class="stats-block stats-tps-block flight-recorder" aria-labelledby="stats-tps-title" aria-busy="true">
+                    <div class="recorder-live-strip">
+                      <div class="recorder-state"><span class="recorder-state-light" aria-hidden="true"></span><div><span>Tick signal</span><strong id="stats-live-state" role="status" aria-live="polite">Checking</strong></div></div>
+                      <div><span>TPS</span><strong id="stats-tps-current">—</strong></div>
+                      <div><span>MSPT</span><strong id="stats-mspt-current">—</strong></div>
+                      <div><span>Active / wall clock</span><strong id="stats-runtime-current">—</strong></div>
+                    </div>
+                    <div class="stats-block-heading"><div><h3 id="stats-tps-title">Server flight recorder</h3><p class="stats-note" id="stats-tps-note">Loading bounded telemetry…</p><p class="stats-note recorder-comparison-note" id="stats-comparison-note" role="status" aria-live="polite">No comparison selected.</p></div><span class="recorder-resolution" id="stats-effective-resolution">—</span></div>
+                    <div class="recorder-canvas-wrap">
+                      <canvas id="stats-tps-chart" class="stats-tps-chart" width="1040" height="440" role="img" aria-label="Server flight recorder. A table containing the same values follows."></canvas>
+                    </div>
+                    <ul class="stats-chart-legend" aria-label="Chart legend"><li class="chart-legend-tps">TPS</li><li class="chart-legend-mspt">MSPT</li><li class="chart-legend-resource">CPU / RSS pressure</li><li class="chart-legend-job">GC pause and backup / update / benchmark windows</li><li class="chart-legend-comparison">Selected comparison</li><li class="chart-legend-offline">Server stopped</li></ul>
+                    <details class="recorder-table-disclosure"><summary>Read recorder as a table</summary><div class="stats-table-wrap" tabindex="0"><table class="stats-table recorder-table"><caption>Bounded server telemetry samples</caption><thead><tr><th scope="col">Time</th><th scope="col">State</th><th scope="col">TPS</th><th scope="col">MSPT</th><th scope="col">Cause</th></tr></thead><tbody id="stats-recorder-table"><tr><td class="empty-state" colspan="5">No telemetry loaded yet.</td></tr></tbody></table></div></details>
+                  </section>
+                  <div class="stats-summary" id="stats-summary">
+                    <div><span>Total player-hours</span><strong id="stats-total-hours">—</strong></div>
+                    <div><span>Unique players</span><strong id="stats-unique-players">—</strong></div>
+                  </div>
                   <section class="stats-block" aria-labelledby="stats-leaderboard-title">
-                    <div class="stats-block-heading"><div><h3 id="stats-leaderboard-title">Player record</h3><span class="section-meta">Last 90 days</span></div><span class="section-meta" id="stats-leaderboard-meta">—</span></div>
-                    <p class="stats-status" id="stats-summary-status" aria-live="polite"></p>
-                    <h4 class="stats-subheading">Players and sessions</h4>
-                    <div class="stats-table-wrap" tabindex="0" aria-label="Players and sessions table"><table class="stats-table"><thead><tr><th scope="col">Player</th><th scope="col">Play time</th><th scope="col">Sessions</th><th scope="col">Last observed</th></tr></thead><tbody id="stats-leaderboard"><tr><td class="empty-state" colspan="4">No player activity recorded in the last 90 days.</td></tr></tbody></table></div>
+                    <div class="stats-block-heading"><h3 id="stats-leaderboard-title">Leaderboard</h3><span class="section-meta" id="stats-leaderboard-meta">—</span></div>
+                    <div class="stats-table-wrap"><table class="stats-table"><thead><tr><th scope="col">Player</th><th scope="col">Hours</th><th scope="col">Sessions</th><th scope="col">Last seen</th></tr></thead><tbody id="stats-leaderboard"><tr><td class="empty-state" colspan="4">No sessions recorded yet.</td></tr></tbody></table></div>
                   </section>
                   <section class="stats-block" aria-labelledby="stats-heatmap-title">
-                    <div class="stats-block-heading"><div><h3 id="stats-heatmap-title">Player-hours by time of week</h3><p class="stats-note">Cumulative player-hours over the last 90 days, grouped by UTC weekday and hour.</p></div></div>
-                    <p class="stats-status" id="stats-heatmap-status" aria-live="polite"></p>
-                    <div class="heatmap-grid" id="stats-heatmap" tabindex="0" role="region" aria-label="Player-hours by UTC weekday and hour"></div>
+                    <div class="stats-block-heading"><h3 id="stats-heatmap-title">Activity heatmap</h3><span class="section-meta">UTC · last 90 days</span></div>
+                    <div class="heatmap-grid" id="stats-heatmap" aria-label="Player-hours by UTC day and hour"></div>
                   </section>
                   <section class="stats-block" id="stats-occupancy-block" aria-labelledby="stats-occupancy-title" hidden>
                     <div class="stats-block-heading"><div><h3 id="stats-occupancy-title">Occupancy</h3><p class="stats-note" id="stats-occupancy-note">Count-based occupancy; player names are not available for this game.</p></div><strong id="stats-occupancy-current">—</strong></div>
-                  </section>
-                  <section class="stats-block stats-tps-block" aria-labelledby="stats-tps-title">
-                    <div class="stats-block-heading"><div><h3 id="stats-tps-title">Tick evidence</h3><p class="stats-note" id="stats-tps-note">Loading tick samples…</p><p class="stats-note">Gaps mean no telemetry was observed. They do not identify stopped time.</p></div><div class="stats-tps-values"><label class="stats-window" for="stats-window">Wall-clock range<select id="stats-window"><option value="1h">Last 1 hour</option><option value="6h">Last 6 hours</option><option value="24h" selected>Last 24 hours</option></select></label><strong id="stats-tps-current">—</strong><span id="stats-mspt-current">—</span></div></div>
-                    <p class="stats-status" id="stats-tps-status" aria-live="polite"></p>
-                    <p class="stats-note">MSPT shows tick headroom; 50 ms/tick is the budget required to sustain 20 TPS.</p>
-                    <svg id="stats-tps-chart" class="stats-tps-chart" viewBox="0 0 520 190" role="img" aria-label="Minecraft TPS observations over the selected wall-clock range">
-                      <rect class="chart-healthy-band" x="48" y="16" width="456" height="14" rx="3"></rect>
-                      <line class="chart-grid" x1="48" y1="16" x2="504" y2="16"></line><line class="chart-grid" x1="48" y1="80" x2="504" y2="80"></line><line class="chart-grid" x1="48" y1="144" x2="504" y2="144"></line>
-                      <line class="chart-axis" x1="48" y1="16" x2="48" y2="144"></line><line class="chart-axis" x1="48" y1="144" x2="504" y2="144"></line>
-                      <text class="chart-ymax" x="42" y="20" text-anchor="end">20</text><text class="chart-ymid" x="42" y="84" text-anchor="end">10</text><text x="42" y="148" text-anchor="end">0</text><text class="chart-unit" x="48" y="10">TPS</text><text class="chart-x0" x="48" y="174">—</text><text class="chart-x1" x="504" y="174" text-anchor="end">—</text>
-                      <g class="tps-chart-areas"></g><g class="tps-chart-lines"></g><g class="tps-chart-points"></g>
-                    </svg>
                   </section>
                 </div>
               </section>
@@ -215,16 +256,19 @@
                 <section class="stats-block benchmark-latest" aria-labelledby="benchmark-latest-title">
                   <div class="stats-block-heading"><div><h3 id="benchmark-latest-title">Latest evidence</h3><p class="stats-note" id="benchmark-latest-meta">No completed comparison.</p></div></div>
                   <dl class="benchmark-diagnostics" id="benchmark-diagnostics">
-                    <div><dt>Candidate bottleneck</dt><dd id="benchmark-bottleneck">—</dd></div>
-                    <div><dt>Leak signal</dt><dd id="benchmark-leak">—</dd></div>
-                    <div><dt>Load target</dt><dd id="benchmark-load">—</dd></div>
-                    <div><dt>Median process time</dt><dd id="benchmark-duration">—</dd></div>
+                    <div><dt>Baseline bottleneck</dt><dd id="benchmark-baseline-bottleneck">—</dd></div><div><dt>Candidate bottleneck</dt><dd id="benchmark-bottleneck">—</dd></div>
+                    <div><dt>Baseline leak</dt><dd id="benchmark-baseline-leak">—</dd></div><div><dt>Candidate leak</dt><dd id="benchmark-leak">—</dd></div>
+                    <div><dt>Baseline load</dt><dd id="benchmark-baseline-load">—</dd></div><div><dt>Candidate load</dt><dd id="benchmark-load">—</dd></div>
+                    <div><dt>Baseline process time</dt><dd id="benchmark-baseline-duration">—</dd></div><div><dt>Candidate process time</dt><dd id="benchmark-duration">—</dd></div>
                   </dl>
                   <div class="benchmark-table-wrap"><table class="stats-table benchmark-table"><thead><tr><th scope="col">Metric</th><th scope="col">Baseline</th><th scope="col">Candidate</th><th scope="col">Delta</th><th scope="col">Verdict</th></tr></thead><tbody id="benchmark-metrics"><tr><td class="empty-state" colspan="5">No benchmark metrics recorded.</td></tr></tbody></table></div>
                 </section>
                 <section class="stats-block" aria-labelledby="benchmark-history-title">
-                  <div class="stats-block-heading"><h3 id="benchmark-history-title">Run history</h3><span class="section-meta">Last 20</span></div>
+                  <div class="stats-block-heading"><h3 id="benchmark-history-title">Run history</h3><span class="section-meta" id="benchmark-history-meta">Recent runs</span></div>
                   <ol class="benchmark-history" id="benchmark-history"><li class="empty-state">No benchmark runs recorded.</li></ol>
+                  <div class="benchmark-history-actions"><button class="button" id="benchmark-load-more" type="button" hidden>Load more</button><button class="button" id="benchmark-export-json" type="button">JSON</button><button class="button" id="benchmark-export-csv" type="button">CSV</button></div>
+                  <div class="benchmark-trend" id="benchmark-trend" aria-label="Run-over-run metric trend"></div>
+                  <p class="field-hint" id="benchmark-corrupt-warning" hidden></p>
                 </section>
               </section>
               <section class="detail-panel" id="panel-config" role="tabpanel" aria-labelledby="tab-config" tabindex="0" hidden>
@@ -245,13 +289,13 @@
                 </form>
                 <details class="config-reference"><summary>Raw file reference</summary><p class="detail-footer">The raw profile-owned file remains read-only here. Only the typed settings above can be changed.</p></details>
                 <section class="schedule-settings" aria-labelledby="schedules-title">
-                  <div class="section-heading schedule-heading"><div><p class="eyebrow">automation</p><h2 id="schedules-title">Schedules</h2></div><span class="section-meta">live reload</span></div>
-                  <p class="field-hint schedule-note">Scheduled switches use the normal controller flow and skip when players are online. Disabled entries remain saved but will not fire.</p>
+                  <div class="section-heading schedule-heading"><div><p class="eyebrow">automation</p><h2 id="schedules-title">Scheduled switches</h2></div><span class="section-meta">live reload</span></div>
+                  <p class="field-hint schedule-note">Scheduled switches use the normal controller flow and skip when players are online. Disabled entries stay saved but do not fire.</p>
                   <div class="schedule-list" id="schedule-list"><p class="empty-state">Loading schedules…</p></div>
                   <form class="schedule-add" id="schedule-form">
                     <label for="schedule-cron">Cron</label>
                     <input id="schedule-cron" name="cron" type="text" required maxlength="128" placeholder="0 20 * * 5" autocomplete="off">
-                    <label for="schedule-profile">Profile</label>
+                    <label for="schedule-profile">Server</label>
                     <select id="schedule-profile" name="profile" required></select>
                     <button class="button button-small button-quiet" type="submit">Add schedule</button>
                     <p class="field-hint" id="schedule-status" aria-live="polite"></p>
@@ -271,7 +315,13 @@
         </section>
 
         <section class="view activity-view" id="events-view" aria-labelledby="events-title" hidden>
-          <div class="page-intro settings-intro"><div><p class="eyebrow">system</p><h1 id="events-title">Events</h1><p class="lede">Controller events, including slot conflicts and health transitions.</p></div></div>
+          <div class="page-intro settings-intro"><div><p class="eyebrow">system</p><h1 id="events-title">Incidents</h1><p class="lede">A bounded, sanitized view of failed controller operations and whether a later success cleared them.</p></div></div>
+          <section class="incident-center incident-center-full" aria-labelledby="incident-history-title">
+            <div class="incident-heading"><div><p class="eyebrow">fault rail</p><h2 id="incident-history-title">Controller failures</h2></div><span class="incident-window">latest 200 audit records</span></div>
+            <p class="incident-summary" id="incident-history-summary" role="status" aria-live="polite">Loading incident history…</p>
+            <ol class="incident-rail" id="incident-list"><li class="incident-empty">Loading recent failures…</li></ol>
+          </section>
+          <div class="section-heading incident-events-heading"><div><h2>Recent controller events</h2><p class="section-meta">Raw typed events remain available beneath the fault rail.</p></div></div>
           <ol class="activity-list" id="events-list"><li class="empty-state">No events loaded.</li></ol>
         </section>
 
@@ -404,6 +454,22 @@
           <label for="restore-confirm-text">Type the profile name to confirm</label><input id="restore-confirm-text" autocomplete="off" required>
         </div>
         <div class="dialog-actions sticky-actions"><button class="button button-quiet" value="cancel" formnovalidate>Cancel</button><button class="button button-danger" id="restore-confirm" value="default" disabled>Restore backup</button></div>
+      </form>
+    </dialog>
+
+    <dialog class="dialog" id="update-dialog" aria-labelledby="update-dialog-title">
+      <form method="dialog" class="dialog-form" id="update-form">
+        <div class="dialog-header"><div><p class="eyebrow">Review required</p><h2 id="update-dialog-title">Apply server update</h2></div><button class="icon-button" value="cancel" aria-label="Close update dialog">×</button></div>
+        <div class="dialog-body">
+          <p id="update-description">Horizon found an update. Review the version change before applying it.</p>
+          <div class="summary-list">
+            <div><span>Server</span><strong id="update-profile">—</strong></div>
+            <div><span>Installed</span><strong id="update-installed">—</strong></div>
+            <div><span>Available</span><strong id="update-available">—</strong></div>
+          </div>
+          <p class="field-hint">Applying an update uses the profile's reviewed update strategy and may require the server to remain stopped. Horizon will reject the request if its safety gates are not satisfied.</p>
+        </div>
+        <div class="dialog-actions sticky-actions"><button class="button button-quiet" value="cancel">Cancel</button><button class="button button-primary" id="update-confirm" value="default">Apply update</button></div>
       </form>
     </dialog>
 

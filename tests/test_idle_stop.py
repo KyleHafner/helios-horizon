@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from types import SimpleNamespace
@@ -121,11 +122,10 @@ def test_idle_stop_controller_uses_normal_stop_actor_and_event(tmp_path):
         request_id=uuid4(), actor="operator", action=GetStatus(kind="get_status", refresh=True)
     )
 
-    asyncio_result = controller.execute_sync(request())
-    assert asyncio_result.ok
+    asyncio.run(controller.maintenance_tick())
     now[0] += timedelta(minutes=5)
-    controller.execute_sync(request())
-    controller.execute_sync(request())
+    asyncio.run(controller.maintenance_tick())
+    asyncio.run(controller.maintenance_tick())
 
     assert adapter.stops == 1
     audit = controller._db().execute(

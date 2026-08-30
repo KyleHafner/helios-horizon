@@ -19,7 +19,7 @@ def test_rejects_shell_like_profile() -> None:
         RpcRequest.model_validate(
             {
                 "request_id": str(uuid4()),
-                "actor": "operator",
+                "actor": "swag",
                 "action": {"kind": "start", "profile_id": "pz-rising;id"},
             }
         )
@@ -28,7 +28,7 @@ def test_rejects_shell_like_profile() -> None:
 def test_request_line_is_bounded_and_jsonl() -> None:
     request = {
         "request_id": str(uuid4()),
-        "actor": "operator",
+        "actor": "swag",
         "action": {"kind": "start", "profile_id": "minecraft"},
     }
     response = parse_request_line((__import__("json").dumps(request) + "\n").encode())
@@ -42,7 +42,7 @@ def test_request_forbids_unknown_fields() -> None:
         RpcRequest.model_validate(
             {
                 "request_id": str(uuid4()),
-                "actor": "operator",
+                "actor": "swag",
                 "action": {
                     "kind": "start",
                     "profile_id": "minecraft",

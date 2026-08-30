@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Perform the example Sunlit graceful-stop contract for systemd ExecStop."""
+"""Perform the fixed Sunlit graceful-stop contract for systemd ExecStop."""
 
 from __future__ import annotations
 
@@ -14,8 +14,12 @@ from pathlib import Path
 
 PROFILE = "minecraft-sunlit-cobblemon"
 METADATA = Path("/run/game-slot/slot.json")
-LATEST_LOG = Path("/srv/game-servers/minecraft-sunlit-cobblemon/logs/latest.log")
-FORGE_ARGS = "@/opt/game-servers/minecraft-sunlit-cobblemon/libraries/example/unix_args.txt"
+LATEST_LOG = Path("/srv/game-servers/minecraft-sunlit-cobblemon-current/logs/latest.log")
+STATE_ROOT = Path("/srv/game-servers/minecraft-sunlit-cobblemon-state")
+FORGE_ARGS = (
+    "@/opt/game-servers/minecraft-sunlit-cobblemon/libraries/net/minecraftforge/"
+    "forge/1.20.1-47.4.0/unix_args.txt"
+)
 STOP_MARKERS = (b"Stopping server", b"Saving players", b"Saving worlds")
 MAX_CAPTURE = 4 * 1024 * 1024
 TIMEOUT_SECONDS = 115.0
@@ -43,6 +47,10 @@ def _secure_regular(path: Path, *, expected_uid: int | None = None) -> os.stat_r
 
 
 def _slot_identity(profile: str, pid: int) -> int:
+    # game-slot-run writes the metadata immediately before exec while running
+    # as the fixed profile user.  Requiring root ownership makes every real
+    # systemd stop fail even though the parent directory and slot lock are
+    # root-controlled.
     _secure_regular(METADATA, expected_uid=os.geteuid())
     raw = json.loads(METADATA.read_text(encoding="utf-8"))
     ticks = raw.get("proc_start_ticks")
@@ -77,6 +85,28 @@ def _read_since(path: Path, offset: int) -> tuple[int, bytes]:
         return stream.tell(), data
 
 
+def _latest_log() -> Path:
+    logs_link = LATEST_LOG.parent
+    link_info = logs_link.lstat()
+    if (
+        not stat.S_ISLNK(link_info.st_mode)
+        or link_info.st_uid != 0
+        or link_info.st_gid != 0
+    ):
+        raise ValueError("Sunlit log directory link is unsafe")
+    # The final path is a regular Forge-created file reached through the
+    # root-owned version-state directory link. Requiring the final file itself
+    # to be a symlink rejects the intended active-link layout.
+    _secure_regular(LATEST_LOG)
+    path = LATEST_LOG.resolve(strict=True)
+    try:
+        path.relative_to(STATE_ROOT)
+    except ValueError as exc:
+        raise ValueError("Sunlit latest log is outside writable state") from exc
+    _secure_regular(path)
+    return path
+
+
 def _read_tail(path: Path) -> bytes:
     _secure_regular(path)
     size = path.stat().st_size
@@ -86,9 +116,13 @@ def _read_tail(path: Path) -> bytes:
 
 
 def _verify_tail() -> bool:
+    try:
+        latest_log = _latest_log()
+    except (OSError, ValueError):
+        return False
     for _ in range(25):
         try:
-            final_tail = _read_tail(LATEST_LOG)
+            final_tail = _read_tail(latest_log)
         except OSError:
             final_tail = b""
         if all(marker in final_tail for marker in STOP_MARKERS):
@@ -98,7 +132,8 @@ def _verify_tail() -> bool:
 
 
 def _stop(pid: int, ticks: int) -> bool:
-    log_info = _secure_regular(LATEST_LOG)
+    latest_log = _latest_log()
+    log_info = _secure_regular(latest_log)
     offset = log_info.st_size
     captured = bytearray()
     os.kill(pid, signal.SIGINT)
@@ -106,7 +141,7 @@ def _stop(pid: int, ticks: int) -> bool:
     while time.monotonic() < deadline:
         current = _ticks(pid)
         try:
-            offset, data = _read_since(LATEST_LOG, offset)
+            offset, data = _read_since(latest_log, offset)
         except OSError:
             data = b""
         if data:
@@ -116,6 +151,9 @@ def _stop(pid: int, ticks: int) -> bool:
         if current is None or current != ticks:
             if all(marker in captured for marker in STOP_MARKERS):
                 return True
+            # Forge can close the JVM just before the final asynchronous log
+            # flush becomes visible to this poller. Re-read only the bounded
+            # secure tail after PID exit; never accept markers while it lives.
             return _verify_tail()
         time.sleep(0.2)
     return False

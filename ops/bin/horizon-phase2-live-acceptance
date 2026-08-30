@@ -1,0 +1,115 @@
+#!/usr/bin/env python3
+"""Run a bounded, identity-free Phase 2 WatchHub acceptance fixture.
+
+This executes the installed ``game_control.push.WatchHub`` implementation;
+it does not contact a service, invoke a command, or read arbitrary paths.
+There are no arbitrary commands or paths accepted by this fixture; evidence is
+written to stdout only.
+"""
+from __future__ import annotations
+
+import argparse
+import asyncio
+import json
+
+from game_control.push import WatchCursor, WatchHub
+
+
+def _strictly_increasing(values: list[int]) -> bool:
+    return all(left < right for left, right in zip(values, values[1:]))
+
+
+def _non_decreasing(values: list[int]) -> bool:
+    return all(left <= right for left, right in zip(values, values[1:]))
+
+
+def _order_contract(events: list[tuple[int, int]]) -> bool:
+    sequences = [sequence for sequence, _generation in events]
+    generations = [generation for _sequence, generation in events]
+    return len(sequences) == len(set(sequences)) and _strictly_increasing(sequences) and _non_decreasing(generations)
+
+
+def _causal_aggregate_contract(events: list[tuple[str, int, int]]) -> bool:
+    """Validate only an aggregate recorded in actual delivery order.
+
+    The broker sequence is globally unique, but delivery from independent
+    subscribers is not a cross-subscriber total order.  Callers must append
+    an item when it is actually observed; this helper deliberately rejects a
+    late slow-subscriber item such as ``..., ("slow", 4, 7)``.
+    """
+    return _order_contract([(sequence, generation) for _subscriber, sequence, generation in events])
+
+
+async def _run() -> dict[str, object]:
+    hub = WatchHub(queue_size=2, history_size=8, max_overflows=2)
+    slow = await hub.subscribe(WatchCursor())
+    healthy = await hub.subscribe(WatchCursor())
+    # This aggregate is the healthy subscriber's actual delivery timeline.
+    # Do not append delayed observations from another subscriber: there is no
+    # valid cross-subscriber total-order claim to make from those deliveries.
+    aggregate_observed: list[tuple[str, int, int]] = []
+    healthy_observed: list[tuple[int, int]] = []
+    slow_observed: list[tuple[int, int]] = []
+
+    async def publish(generation: int) -> None:
+        await hub.publish("status_delta", {}, generation=generation)
+        # Keep the healthy subscriber flowing while the slow subscriber is
+        # intentionally never drained.
+        while not healthy.queue.empty():
+            event = await healthy.queue.get()
+            item = (event.sequence, event.generation)
+            aggregate_observed.append(("healthy", *item))
+            healthy_observed.append(item)
+
+    initial = await hub.publish("status", {}, generation=1, full=True)
+    initial_healthy = await healthy.queue.get()
+    initial_item = (initial_healthy.sequence, initial_healthy.generation)
+    aggregate_observed.append(("healthy", *initial_item))
+    healthy_observed.append(initial_item)
+    await publish(2)
+    await publish(3)
+    slow_items = []
+    while not slow.queue.empty():
+        slow_items.append(await slow.queue.get())
+    marker_candidates = [item for item in slow_items if item.kind == "full_resync"]
+    slow_marker = marker_candidates[-1] if marker_candidates else None
+    if slow_marker is not None:
+        marker_item = (slow_marker.sequence, slow_marker.generation)
+        slow_observed.append(marker_item)
+    await publish(4)
+    await publish(5)
+    await publish(6)
+    aggregate_order_ok = _causal_aggregate_contract(aggregate_observed)
+    generations_ok = _non_decreasing([generation for _subscriber, _sequence, generation in aggregate_observed])
+    subscriber_order_ok = _order_contract(healthy_observed) and _order_contract(slow_observed)
+    passed = bool(slow_marker is not None and slow.disconnected and not healthy.disconnected and aggregate_order_ok and generations_ok and subscriber_order_ok)
+    return {
+        "schemaVersion": "phase2.live.fixture.v1",
+        "identityFree": True,
+        "queueOverflow": {"observed": slow_marker is not None},
+        "slowSubscriberEvicted": bool(slow.disconnected),
+        "healthySubscriberUnaffected": bool(not healthy.disconnected),
+        "aggregateOrderContract": aggregate_order_ok,
+        "nonDecreasingGenerations": generations_ok,
+        "subscriberOrderContracts": subscriber_order_ok,
+        "crossSubscriberTotalOrderClaimed": False,
+        "crossSubscriberGenerationOrder": {
+            "claimed": False,
+            "healthy": _non_decreasing([generation for _sequence, generation in healthy_observed]),
+            "slow": _non_decreasing([generation for _sequence, generation in slow_observed]),
+        },
+        "observedSequenceCount": len(aggregate_observed),
+        "pass": passed,
+    }
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description=__doc__)
+    args = parser.parse_args()
+    report = asyncio.run(_run())
+    print(json.dumps(report, sort_keys=True))
+    return 0 if report["pass"] else 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

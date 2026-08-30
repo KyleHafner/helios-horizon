@@ -1,0 +1,70 @@
+#!/usr/bin/env python3
+"""Perform the narrow controller RPCs used by the Sunlit updater."""
+from __future__ import annotations
+
+import argparse
+import asyncio
+import json
+import os
+from uuid import UUID
+
+from game_control.models import BackupDestination
+from game_control.protocol import (
+    CreateBackup,
+    ProfileId,
+    RpcFailure,
+    RpcRequest,
+    response_from_json,
+)
+
+
+async def request_backup(request_id: UUID) -> dict:
+    request = RpcRequest(
+        request_id=request_id,
+        actor="sunlit-auto-update",
+        action=CreateBackup(
+            kind="create_backup",
+            profile_id=ProfileId.MINECRAFT_SUNLIT_COBBLEMON,
+            protected=True,
+            destination=BackupDestination.HORIZON_B2,
+        ),
+    )
+    reader, writer = await asyncio.wait_for(
+        asyncio.open_unix_connection("/run/game-control/control.sock"), 15
+    )
+    try:
+        writer.write(request.model_dump_json().encode("utf-8") + b"\n")
+        await writer.drain()
+        response = response_from_json(await asyncio.wait_for(reader.readline(), 7_200))
+    finally:
+        writer.close()
+        await writer.wait_closed()
+    if response.request_id != request.request_id:
+        raise RuntimeError("controller response UUID mismatch")
+    if isinstance(response, RpcFailure):
+        if response.error.code.value == "request_in_progress":
+            raise TimeoutError("backup request remains in progress")
+        raise RuntimeError(f"controller rejected backup: {response.error.code.value}")
+    return {"job_id": response.result.job_id, "state": response.result.state}
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("backup", choices=("backup",))
+    parser.add_argument("--request-id", required=True, type=UUID)
+    args = parser.parse_args(argv)
+    if os.geteuid() == 0:
+        parser.error("run as the gamecontrol socket peer, not root")
+    try:
+        print(json.dumps(asyncio.run(request_backup(args.request_id)), sort_keys=True))
+    except TimeoutError as exc:
+        print(f"deferred: {exc}", file=os.sys.stderr)
+        return 75
+    except (OSError, RuntimeError, asyncio.TimeoutError) as exc:
+        print(f"error: {exc}", file=os.sys.stderr)
+        return 2
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

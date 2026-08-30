@@ -3,25 +3,24 @@ from __future__ import annotations
 import json
 import sqlite3
 import subprocess
+import sys
 from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
 
+from game_control import benchmarks
 from game_control.benchmarks import BenchmarkService, parse_benchmark_plans
+from game_control import state_db
 from game_control.errors import SafeError
 from game_control.models import ProfileId
 from game_control.protocol import GetBenchmarks, RunBenchmark
 
 
 def _database() -> sqlite3.Connection:
-    connection = sqlite3.connect(":memory:")
-    connection.execute(
-        "CREATE TABLE benchmark_runs("
-        "id TEXT PRIMARY KEY,profile_id TEXT,baseline_preset TEXT,candidate_preset TEXT,"
-        "state TEXT,created_at TEXT,finished_at TEXT,overall_verdict TEXT,summary_json TEXT,"
-        "artifact_path TEXT,error_code TEXT)"
-    )
+    connection = sqlite3.connect(":memory:", check_same_thread=False)
+    state_db._configure(connection)
+    state_db._migrate_state(connection)
     return connection
 
 
@@ -53,7 +52,16 @@ def _summary(path: Path) -> None:
     path.write_text(
         json.dumps(
             {
-                "schemaVersion": 1,
+                "schemaVersion": 2,
+                "driverSha256": "d" * 64,
+                "configSha256": "c" * 64,
+                "presetDigests": {"current": "p" * 64, "candidate": "q" * 64},
+                "presetArgvDigests": {"current": "a" * 64, "candidate": "b" * 64},
+                "statisticsImplementation": {"name": "fixture", "fixtures": "fixture-v1"},
+                "pairPlan": {"minimumCompletePairs": 1, "maximumPairs": 1},
+                "pairs": [{"complete": True, "degraded": False}],
+                "primaryEndpoints": [{"name": "tick.p95Nanos", "effectThreshold": 0.1}],
+                "thresholds": {"tick.p95Nanos": 0.1},
                 "baselinePreset": "current",
                 "candidatePreset": "candidate",
                 "overallVerdict": "better",
@@ -112,6 +120,92 @@ def _service(tmp_path: Path, runner):
     return service, reports
 
 
+def test_process_group_translates_run_capture_output_for_maintenance_popen(monkeypatch):
+    """The production runner keeps Popen/maintenance.slice semantics intact."""
+    captured = {}
+
+    class FakeProcess:
+        args = ["fake-driver"]
+        returncode = 0
+
+        def communicate(self, timeout=None):
+            captured["timeout"] = timeout
+            return '{"schemaVersion": 2}\n', ""
+
+    def fake_maintenance_popen(command, **kwargs):
+        captured["command"] = command
+        captured["kwargs"] = kwargs
+        return FakeProcess()
+
+    monkeypatch.setattr(benchmarks, "maintenance_popen", fake_maintenance_popen)
+    result = benchmarks._run_process_group(
+        ["fake-driver", "--check"], capture_output=True, text=True, timeout=7
+    )
+
+    assert result.returncode == 0
+    assert result.stdout == '{"schemaVersion": 2}\n'
+    assert captured["kwargs"]["stdout"] is subprocess.PIPE
+    assert captured["kwargs"]["stderr"] is subprocess.PIPE
+    assert captured["kwargs"]["text"] is True
+    assert captured["kwargs"]["start_new_session"] is True
+    assert captured["timeout"] == 7
+
+
+def test_process_group_timeout_terminates_and_cleans_registry(monkeypatch):
+    registry = {}
+
+    class HangingProcess:
+        args = ["fake-driver"]
+        returncode = -15
+
+        def communicate(self, timeout=None):
+            raise subprocess.TimeoutExpired(self.args, timeout)
+
+        def terminate(self):
+            self.terminated = True
+
+        def wait(self, timeout=None):
+            return self.returncode
+
+        def kill(self):
+            self.killed = True
+
+    process = HangingProcess()
+    monkeypatch.setattr(benchmarks, "maintenance_popen", lambda *_args, **_kwargs: process)
+    with pytest.raises(subprocess.TimeoutExpired):
+        benchmarks._run_process_group(
+            ["fake-driver"], capture_output=True, timeout=1,
+            process_registry=registry, process_key="job-timeout",
+        )
+    assert process.terminated is True
+    assert registry == {}
+
+
+@pytest.mark.parametrize("stream_name", ["stdout", "stderr"])
+def test_process_group_bounds_each_output_stream_and_terminates(monkeypatch, stream_name):
+    flood = (
+        "import sys,time; "
+        f"getattr(sys, {stream_name!r}).write('x' * (3 * 1024 * 1024)); "
+        f"getattr(sys, {stream_name!r}).flush(); time.sleep(30)"
+    )
+    process_holder = {}
+
+    def fake_maintenance_popen(command, **kwargs):
+        process_holder["process"] = subprocess.Popen(command, **kwargs)
+        return process_holder["process"]
+
+    monkeypatch.setattr(benchmarks, "maintenance_popen", fake_maintenance_popen)
+    registry = {}
+    with pytest.raises(SafeError, match="bounded limit"):
+        benchmarks._run_process_group(
+            [sys.executable, "-c", flood], capture_output=True, timeout=5,
+            process_registry=registry, process_key=stream_name,
+        )
+    process = process_holder["process"]
+    assert process.poll() is not None
+    assert registry == {}
+
+
 @pytest.mark.asyncio
 async def test_benchmark_service_runs_only_configured_presets_and_persists_safe_summary(tmp_path: Path):
     captured = []
@@ -119,8 +213,10 @@ async def test_benchmark_service_runs_only_configured_presets_and_persists_safe_
     def runner(command, **kwargs):
         captured.append((command, kwargs))
         summary = tmp_path / "reports" / "run-1" / "summary.json"
-        summary.parent.mkdir()
+        summary.parent.mkdir(exist_ok=True)
         _summary(summary)
+        if command[-1] == "--check":
+            return subprocess.CompletedProcess(command, 0, stdout=summary.read_text(), stderr="")
         return subprocess.CompletedProcess(command, 0, stdout=f"{summary}\n", stderr="")
 
     service, _reports = _service(tmp_path, runner)
@@ -137,8 +233,8 @@ async def test_benchmark_service_runs_only_configured_presets_and_persists_safe_
     assert result.overall_verdict == "better"
     assert result.metrics[0].candidate_median == 15_000_000
     assert result.candidate_diagnostics.load_reached_target is True
-    assert captured[0][0][-4:] == ["--baseline", "current", "--candidate", "candidate"]
-    assert captured[0][1]["check"] is False
+    assert captured[-1][0][-4:] == ["--baseline", "current", "--candidate", "candidate"]
+    assert captured[-1][1]["check"] is False
     overview = await service.overview(
         GetBenchmarks(kind="get_benchmarks", profile_id=action.profile_id)
     )
@@ -164,6 +260,8 @@ async def test_benchmark_service_rejects_artifact_outside_approved_root(tmp_path
     _summary(outside)
 
     def runner(command, **_kwargs):
+        if command[-1] == "--check":
+            return subprocess.CompletedProcess(command, 0, stdout=outside.read_text(), stderr="")
         return subprocess.CompletedProcess(command, 0, stdout=f"{outside}\n", stderr="")
 
     service, _reports = _service(tmp_path, runner)

@@ -1,7 +1,8 @@
 [Unit]
 Description=Helios game control slot daemon
 After=local-fs.target
-RequiresMountsFor=/opt/game-control /var/lib/game-control /var/backups/game-servers
+RequiresMountsFor=/opt/game-control /var/lib/game-control /var/backups/game-servers /opt/game-servers /srv/game-servers
+OnFailure=horizon-alert-notify@controller.service
 
 [Service]
 Type=simple
@@ -11,13 +12,18 @@ WorkingDirectory=/opt/game-control
 ExecStart=/opt/game-control/.venv/bin/python -m game_control.slotd_main
 Restart=on-failure
 RestartSec=2s
+Slice=horizon.slice
+CPUAccounting=yes
+MemoryAccounting=yes
+IOAccounting=yes
+LogNamespace=horizon
 PrivateTmp=yes
 ProtectHome=read-only
 ProtectSystem=strict
 RestrictSUIDSGID=yes
 ReadOnlyPaths=/opt/game-control /etc/game-control /etc/ssl/certs /usr/bin /usr/local/bin /usr/local/libexec /proc /sys/fs/cgroup
-ReadWritePaths=/run/game-control /run/game-slot /var/lib/game-control /var/backups/game-servers /opt/game-servers /srv/game-servers /opt/pzserver /home/pzuser/Zomboid /srv/game-servers/minecraft
-CapabilityBoundingSet=CAP_CHOWN CAP_DAC_OVERRIDE CAP_DAC_READ_SEARCH CAP_FOWNER
+ReadWritePaths=/run/game-control /run/game-slot /var/lib/game-control /var/backups/game-servers /opt/game-servers /srv/game-servers
+CapabilityBoundingSet=CAP_CHOWN CAP_DAC_OVERRIDE CAP_DAC_READ_SEARCH CAP_FOWNER CAP_SETGID CAP_SETUID
 AmbientCapabilities=
 UMask=0077
 

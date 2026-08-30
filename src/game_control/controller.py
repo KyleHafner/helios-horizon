@@ -15,14 +15,17 @@ import logging
 import os
 import sqlite3
 import time
-from contextlib import nullcontext
+from contextlib import asynccontextmanager, nullcontext
 from datetime import datetime, timedelta, timezone
+from enum import StrEnum
 from pathlib import Path
 from typing import Any, Awaitable, Callable, Mapping
 from uuid import UUID, uuid4
 
 from .adapters.base import Adapter, AdapterError
 from .errors import SafeError
+from .health import ReadinessCoordinator, ReadinessOutcome
+from .managed_tuning import readiness_event
 from .idle_stop import IdleStopTracker
 from .models import BackupDestination, NotificationEvent, OperationName, Profile, ProfileId
 from .schedule import ScheduleBook, ScheduleEntry, parse_schedule
@@ -48,11 +51,15 @@ from .protocol import (
     GetNotificationConfig,
     GetProfiles,
     GetStatus,
+    Watch,
+    WaitReadiness,
     GetStatsHeatmap,
     GetStatsSummary,
     GetStatsTps,
     GetProfileConfig,
     GetBenchmarks,
+    ExportBenchmarks,
+    BenchmarkExport,
     GetSchedules,
     ScheduleResponse,
     ScheduleView,
@@ -60,8 +67,10 @@ from .protocol import (
     ScheduleSpec,
     SetProfileConfig,
     JobAccepted,
+    ReadinessResult,
     ListAudit,
     ListBackups,
+    ListAggregateBackups,
     ListEvents,
     LogPage,
     NotificationConfig,
@@ -76,6 +85,7 @@ from .protocol import (
     PublicEndpoint,
     Restart,
     RunBenchmark,
+    CancelBenchmark,
     RpcAction,
     RpcFailure,
     RpcProvenance,
@@ -97,6 +107,7 @@ from .protocol import (
     UpdateConfirmation,
     UpdateStatus,
     WorldCloneConfirmation,
+    MAX_RESPONSE_BYTES,
     response_from_json,
     response_json,
     success,
@@ -104,23 +115,29 @@ from .protocol import (
 )
 from .slot import ReservationStore, SlotInspector, OperationLock
 from .perf import PerformanceTracker
+from .db_telemetry import collect_perf_databases_async
+from .introspection import signature_parameters
 
 _LOG = logging.getLogger(__name__)
 
 
 DISPATCH: dict[type, str] = {
     GetStatus: "_get_status",
+    WaitReadiness: "_wait_readiness",
     GetPerf: "_get_perf",
     GetProfiles: "_get_profiles",
     GetLogs: "_get_logs",
     ListBackups: "_list_backups",
+    ListAggregateBackups: "_list_aggregate_backups",
     ListEvents: "_list_events",
     GetStatsSummary: "_get_stats_summary",
     GetStatsHeatmap: "_get_stats_heatmap",
     GetStatsTps: "_get_stats_tps",
     GetProfileConfig: "_get_profile_config",
     GetBenchmarks: "_get_benchmarks",
+    ExportBenchmarks: "_export_benchmarks",
     RunBenchmark: "_run_benchmark",
+    CancelBenchmark: "_cancel_benchmark",
     SetProfileConfig: "_set_profile_config",
     GetSchedules: "_get_schedules",
     SetSchedules: "_set_schedules",
@@ -156,6 +173,64 @@ DISPATCH.update({
 })
 
 
+class _ActionClass(StrEnum):
+    PURE_READ = "pure_read"
+    MUTATION = "mutation"
+
+
+# Concrete action types, rather than caller-controlled kind strings, determine
+# whether a request participates in durable idempotency. Unknown action types
+# stay on the mutation path until deliberately classified.
+ACTION_CLASSES: dict[type, _ActionClass] = {
+    GetStatus: _ActionClass.PURE_READ,
+    WaitReadiness: _ActionClass.PURE_READ,
+    GetPerf: _ActionClass.PURE_READ,
+    GetProfiles: _ActionClass.PURE_READ,
+    GetLogs: _ActionClass.PURE_READ,
+    ListBackups: _ActionClass.PURE_READ,
+    ListAggregateBackups: _ActionClass.PURE_READ,
+    ListEvents: _ActionClass.PURE_READ,
+    GetStatsSummary: _ActionClass.PURE_READ,
+    GetStatsHeatmap: _ActionClass.PURE_READ,
+    GetStatsTps: _ActionClass.PURE_READ,
+    GetProfileConfig: _ActionClass.PURE_READ,
+    GetBenchmarks: _ActionClass.PURE_READ,
+    ExportBenchmarks: _ActionClass.PURE_READ,
+    GetSchedules: _ActionClass.PURE_READ,
+    ListAudit: _ActionClass.PURE_READ,
+    GetNotificationConfig: _ActionClass.PURE_READ,
+    RunBenchmark: _ActionClass.MUTATION,
+    CancelBenchmark: _ActionClass.MUTATION,
+    SetSchedules: _ActionClass.MUTATION,
+    SetProfileConfig: _ActionClass.MUTATION,
+    Start: _ActionClass.MUTATION,
+    Stop: _ActionClass.MUTATION,
+    Restart: _ActionClass.MUTATION,
+    PrepareSwitch: _ActionClass.MUTATION,
+    ConfirmSwitch: _ActionClass.MUTATION,
+    PrepareForceStop: _ActionClass.MUTATION,
+    ConfirmForceStop: _ActionClass.MUTATION,
+    CreateBackup: _ActionClass.MUTATION,
+    PrepareRestore: _ActionClass.MUTATION,
+    ConfirmRestore: _ActionClass.MUTATION,
+    PrepareWorldClone: _ActionClass.MUTATION,
+    ConfirmWorldClone: _ActionClass.MUTATION,
+    CheckUpdate: _ActionClass.MUTATION,
+    PrepareUpdate: _ActionClass.MUTATION,
+    ConfirmUpdate: _ActionClass.MUTATION,
+    SetNotificationRule: _ActionClass.MUTATION,
+    TestNotification: _ActionClass.MUTATION,
+    SetIdleStop: _ActionClass.MUTATION,
+    Command: _ActionClass.MUTATION,
+}
+
+# ``Watch`` is a long-lived socket protocol handled by slotd_main after peer
+# authorization; it is intentionally not a controller dispatch action. Keep
+# that exception explicit so a future RpcAction cannot silently bypass the
+# controller exhaustiveness gate.
+STREAM_ACTIONS = frozenset({Watch})
+
+
 def _action_types() -> set[type]:
     from typing import Annotated, get_args, get_origin, Union
 
@@ -165,7 +240,13 @@ def _action_types() -> set[type]:
 
 
 def dispatch_is_exhaustive() -> bool:
-    return _action_types() == set(DISPATCH)
+    action_types = _action_types()
+    controller_actions = action_types - STREAM_ACTIONS
+    return controller_actions == set(DISPATCH) == set(ACTION_CLASSES) and STREAM_ACTIONS <= action_types
+
+
+def _action_class(action: Any) -> _ActionClass:
+    return ACTION_CLASSES.get(type(action), _ActionClass.MUTATION)
 
 
 class _MemoryLock:
@@ -246,8 +327,40 @@ class Controller:
         self.boot_autostart = boot_autostart
         self._boot_autostart_attempted = False
         self._transition_lock = asyncio.Lock()
+        self._maintenance_lock = asyncio.Lock()
         self.initializing = True
         self._background_tasks: set[asyncio.Task[Any]] = set()
+        self._readiness = ReadinessCoordinator()
+
+    def _record_lifecycle_latency(self, metric: str, profile_id: Any, started: float, *, success: bool, result: str | None = None) -> None:
+        """Best-effort bounded terminal lifecycle sample; never alter control flow."""
+        database = getattr(getattr(self, "services", None), "telemetry_db", None)
+        recorder = getattr(database, "enqueue_sample", None)
+        duration_ms = min(900_000.0, max(0.0, (time.monotonic() - started) * 1000.0))
+        if callable(recorder):
+            try:
+                event = readiness_event(str(getattr(profile_id, "value", profile_id)), int(duration_ms), success)
+                recorder(
+                    profile_id,
+                    metric,
+                    event.duration_ms,
+                    ts_ms=int(time.time() * 1000),
+                    state="available",
+                    labels={"result": result or ("success" if success else "failure"), "source": "slotd"},
+                )
+            except Exception:
+                _LOG.debug("lifecycle latency sample dropped", exc_info=True)
+        alerts = getattr(getattr(self, "services", None), "alerts", None)
+        if metric == "wake_duration" and alerts is not None:
+            try:
+                alerts.observe(
+                    profile_id,
+                    profile_state="running" if success else "starting",
+                    now=time.monotonic(),
+                    wake_duration_ms=duration_ms,
+                )
+            except Exception:
+                _LOG.debug("wake alert evaluation dropped", exc_info=True)
 
     @classmethod
     def for_testing(cls, tmp_path: Path) -> "Controller":
@@ -270,19 +383,59 @@ class Controller:
                 except Exception:
                     _LOG.exception("performance aggregate flush skipped")
 
+    async def maintenance_tick(self, request_id: UUID | None = None) -> None:
+        """Run controller-owned schedule, idle-stop, and retention maintenance."""
+        async with self._maintenance_lock:
+            request_id = request_id or uuid4()
+            service_group = getattr(self.services, "status", None)
+            if service_group is not None:
+                action = GetStatus(kind="get_status", refresh=True)
+                snapshot_method = service_group.snapshot
+                try:
+                    parameters = signature_parameters(snapshot_method)
+                    supports_maintenance = any(
+                        parameter.kind is inspect.Parameter.VAR_KEYWORD
+                        or parameter.name == "maintenance"
+                        for parameter in parameters
+                    )
+                except (TypeError, ValueError):
+                    supports_maintenance = False
+                if supports_maintenance:
+                    result = snapshot_method(
+                        action, "system:maintenance", request_id, maintenance=True
+                    )
+                else:
+                    # Preserve older injected status seams used during rolling
+                    # upgrades; those seams have no persistence mode.
+                    result = snapshot_method(action, "system:maintenance", request_id)
+                result = await result if inspect.isawaitable(result) else result
+                if isinstance(result, StatusSnapshot):
+                    result = result.model_copy(update={"initializing": self.initializing})
+                    await self._apply_idle_stops(result, request_id)
+                    await self._apply_schedules(result, request_id)
+            session_store = getattr(self.services, "session_store", None)
+            maintain = getattr(session_store, "maintain", None)
+            if callable(maintain):
+                maintain(now=_iso(self._clock()))
+
     async def _execute(self, request: RpcRequest) -> RpcResponse:
         canonical = self._canonical(request)
+        if _action_class(request.action) is _ActionClass.PURE_READ:
+            return await self._dispatch(request)
         claim = await self._claim_request(request.request_id, canonical)
         if claim is not None:
             if claim is not _PENDING:
                 return claim
             return await self._wait_for_replay(request.request_id, canonical)
+        response = await self._dispatch(request)
+        await self._store_replay(request.request_id, canonical, response)
+        return response
+
+    async def _dispatch(self, request: RpcRequest) -> RpcResponse:
         try:
             handler_name = DISPATCH[type(request.action)]
         except KeyError:
-            response = failure(request.request_id, ErrorCode.INVALID_REQUEST, "invalid request")
-            await self._store_replay(request.request_id, canonical, response)
-            return response
+            return failure(request.request_id, ErrorCode.INVALID_REQUEST, "invalid request")
         try:
             if isinstance(request.action, Command):
                 result = self._command(
@@ -306,7 +459,6 @@ class Controller:
                 "internal controller error",
                 details=SafeDetails(incident_id=incident),
             )
-        await self._store_replay(request.request_id, canonical, response)
         return response
 
     def execute_sync(self, request: RpcRequest) -> RpcResponse:
@@ -563,8 +715,31 @@ class Controller:
 
     async def _transaction(self, callback: Callable[[], Any]) -> Any:
         async with self._transition_lock:
-            with self._operation_lock_factory():
+            operation_lock = self._operation_lock_factory()
+            entered = False
+            enter_task = asyncio.create_task(asyncio.to_thread(operation_lock.__enter__))
+            try:
+                try:
+                    await asyncio.shield(enter_task)
+                    entered = True
+                except asyncio.CancelledError:
+                    # flock acquisition cannot be cancelled in its worker
+                    # thread.  Wait for it, then release it before propagating
+                    # cancellation so a late acquisition is never leaked.
+                    await enter_task
+                    entered = True
+                    raise
                 return callback()
+            finally:
+                if entered:
+                    exit_task = asyncio.create_task(
+                        asyncio.to_thread(operation_lock.__exit__, None, None, None)
+                    )
+                    try:
+                        await asyncio.shield(exit_task)
+                    except asyncio.CancelledError:
+                        await exit_task
+                        raise
 
     def _job_intent(self, actor: str, action: str, profile_id: ProfileId | None) -> str:
         job_id = uuid4().hex
@@ -631,17 +806,56 @@ class Controller:
             except Exception as exc:
                 raise _ControllerFailure(ErrorCode.SLOT_CONFLICT, "slot reservation was lost") from exc
 
-    async def _await_lease(self, awaitable, renewal_task):
+    @asynccontextmanager
+    async def _operation_lease(self, profile: Profile, operation: str, request_id: UUID, *, actor: str):
+        """Hold the durable slot reservation for the complete heavy operation.
+
+        The reservation is the shared authority consumed by the direct slot
+        runner as well as this controller.  Keeping it alive across worker
+        threads closes the preflight-to-use gap and serializes maintenance
+        with lifecycle starts in other profiles.
+        """
+        lease = await self._reserve(profile, operation, str(request_id), actor=actor)
+        renewal = self._lease_renewal(lease)
+        try:
+            await self._assert_lease(renewal)
+            yield lease, renewal
+        finally:
+            renewal.cancel()
+            try:
+                await renewal
+            except asyncio.CancelledError:
+                pass
+            await self._clear_reservation(lease)
+
+    async def _await_lease(self, awaitable, renewal_task, *, drain_on_renewal: bool = False):
         if renewal_task is None:
             return await awaitable
         work = asyncio.create_task(awaitable)
-        done, _ = await asyncio.wait((work, renewal_task), return_when=asyncio.FIRST_COMPLETED)
-        if renewal_task in done and work not in done:
-            work.cancel()
+        try:
+            done, _ = await asyncio.wait((work, renewal_task), return_when=asyncio.FIRST_COMPLETED)
+        except asyncio.CancelledError:
+            # Cancellation of a coroutine awaiting asyncio.to_thread does not
+            # stop the worker thread. Drain it before the caller's lease
+            # cleanup runs, otherwise the worker can mutate after ownership
+            # has been released.
             try:
-                await work
-            except asyncio.CancelledError:
+                await asyncio.shield(work)
+            except BaseException:
                 pass
+            raise
+        if renewal_task in done and work not in done:
+            if drain_on_renewal:
+                try:
+                    await asyncio.shield(work)
+                except BaseException:
+                    pass
+            else:
+                work.cancel()
+                try:
+                    await work
+                except asyncio.CancelledError:
+                    pass
             await self._assert_lease(renewal_task)
         result = await work
         await self._assert_lease(renewal_task)
@@ -652,7 +866,7 @@ class Controller:
         budget = max(0.0, float(profile.stop_timeout_seconds))
         callback = self.await_free_slot
         try:
-            parameters = inspect.signature(callback).parameters
+            parameters = signature_parameters(callback)
         except (TypeError, ValueError):
             parameters = ()
         free = callback(budget) if parameters else callback()
@@ -661,8 +875,52 @@ class Controller:
             return bool(await self._await_lease(wait, renewal_task))
         return bool(wait)
 
+    async def _probe_start_health(self, profile: Profile, renewal_task=None) -> bool:
+        """Run the existing bounded start/health producer directly."""
+        ready = self.await_ready(profile)
+        if inspect.isawaitable(ready):
+            ready = await self._await_lease(
+                asyncio.wait_for(ready, timeout=profile.health_timeout_seconds),
+                renewal_task,
+            )
+        return ready is not False
+
+    async def _cleanup_failed_start(
+        self,
+        profile: Profile,
+        actor: str,
+        renewal_task: asyncio.Task | None,
+    ) -> None:
+        """Stop only the process started under the still-owned reservation.
+
+        A service can fail before opening its health port while a non-daemon
+        child keeps the systemd unit alive.  Leaving that process behind blocks
+        every later start and also makes the normal stop preflight impossible.
+        Keep this cleanup bound to the original reservation and never replace
+        the primary start failure with cleanup detail.
+        """
+        try:
+            await self._assert_lease(renewal_task)
+            await self._await_lease(self._adapter(profile).force_stop(profile), renewal_task)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            code = "start_cleanup_failed"
+            message = "Failed start left a process that Horizon could not stop automatically."
+        else:
+            code = "start_cleanup_succeeded"
+            message = "Horizon stopped the process left by a failed start."
+        try:
+            await self._record_event(profile.id, code, message)
+        except Exception:
+            # Recovery is best-effort telemetry.  Never replace the primary
+            # start error if the audit/event store is independently degraded.
+            pass
+
     async def _start(self, action: Start, actor: str, request_id: UUID) -> JobAccepted:
         profile = self._profile(action.profile_id)
+        lifecycle_started = time.monotonic()
+        lifecycle_success = False
         self._require_operation(profile, OperationName.START, actor)
         if self._db().execute(
             "SELECT 1 FROM jobs WHERE operation='benchmark' AND state IN ('accepted','running') LIMIT 1"
@@ -683,6 +941,8 @@ class Controller:
         lease = None
         renewal_task = None
         job_id = None
+        readiness_ticket = None
+        start_attempted_by_request = False
         try:
             lease = await self._reserve(profile, "start", str(request_id), actor=actor)
             renewal_task = self._lease_renewal(lease)
@@ -690,29 +950,47 @@ class Controller:
             free = await self._wait_for_free_slot(profile, renewal_task)
             if free is False:
                 raise _ControllerFailure(ErrorCode.SLOT_CONFLICT, "slot is occupied")
+            # Publish a generation only after this request owns the slot and is
+            # actually entering the start transition.  A rejected concurrent
+            # contender must never replace the genuine start's wait target.
+            readiness_ticket = self._readiness.begin(profile.id)
+            start_attempted_by_request = True
             await self._await_lease(self._adapter(profile).start(profile), renewal_task)
             await self._assert_lease(renewal_task)
-            ready = self.await_ready(profile)
-            if inspect.isawaitable(ready):
-                ready = await self._await_lease(
-                    asyncio.wait_for(ready, timeout=profile.health_timeout_seconds),
-                    renewal_task,
-                )
+            ready = await self._probe_start_health(profile, renewal_task)
             if ready is False:
                 raise RuntimeError("start readiness failed")
             await self._transaction(lambda: self._finish(job_id, actor, "start", profile.id, ok=True))
-            return JobAccepted(job_id=job_id, state="running")
+            lifecycle_success = True
+            self._readiness.notify(readiness_ticket, ReadinessOutcome.SUCCESS)
+            return JobAccepted(
+                job_id=job_id,
+                state="running",
+                readiness_generation=readiness_ticket.generation,
+                readiness=ReadinessOutcome.SUCCESS.value,
+            )
         except asyncio.TimeoutError:
+            if start_attempted_by_request:
+                await self._cleanup_failed_start(profile, actor, renewal_task)
+            if readiness_ticket is not None:
+                self._readiness.notify(readiness_ticket, ReadinessOutcome.TIMEOUT)
             if job_id is not None:
                 await self._transaction(lambda: self._finish(job_id, actor, "start", profile.id, ok=False, code=ErrorCode.START_TIMEOUT, detail="start timed out"))
             raise _ControllerFailure(ErrorCode.START_TIMEOUT, "start timed out", retryable=True)
         except Exception as exc:
+            if start_attempted_by_request:
+                await self._cleanup_failed_start(profile, actor, renewal_task)
+            if readiness_ticket is not None:
+                self._readiness.notify(readiness_ticket, ReadinessOutcome.FAILURE)
             code = exc.code if isinstance(exc, _ControllerFailure) else ErrorCode.HEALTH_FAILED
             detail = exc.message if isinstance(exc, _ControllerFailure) else "start failed"
             if job_id is not None:
                 await self._transaction(lambda: self._finish(job_id, actor, "start", profile.id, ok=False, code=code, detail=detail))
             raise _ControllerFailure(code, detail, retryable=code is ErrorCode.HEALTH_FAILED) from exc
         finally:
+            if readiness_ticket is not None:
+                self._readiness.finish(readiness_ticket)
+            self._record_lifecycle_latency("wake_duration", profile.id, lifecycle_started, success=lifecycle_success)
             if renewal_task is not None:
                 renewal_task.cancel()
                 try:
@@ -738,7 +1016,7 @@ class Controller:
         if snapshot_method is None:
             raise _ControllerFailure(ErrorCode.HEALTH_FAILED, "stop preflight status unavailable", retryable=True)
         try:
-            parameters = inspect.signature(snapshot_method).parameters
+            parameters = signature_parameters(snapshot_method)
         except (TypeError, ValueError):
             parameters = ()
         action = GetStatus(kind="get_status", refresh=True)
@@ -761,9 +1039,9 @@ class Controller:
             raise _ControllerFailure(ErrorCode.SLOT_CONFLICT, "stop preflight slot owner changed")
         if current.active_job_id is not None:
             raise _ControllerFailure(ErrorCode.SLOT_CONFLICT, "stop preflight found an active job")
-        if current.players_online is None or (current.players_online != 0 and not allow_players):
+        if not allow_players and (current.players_online is None or current.players_online != 0):
             raise _ControllerFailure(ErrorCode.SLOT_CONFLICT, "stop preflight found active players")
-        if current.required_ports_ready is not True:
+        if not allow_players and current.required_ports_ready is not True:
             raise _ControllerFailure(ErrorCode.SLOT_CONFLICT, "stop preflight listener is not ready")
         if self.slot_inspector is not None:
             observed = self.slot_inspector.observe()
@@ -815,6 +1093,8 @@ class Controller:
         lease = None
         renewal_task = None
         job_id = None
+        lifecycle_started = time.monotonic()
+        lifecycle_success = False
         try:
             lease, renewal_task = await self._acquire_stop_fence(
                 profile, actor, request_id, allow_players=allow_players
@@ -825,6 +1105,7 @@ class Controller:
             work = stop if timeout is None else asyncio.wait_for(stop, timeout=timeout)
             await self._await_lease(work, renewal_task)
             await self._transaction(lambda: self._finish(job_id, actor, operation, profile.id, ok=True))
+            lifecycle_success = True
             return JobAccepted(job_id=job_id, state="running")
         except asyncio.TimeoutError as exc:
             if job_id is not None:
@@ -839,6 +1120,7 @@ class Controller:
                 raise
             raise _ControllerFailure(ErrorCode.INTERNAL_ERROR, detail) from exc
         finally:
+            self._record_lifecycle_latency("stop_duration", profile.id, lifecycle_started, success=lifecycle_success)
             if renewal_task is not None:
                 renewal_task.cancel()
                 try:
@@ -1083,6 +1365,8 @@ class Controller:
         target_started = False
         rollback_lease = None
         rollback_task = None
+        lifecycle_started = time.monotonic()
+        lifecycle_success = False
         try:
             lease = await self._reserve(target_profile, "switch", action.confirmation_id, actor=actor)
             renewal_task = self._lease_renewal(lease)
@@ -1118,15 +1402,11 @@ class Controller:
             target_started = True
             await self._start_with_free_retry(target_profile, renewal_task)
             await self._assert_lease(renewal_task)
-            ready = self.await_ready(target_profile)
-            if inspect.isawaitable(ready):
-                ready = await self._await_lease(
-                    asyncio.wait_for(ready, timeout=target_profile.health_timeout_seconds),
-                    renewal_task,
-                )
+            ready = await self._probe_start_health(target_profile, renewal_task)
             if ready is False:
                 raise RuntimeError("target readiness failed")
             await self._transaction(lambda: self._finish(job_id, actor, "switch", target, ok=True))
+            lifecycle_success = True
             return JobAccepted(job_id=job_id, state="running")
         except Exception as exc:
             if payload.get("rollback_on_failure", True):
@@ -1169,12 +1449,7 @@ class Controller:
                     if free is False:
                         raise RuntimeError("slot did not become free for rollback")
                     await self._start_with_free_retry(source_profile, rollback_task)
-                    ready = self.await_ready(source_profile)
-                    if inspect.isawaitable(ready):
-                        ready = await self._await_lease(
-                            asyncio.wait_for(ready, timeout=source_profile.health_timeout_seconds),
-                            rollback_task,
-                        )
+                    ready = await self._probe_start_health(source_profile, rollback_task)
                     if ready is False:
                         raise RuntimeError("rollback readiness failed")
                 except Exception as rollback_exc:
@@ -1195,6 +1470,7 @@ class Controller:
             await self._transaction(lambda: self._finish(job_id, actor, "switch", target, ok=False, code=code, detail=detail))
             raise _ControllerFailure(code, detail) from exc
         finally:
+            self._record_lifecycle_latency("switch_duration", target, lifecycle_started, success=lifecycle_success)
             if renewal_task is not None:
                 renewal_task.cancel()
                 try:
@@ -1315,6 +1591,21 @@ class Controller:
         finally:
             self.performance.record_cycle((time.monotonic() - started) * 1000.0)
 
+    async def _wait_readiness(self, action: WaitReadiness, actor: str, request_id: UUID) -> ReadinessResult:
+        del actor, request_id
+        try:
+            ticket = self._readiness.latest(action.profile_id, generation=action.generation)
+            outcome = await self._readiness.wait(ticket, timeout=action.timeout_seconds)
+        except asyncio.TimeoutError as exc:
+            raise _ControllerFailure(ErrorCode.START_TIMEOUT, "start readiness timed out", retryable=True) from exc
+        except (RuntimeError, ValueError) as exc:
+            raise _ControllerFailure(ErrorCode.HEALTH_FAILED, "start readiness is unavailable", retryable=True) from exc
+        return ReadinessResult(
+            profile_id=action.profile_id,
+            generation=ticket.generation,
+            outcome=outcome.value,
+        )
+
     async def _get_status_timed(self, action: GetStatus, actor: str, request_id: UUID) -> StatusSnapshot:
         service_group = getattr(self.services, "status", None)
         if service_group is not None:
@@ -1325,9 +1616,6 @@ class Controller:
             result = StatusSnapshot(generation=0, observed_at=self._clock(), profiles=())
         if isinstance(result, StatusSnapshot):
             result = result.model_copy(update={"initializing": self.initializing})
-            if action.refresh:
-                await self._apply_idle_stops(result, request_id)
-                await self._apply_schedules(result, request_id)
             return result
         return result
 
@@ -1371,12 +1659,60 @@ class Controller:
         due = self._schedule.due(snapshot.observed_at)
         if not due:
             return
+        benchmark_due = tuple(entry for entry in due if entry.operation == "benchmark")
+        if benchmark_due:
+            statuses = tuple(snapshot.profiles)
+            evidence_reader = self._service("status", "benchmark_eligibility")
+            evidence = None
+            if callable(evidence_reader):
+                try:
+                    policy_entry = benchmark_due[0]
+                    evidence = evidence_reader(
+                        maintenance_window=policy_entry.maintenance_window,
+                        rollback_safe=policy_entry.rollback_safe,
+                        public_wake_policy=policy_entry.public_wake_policy,
+                    )
+                    if inspect.isawaitable(evidence):
+                        evidence = await evidence
+                except Exception:
+                    evidence = None
+            evidence_ok = isinstance(evidence, Mapping) and all(evidence.get(key) is True for key in (
+                "maintenance_window", "storage_acceptable", "ups_acceptable",
+                "quiet_period", "no_wake_session", "no_conflicting_jobs", "rollback_safe_public_wake",
+            ))
+            eligible = (
+                not any(item.players_online != 0 or item.active_job_id is not None or getattr(item, "state", "") not in {"stopped", "failed", "blocked", "unknown"} for item in statuses)
+                and not any(getattr(item, "slot_owner", None) for item in statuses)
+                and evidence_ok
+                and all(getattr(entry, "maintenance_window", False) and getattr(entry, "rollback_safe", False) and getattr(entry, "public_wake_policy", "disabled") == "safe" for entry in benchmark_due)
+            )
+            for entry in benchmark_due:
+                if self._schedule_fire_seen(entry, snapshot.observed_at):
+                    continue
+                await self._record_event(entry.profile, "scheduled_fire", self._schedule_fire_key(entry, snapshot.observed_at))
+                if not eligible:
+                    await self._record_event(entry.profile, "scheduled_benchmark_skipped", "benchmark eligibility evidence unavailable")
+                    continue
+                try:
+                    await self._run_benchmark(
+                        RunBenchmark(kind="run_benchmark", profile_id=entry.profile,
+                                     baseline_preset=entry.baseline_preset or "", candidate_preset=entry.candidate_preset or ""),
+                        "system:schedule", request_id,
+                    )
+                    await self._record_event(entry.profile, "scheduled_benchmark", "scheduled benchmark dispatched")
+                except Exception:
+                    await self._record_event(entry.profile, "scheduled_benchmark_failed", "scheduled benchmark dispatch failed")
+            due = tuple(entry for entry in due if entry.operation != "benchmark")
+            if not due:
+                return
         for entry in due:
-            # Older/public schedule entries describe switches only.  Private
-            # backup-aware entries may carry this optional field, but the
-            # schedule loop must not make that extension mandatory.
-            backup_destination = getattr(entry, "backup_destination", None)
-            if backup_destination is None:
+            # Claim each fire immediately before executing it. This is
+            # intentionally sequential: duplicate config entries in one due
+            # tick must observe the marker written by the first entry.
+            if self._schedule_fire_seen(entry, snapshot.observed_at):
+                continue
+            await self._record_event(entry.profile, "scheduled_fire", self._schedule_fire_key(entry, snapshot.observed_at))
+            if entry.operation != "backup" or entry.backup_destination is None:
                 continue
             job_id = await self._transaction(
                 lambda: self._job_intent("system:schedule", "scheduled_backup", entry.profile)
@@ -1390,8 +1726,8 @@ class Controller:
                     CreateBackup(
                         kind="create_backup",
                         profile_id=entry.profile,
-                        protected=backup_destination is BackupDestination.HORIZON_B2,
-                        destination=backup_destination,
+                        protected=entry.backup_destination is BackupDestination.HORIZON_B2,
+                        destination=entry.backup_destination,
                     ),
                     "system:schedule",
                     request_id,
@@ -1445,7 +1781,7 @@ class Controller:
                     "deferred" if deferred else "failed",
                     entry.profile.value,
                 )
-        due = tuple(entry for entry in due if getattr(entry, "backup_destination", None) is None)
+        due = tuple(entry for entry in due if entry.operation == "switch")
         if not due:
             return
         statuses = {item.profile_id: item for item in snapshot.profiles}
@@ -1488,8 +1824,28 @@ class Controller:
                 await self._record_event(entry.profile, "scheduled_switch", "scheduled switch failed")
                 _LOG.warning("scheduled switch failed for %s", entry.profile, exc_info=True)
 
+    @staticmethod
+    def _schedule_fire_key(entry: ScheduleEntry, observed_at: datetime) -> str:
+        minute = observed_at.astimezone(timezone.utc).replace(second=0, microsecond=0)
+        operation = entry.operation
+        destination = entry.backup_destination.value if entry.backup_destination is not None else "none"
+        return f"{minute.isoformat()}:{entry.profile.value}:{operation}:{destination}:{entry.cron}:{entry.campaign or 'none'}"
+
+    def _schedule_fire_seen(self, entry: ScheduleEntry, observed_at: datetime) -> bool:
+        row = self._db().execute(
+            "SELECT 1 FROM events WHERE profile_id=? AND code='scheduled_fire' AND message=? LIMIT 1",
+            (entry.profile.value, self._schedule_fire_key(entry, observed_at)),
+        ).fetchone()
+        return row is not None
+
     async def _get_perf(self, action: GetPerf, actor: str, request_id: UUID) -> PerfSnapshot:
-        return PerfSnapshot.model_validate(self.performance.snapshot())
+        snapshot = self.performance.snapshot()
+        services = getattr(self, "services", None)
+        snapshot["databases"] = await collect_perf_databases_async(
+            state=getattr(self, "state_db", None),
+            telemetry=getattr(services, "telemetry_db", None),
+        )
+        return PerfSnapshot.model_validate(snapshot)
 
     async def _get_profiles(self, action: GetProfiles, actor: str, request_id: UUID) -> tuple[PublicProfile, ...]:
         service = self._service("profiles", "public_profiles")
@@ -1517,22 +1873,76 @@ class Controller:
         )
 
     async def _get_logs(self, action: GetLogs, actor: str, request_id: UUID) -> LogPage:
+        try:
+            offset = self._log_offset(action.page.cursor)
+        except ValueError as exc:
+            raise _ControllerFailure(ErrorCode.INVALID_REQUEST, "invalid log cursor") from exc
         service = self._service("logs", "page")
         if service is not None:
             result = service(action, actor, request_id)
-            return await result if inspect.isawaitable(result) else result
+            result = await result if inspect.isawaitable(result) else result
+            return self._bound_log_page(
+                LogPage(items=tuple(result.items[offset:]), next_cursor=None),
+                action.page,
+                offset=offset,
+            )
         profile = self._profile(action.profile_id)
         adapter = self._adapter(profile)
+        requested = min(5000, action.page.limit + offset)
         if action.page.since is None and action.page.until is None:
-            logs = await adapter.recent_logs(profile, action.page.limit)
+            logs = await adapter.recent_logs(profile, requested)
         else:
             logs = await adapter.recent_logs(
                 profile,
-                action.page.limit,
+                requested,
                 since=action.page.since,
                 until=action.page.until,
             )
-        return LogPage(items=tuple(logs), next_cursor=None)
+        return self._bound_log_page(LogPage(items=tuple(logs[offset:]), next_cursor=None), action.page, offset=offset)
+
+    @staticmethod
+    def _log_offset(cursor: str | None) -> int:
+        if not cursor:
+            return 0
+        if not isinstance(cursor, str) or len(cursor) > 4 or not cursor.isascii() or not cursor.isdecimal() or (len(cursor) > 1 and cursor.startswith("0")):
+            raise ValueError("invalid log cursor")
+        value = int(cursor, 10)
+        if value > 5000:
+            raise ValueError("invalid log cursor")
+        return value
+
+    @staticmethod
+    def _bound_log_page(page: LogPage, options, *, offset: int | None = None) -> LogPage:
+        """Keep serialized log responses below the explicit RPC frame budget."""
+        start = 0 if offset is None else offset
+        items = tuple(page.items)
+        selected: list[Any] = []
+        encoded_items: list[bytes] = []
+        encoded_total = 0
+        # Encode each record once. This avoids repeatedly serializing the
+        # entire growing page (which was quadratic for small records).
+        for item in items:
+            encoded_item = json.dumps(item.model_dump(mode="json"), separators=(",", ":")).encode()
+            projected = 32 + encoded_total + len(encoded_items) + len(encoded_item)
+            if projected > MAX_RESPONSE_BYTES - 2048:
+                break
+            selected.append(item)
+            encoded_items.append(encoded_item)
+            encoded_total += len(encoded_item)
+        more = len(selected) < len(items)
+        # The controller owns one cursor contract for logs: a decimal offset
+        # into the bounded result set. Never expose an opaque backend cursor
+        # that this endpoint cannot validate on the next request.
+        next_cursor = str(start + len(selected)) if more else None
+        result = LogPage(items=tuple(selected), next_cursor=next_cursor)
+        # Account for exact wrapper/cursor/escaping bytes once, then trim only
+        # the tail if the typed envelope itself crosses the hard budget.
+        while selected and len(json.dumps(result.model_dump(mode="json"), separators=(",", ":")).encode()) > MAX_RESPONSE_BYTES:
+            selected.pop()
+            encoded_items.pop()
+            next_cursor = str(start + len(selected))
+            result = LogPage(items=tuple(selected), next_cursor=next_cursor)
+        return result
 
     async def _list_backups(self, action: ListBackups, actor: str, request_id: UUID) -> BackupPage:
         service = self._service("backups", "list")
@@ -1540,6 +1950,19 @@ class Controller:
             result = service(action, actor, request_id)
             return await result if inspect.isawaitable(result) else result
         return BackupPage(items=(), next_cursor=None)
+
+    async def _list_aggregate_backups(self, action: ListAggregateBackups, actor: str, request_id: UUID) -> BackupPage:
+        items = []
+        per_profile = min(200, action.page.limit)
+        for profile_id in sorted(self.profiles, key=lambda item: item.value):
+            page = await self._list_backups(
+                ListBackups(kind="list_backups", profile_id=profile_id,
+                            page=PageOptions(limit=per_profile)),
+                actor, request_id,
+            )
+            items.extend(page.items)
+        items.sort(key=lambda item: (str(item.created_at), str(item.id)), reverse=True)
+        return BackupPage(items=tuple(items[:action.page.limit]), next_cursor=None)
 
     async def _list_events(self, action: ListEvents, actor: str, request_id: UUID) -> EventPage:
         service = self._service("audit", "list_events")
@@ -1549,15 +1972,21 @@ class Controller:
         return EventPage(items=(), next_cursor=None)
 
     async def _get_stats_summary(self, action: GetStatsSummary, actor: str, request_id: UUID) -> dict[str, Any]:
-        return stats_summary(self._db(), action.profile_id.value, action.days, now=_iso(self._clock()))
+        return stats_summary(self._db(), action.profile_id.value, action.days, hours=action.hours, now=_iso(self._clock()))
 
     async def _get_stats_heatmap(self, action: GetStatsHeatmap, actor: str, request_id: UUID) -> dict[str, Any]:
-        return stats_heatmap(self._db(), action.profile_id.value, action.days, now=_iso(self._clock()))
+        return stats_heatmap(self._db(), action.profile_id.value, action.days, hours=action.hours, now=_iso(self._clock()))
 
     async def _get_stats_tps(self, action: GetStatsTps, actor: str, request_id: UUID) -> dict[str, Any]:
         if action.profile_id.value not in {"minecraft", "minecraft-sunlit-cobblemon"}:
             raise _ControllerFailure(ErrorCode.INVALID_REQUEST, "tick telemetry is only available for Minecraft")
-        return stats_tps(self._db(), action.profile_id.value, action.window, now=_iso(self._clock()))
+        service = self._service("stats", "tps")
+        if service is not None:
+            return await self._invoke(service, action, actor, request_id, now=_iso(self._clock()))
+        return stats_tps(
+            self._db(), action.profile_id.value, action.window, now=_iso(self._clock()),
+            resolution=action.resolution, limit=action.limit,
+        )
 
     async def _get_profile_config(self, action: GetProfileConfig, actor: str, request_id: UUID) -> ProfileConfigResponse:
         profile = self._profile(action.profile_id)
@@ -1574,6 +2003,16 @@ class Controller:
             return BenchmarkOverview(profile_id=action.profile_id, available=False, presets=(), runs=())
         return await self._invoke(service, action, actor, request_id)
 
+    async def _export_benchmarks(self, action: ExportBenchmarks, actor: str, request_id: UUID) -> BenchmarkExport:
+        self._profile(action.profile_id)
+        service = self._service("benchmarks", "export_history")
+        if service is None:
+            raise _ControllerFailure(ErrorCode.BENCHMARK_FAILED, "benchmark service unavailable")
+        result = service(action.profile_id, fmt=action.format, limit=action.limit)
+        if inspect.isawaitable(result):
+            result = await result
+        return BenchmarkExport(format=action.format, content=str(result))
+
     async def _run_benchmark(self, action: RunBenchmark, actor: str, request_id: UUID) -> JobAccepted:
         profile = self._profile(action.profile_id)
         self._require_operation(profile, OperationName.BENCHMARK, actor)
@@ -1583,13 +2022,18 @@ class Controller:
         fail = self._service("benchmarks", "fail")
         if None in {prove_idle, prepare, run, fail}:
             raise _ControllerFailure(ErrorCode.BENCHMARK_FAILED, "benchmark service unavailable")
+        lease, renewal_task = await self._operation_lease_acquire(profile, "benchmark", request_id, actor=actor)
         try:
             result = prove_idle(action.profile_id)
             if inspect.isawaitable(result):
-                await result
+                await self._await_lease(result, renewal_task)
         except SafeError as exc:
+            await self._operation_lease_release(lease, renewal_task)
             code = ErrorCode.INVALID_STATE if exc.code == "invalid_state" else ErrorCode.BENCHMARK_FAILED
             raise _ControllerFailure(code, exc.message, retryable=code is ErrorCode.INVALID_STATE) from exc
+        except Exception:
+            await self._operation_lease_release(lease, renewal_task)
+            raise
 
         def accept() -> str:
             active = self._db().execute(
@@ -1616,14 +2060,70 @@ class Controller:
         try:
             job_id = await self._transaction(accept)
         except SafeError as exc:
+            await self._operation_lease_release(lease, renewal_task)
             raise _ControllerFailure(ErrorCode.INVALID_REQUEST, exc.message) from exc
+        except Exception:
+            await self._operation_lease_release(lease, renewal_task)
+            raise
         task = asyncio.create_task(
-            self._benchmark_worker(action, actor, request_id, job_id, run, fail),
+            self._benchmark_worker(action, actor, request_id, job_id, run, fail, lease, renewal_task),
             name=f"benchmark-{job_id}",
         )
         self._background_tasks.add(task)
         task.add_done_callback(self._background_tasks.discard)
         return JobAccepted(job_id=job_id, state="accepted")
+
+    async def _operation_lease_acquire(self, profile: Profile, operation: str, request_id: UUID, *, actor: str):
+        lease = await self._reserve(profile, operation, str(request_id), actor=actor)
+        renewal = self._lease_renewal(lease)
+        try:
+            await self._assert_lease(renewal)
+        except Exception:
+            renewal.cancel()
+            try:
+                await renewal
+            except asyncio.CancelledError:
+                pass
+            await self._clear_reservation(lease)
+            raise
+        return lease, renewal
+
+    async def _operation_lease_release(self, lease, renewal) -> None:
+        renewal.cancel()
+        try:
+            await renewal
+        except asyncio.CancelledError:
+            pass
+        await self._clear_reservation(lease)
+
+    async def _cancel_benchmark(self, action: CancelBenchmark, actor: str, request_id: UUID) -> JobAccepted:
+        del request_id
+        row = self._db().execute(
+            "SELECT profile_id,state FROM jobs WHERE id=? AND operation='benchmark'",
+            (action.job_id,),
+        ).fetchone()
+        if row is None or row[1] not in {"accepted", "running"}:
+            raise _ControllerFailure(ErrorCode.INVALID_STATE, "benchmark job is not active")
+        service = self._service("benchmarks", "cancel")
+        if service is None or not service(action.job_id):
+            raise _ControllerFailure(ErrorCode.INVALID_STATE, "benchmark process is not cancellable")
+        failed = self._service("benchmarks", "fail")
+        if failed is not None:
+            result = failed(action.job_id, "cancelled")
+            if inspect.isawaitable(result):
+                await result
+        await self._transaction(
+            lambda: self._finish(
+                action.job_id,
+                actor,
+                "benchmark",
+                ProfileId(row[0]),
+                ok=False,
+                code=ErrorCode.BENCHMARK_FAILED,
+                detail="benchmark cancelled",
+            )
+        )
+        return JobAccepted(job_id=action.job_id, state="cancelled")
 
     async def _benchmark_worker(
         self,
@@ -1633,12 +2133,18 @@ class Controller:
         job_id: str,
         run: Any,
         fail: Any,
+        lease: tuple[ProfileId, str, int],
+        renewal_task: asyncio.Task,
     ) -> None:
         del request_id
         try:
+            await self._assert_lease(renewal_task)
             result = run(action, job_id)
             if inspect.isawaitable(result):
-                await result
+                result = await self._await_lease(result, renewal_task, drain_on_renewal=True)
+        except asyncio.CancelledError:
+            await self._operation_lease_release(lease, renewal_task)
+            raise
         except Exception:
             try:
                 failed = fail(job_id, "benchmark_failed")
@@ -1658,39 +2164,73 @@ class Controller:
                 )
             )
             _LOG.exception("benchmark job %s failed", job_id)
+            await self._operation_lease_release(lease, renewal_task)
             return
-        await self._transaction(
-            lambda: self._finish(
-                job_id,
-                actor,
-                "benchmark",
-                action.profile_id,
-                ok=True,
-                detail="benchmark completed",
+        try:
+            alerts = getattr(getattr(self, "services", None), "alerts", None)
+            regression = False
+            benchmark_service = self._service("benchmarks", "evaluate_completed_regression")
+            if benchmark_service is not None:
+                try:
+                    evaluated = benchmark_service(action.profile_id, result)
+                    regression = await evaluated if inspect.isawaitable(evaluated) else bool(evaluated)
+                except Exception:
+                    _LOG.warning("rolling benchmark regression evaluation failed", exc_info=True)
+            if alerts is not None:
+                try:
+                    alerts.observe(
+                        action.profile_id,
+                        profile_state="stopped",
+                        now=time.monotonic(),
+                        benchmark_regression=regression,
+                    )
+                except Exception:
+                    _LOG.debug("benchmark alert evaluation dropped", exc_info=True)
+            await self._transaction(
+                lambda: self._finish(
+                    job_id,
+                    actor,
+                    "benchmark",
+                    action.profile_id,
+                    ok=True,
+                    detail="benchmark completed",
+                )
             )
-        )
+        finally:
+            await self._operation_lease_release(lease, renewal_task)
 
     async def _set_profile_config(self, action: SetProfileConfig, actor: str, request_id: UUID) -> ProfileConfigResponse:
         profile = self._profile(action.profile_id)
-        status_service = getattr(self.services, "status", None)
-        if status_service is not None:
-            snapshot = status_service.cached_snapshot()
-            if inspect.isawaitable(snapshot):
-                snapshot = await snapshot
-            current = next((item for item in snapshot.profiles if item.profile_id == profile.id), None)
-            state = getattr(getattr(current, "state", None), "value", getattr(current, "state", None))
-            if state in {"starting", "stopping"}:
-                raise _ControllerFailure(ErrorCode.INVALID_STATE, "profile config cannot change while the profile is transitioning")
-        try:
-            result = set_profile_config(profile, action.changes)
-            settings = tuple(ProfileConfigEntry.model_validate(item) for item in get_profile_config(profile))
-        except ConfigValidationError as exc:
-            raise _ControllerFailure(ErrorCode.INVALID_REQUEST, str(exc)) from exc
-        changed = tuple(result["changed"])
-        restart_required = tuple(result["restart_required"])
-        await self._record_event(profile.id, "config_changed", f"config changed: {', '.join(changed) or 'no changes'}")
-        await self._record_audit(actor, "set_profile_config", profile.id, "succeeded", None, f"changed keys: {', '.join(changed) or 'none'}; restart required: {', '.join(restart_required) or 'none'}")
-        return ProfileConfigResponse(profile_id=profile.id, settings=settings, changed=changed, restart_required=restart_required)
+        async with self._operation_lease(profile, "set_profile_config", request_id, actor=actor) as (_lease, renewal):
+            status_service = getattr(self.services, "status", None)
+            if status_service is not None:
+                snapshot = status_service.cached_snapshot()
+                if inspect.isawaitable(snapshot):
+                    snapshot = await snapshot
+                current = next((item for item in snapshot.profiles if item.profile_id == profile.id), None)
+                state = getattr(getattr(current, "state", None), "value", getattr(current, "state", None))
+                if state in {"starting", "stopping"}:
+                    raise _ControllerFailure(ErrorCode.INVALID_STATE, "profile config cannot change while the profile is transitioning")
+            try:
+                result = await self._await_lease(
+                    asyncio.to_thread(
+                        set_profile_config, profile, action.changes,
+                        lease_check=lambda: self._lease_owned_sync(_lease),
+                    ), renewal,
+                    drain_on_renewal=True,
+                )
+                settings = tuple(ProfileConfigEntry.model_validate(item) for item in get_profile_config(profile))
+            except ConfigValidationError as exc:
+                raise _ControllerFailure(ErrorCode.INVALID_REQUEST, str(exc)) from exc
+            except RuntimeError as exc:
+                if str(exc) != "operation lease was lost before config publication":
+                    raise
+                raise _ControllerFailure(ErrorCode.SLOT_CONFLICT, str(exc), retryable=True) from exc
+            changed = tuple(result["changed"])
+            restart_required = tuple(result["restart_required"])
+            await self._record_event(profile.id, "config_changed", f"config changed: {', '.join(changed) or 'no changes'}")
+            await self._record_audit(actor, "set_profile_config", profile.id, "succeeded", None, f"changed keys: {', '.join(changed) or 'none'}; restart required: {', '.join(restart_required) or 'none'}")
+            return ProfileConfigResponse(profile_id=profile.id, settings=settings, changed=changed, restart_required=restart_required)
 
     def _schedule_response(self) -> ScheduleResponse:
         now = self._clock()
@@ -1701,6 +2241,10 @@ class Controller:
                 next_fire=entry.next_fire(now),
                 enabled=entry.enabled,
                 backup_destination=entry.backup_destination,
+                operation=entry.operation,
+                baseline_preset=entry.baseline_preset,
+                candidate_preset=entry.candidate_preset,
+                campaign=entry.campaign,
             )
             for entry in self._schedule.entries
         ))
@@ -1731,14 +2275,85 @@ class Controller:
             return await result if inspect.isawaitable(result) else result
         return AuditPage(items=(), next_cursor=None)
 
+    def _lease_owned_sync(self, lease: tuple[ProfileId, str, int]) -> bool:
+        store = self.reservation_store
+        if store is None:
+            return True
+        owns_live = getattr(store, "owns_live", None)
+        if callable(owns_live):
+            return bool(owns_live(*lease))
+        if not hasattr(store, "read"):
+            return True
+        current = store.read()
+        return current is not None and (
+            current.profile_id, current.operation_id, current.state_generation
+        ) == lease
+
+    async def _run_maintenance_job(
+        self, profile: Profile, operation: str, action: Any, actor: str, request_id: UUID,
+        service: Any, **extra: Any,
+    ) -> JobAccepted:
+        """Run one synchronous maintenance worker under a durable controller job."""
+        async with self._operation_lease(profile, operation, request_id, actor=actor) as (lease, renewal):
+            job_id = await self._transaction(lambda: self._job_intent(actor, operation, profile.id))
+            try:
+                result = await self._await_lease(
+                    self._invoke(service, action, actor, request_id,
+                                 lease_check=lambda: self._lease_owned_sync(lease), **extra),
+                    renewal,
+                    drain_on_renewal=True,
+                )
+            except asyncio.CancelledError:
+                await self._transaction(lambda: self._finish(
+                    job_id, actor, operation, profile.id, ok=False,
+                    code=ErrorCode.INTERNAL_ERROR, detail="maintenance cancelled",
+                ))
+                raise
+            except Exception as exc:
+                failure = self._maintenance_failure(operation, exc)
+                await self._transaction(lambda: self._finish(
+                    job_id, actor, operation, profile.id, ok=False,
+                    code=failure.code, detail=failure.message,
+                ))
+                raise failure from exc
+            await self._transaction(lambda: self._finish(
+                job_id, actor, operation, profile.id, ok=True, detail=f"{operation} completed",
+            ))
+            return JobAccepted(job_id=job_id, state="succeeded")
+
+    @staticmethod
+    def _maintenance_failure(operation: str, exc: Exception) -> _ControllerFailure:
+        if isinstance(exc, _ControllerFailure):
+            return exc
+        defaults = {
+            "backup": ErrorCode.BACKUP_FAILED,
+            "restore": ErrorCode.RESTORE_FAILED,
+            "update": ErrorCode.UPDATE_FAILED,
+            "world_clone": ErrorCode.INVALID_REQUEST,
+        }
+        if isinstance(exc, SafeError):
+            try:
+                code = ErrorCode(exc.code)
+            except ValueError:
+                code = defaults.get(operation, ErrorCode.INTERNAL_ERROR)
+            allowed = {
+                "backup": {ErrorCode.BACKUP_FAILED, ErrorCode.INVALID_REQUEST, ErrorCode.SLOT_CONFLICT},
+                "restore": {ErrorCode.RESTORE_FAILED, ErrorCode.INVALID_REQUEST, ErrorCode.SLOT_CONFLICT},
+                "update": {ErrorCode.UPDATE_FAILED, ErrorCode.INVALID_REQUEST, ErrorCode.SLOT_CONFLICT},
+                "world_clone": {ErrorCode.INVALID_REQUEST, ErrorCode.SLOT_CONFLICT},
+            }
+            if code not in allowed.get(operation, set()):
+                code = defaults.get(operation, ErrorCode.INTERNAL_ERROR)
+            return _ControllerFailure(code, exc.message, retryable=exc.retryable)
+        return _ControllerFailure(defaults.get(operation, ErrorCode.INTERNAL_ERROR), f"{operation} failed")
+
     async def _create_backup(self, action: CreateBackup, actor: str, request_id: UUID) -> JobAccepted:
         profile = self._profile(action.profile_id)
         self._require_operation(profile, OperationName.BACKUP, actor)
         service = self._service("backups", "create")
         if service is None:
             raise _ControllerFailure(ErrorCode.BACKUP_FAILED, "backup service unavailable")
-        result = await self._invoke(service, action, actor, request_id)
-        return result
+        return await self._run_maintenance_job(profile, "backup", action, actor, request_id, service)
 
     async def _prepare_restore(self, action: PrepareRestore, actor: str, request_id: UUID) -> ConfirmationSummary:
         profile = self._profile(action.profile_id)
@@ -1766,7 +2381,9 @@ class Controller:
             service = self._service("backups", "restore")
         if service is None:
             raise _ControllerFailure(ErrorCode.RESTORE_FAILED, "restore service unavailable")
-        return await self._invoke(service, action, actor, request_id, payload=payload)
+        profile_id = payload.get("profile_id", getattr(action, "profile_id", None))
+        profile = self._profile(profile_id)
+        return await self._run_maintenance_job(profile, "restore", action, actor, request_id, service, payload=payload)
 
     async def _prepare_world_clone(self, action: PrepareWorldClone, actor: str, request_id: UUID) -> ConfirmationSummary:
         source = self._profile(ProfileId.TERRARIA_VANILLA)
@@ -1803,7 +2420,8 @@ class Controller:
             service = self._service("worlds", "clone")
         if service is None:
             raise _ControllerFailure(ErrorCode.INVALID_REQUEST, "world clone service unavailable")
-        return await self._invoke(service, action, actor, request_id, payload=payload)
+        source = self._profile(ProfileId.TERRARIA_VANILLA)
+        return await self._run_maintenance_job(source, "world_clone", action, actor, request_id, service, payload=payload)
 
     async def _check_update(self, action: CheckUpdate, actor: str, request_id: UUID) -> UpdateStatus:
         profile = self._profile(action.profile_id)
@@ -1840,7 +2458,8 @@ class Controller:
             service = self._service("updates", "apply")
         if service is None:
             raise _ControllerFailure(ErrorCode.UPDATE_FAILED, "update service unavailable")
-        return await self._invoke(service, action, actor, request_id, payload=payload)
+        profile = self._profile(payload.get("profile_id", getattr(action, "profile_id", None)))
+        return await self._run_maintenance_job(profile, "update", action, actor, request_id, service, payload=payload)
 
     async def _get_notification_config(self, action: GetNotificationConfig, actor: str, request_id: UUID) -> NotificationConfig:
         service = self._service("notifications", "get_config")
@@ -1891,8 +2510,7 @@ class Controller:
     async def _invoke(self, service, action, actor: str, request_id: UUID, **extra):
         """Call an injected typed seam without forwarding arbitrary RPC maps."""
         try:
-            signature = inspect.signature(service)
-            names = tuple(signature.parameters)
+            names = tuple(parameter.name for parameter in signature_parameters(service))
         except (TypeError, ValueError):
             names = ()
         kwargs = {name: value for name, value in extra.items() if name in names}
@@ -1916,4 +2534,4 @@ class _ControllerFailure(Exception):
         super().__init__(message)
 
 
-__all__ = ["Controller", "DISPATCH", "dispatch_is_exhaustive"]
+__all__ = ["Controller", "DISPATCH", "STREAM_ACTIONS", "dispatch_is_exhaustive"]

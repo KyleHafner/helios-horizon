@@ -18,10 +18,12 @@ class _Window:
         self.interval_count = 0
         self.interval_total = 0.0
         self.interval_max = 0.0
+        self.total_count = 0
 
     def record(self, value: float) -> None:
         value = max(0.0, float(value))
         self.samples.append(value)
+        self.total_count += 1
         self.interval_samples.append(value)
         self.interval_count += 1
         self.interval_total += value
@@ -79,6 +81,10 @@ class PerformanceTracker:
             raise ValueError("performance ring bound out of range")
         self.cycle = _Window(maxlen=maxlen)
         self.rpc = _Window(maxlen=maxlen)
+        # Keep the response bounded. The Phase2 collector uses the monotonic
+        # sequence below to consume unseen values and rejects an overwrite.
+        self.event_loop_lag = _Window(maxlen=maxlen)
+        self.maintenance = _Window(maxlen=maxlen)
         self._last_flush: datetime | None = None
 
     def record_cycle(self, duration_ms: float) -> None:
@@ -87,8 +93,27 @@ class PerformanceTracker:
     def record_rpc(self, duration_ms: float) -> None:
         self.rpc.record(duration_ms)
 
-    def snapshot(self) -> dict[str, dict[str, float | int | None]]:
-        return {"cycle": self.cycle.snapshot(), "rpc": self.rpc.snapshot()}
+    def record_event_loop_lag(self, duration_ms: float) -> None:
+        self.event_loop_lag.record(duration_ms)
+
+    def record_maintenance(self, duration_ms: float) -> None:
+        self.maintenance.record(duration_ms)
+
+    def snapshot(self) -> dict[str, dict[str, float | int | None] | list[float] | dict[str, int]]:
+        event_values = list(self.event_loop_lag.samples)
+        event_end = self.event_loop_lag.total_count
+        maintenance_values = list(self.maintenance.samples)
+        maintenance_end = self.maintenance.total_count
+        return {"cycle": self.cycle.snapshot(), "rpc": self.rpc.snapshot(),
+                "maintenance": self.maintenance.snapshot(),
+                "maintenance_ms": maintenance_values,
+                "maintenance_sequence": {
+                    "start": maintenance_end - len(maintenance_values), "end": maintenance_end,
+                },
+                "event_loop_lag_ms": event_values,
+                "event_loop_lag_sequence": {
+                    "start": event_end - len(event_values), "end": event_end,
+                }}
 
     def flush_if_due(
         self,

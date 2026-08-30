@@ -1,0 +1,59 @@
+# Pinned lazymc v0.2.11 contract.  The binary is provisioned separately after
+# verifying the signed source commit recorded in the H2 handoff.
+[public]
+address = "0.0.0.0:25565"
+version = "1.20.1"
+
+[server]
+address = "127.0.0.1:25566"
+directory = "/etc/game-control/lazymc"
+# Ownership boundary: lazymc runs this fixed Horizon supervisor/helper only.
+# It never launches, owns, signals, or stops Java. The helper requests typed
+# wake/status through Horizon; Horizon starts Java and owns its health gate.
+# The helper stays live while the backend is live and exits only after typed
+# status reports the controller-owned idle stop.
+command = "/usr/local/libexec/horizon-lazymc-wake"
+freeze_process = false
+wake_on_start = false
+wake_on_crash = false
+probe_on_start = false
+forge = true
+start_timeout = 600
+stop_timeout = 120
+wake_whitelist = true
+block_banned_ips = true
+
+[time]
+# lazymc is only the public proxy.  Horizon's player-aware idle-stop is the
+# sole stop owner; this value keeps lazymc from terminating the adapter child.
+sleep_after = 4294967295
+minimum_online_time = 600
+
+[motd]
+sleeping = "§7Horizon is sleeping\n§2☻ Join to wake it"
+starting = "§2☻ Horizon is starting...\n§7⌛ Please wait"
+stopping = "§7Horizon is stopping...\n⌛ Please reconnect later"
+
+[join]
+# Hold is bounded by Minecraft's client timeout; kick is the bounded fallback
+# while the controller's Forge health gate may take up to 600 seconds.
+methods = ["hold", "kick"]
+
+[join.hold]
+timeout = 25
+
+[join.kick]
+starting = "Horizon is starting. Please reconnect in a minute."
+stopping = "Horizon is stopping. Please reconnect later."
+
+[lockout]
+enabled = false
+
+[rcon]
+enabled = false
+
+[advanced]
+rewrite_server_properties = false
+
+[config]
+version = "0.2.11"

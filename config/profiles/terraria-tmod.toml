@@ -8,17 +8,20 @@ stop_timeout_seconds = 90
 health_timeout_seconds = 120
 min_available_memory_bytes = 3221225472
 min_free_disk_bytes = 8589934592
-public_endpoint = { host = "terraria.example.com", port = 7777, protocol = "tcp", relay_unit = "terraria-relay.service" }
+public_endpoint = { host = "terraria.example.com", port = 7777, protocol = "tcp", relay_unit = "horizon-terraria-relay.service" }
 operations = ["start", "stop", "restart", "force_stop", "command", "backup", "restore", "clone_target", "update_check", "update_apply"]
 notification_events = ["start", "stop", "failed_start", "crash", "forced_stop", "slot_conflict", "low_disk", "backup_failure", "update_complete", "update_failure", "idle_stop"]
 
 [process]
 executable = "/opt/game-servers/terraria-tmod/current/dotnet/dotnet"
-argv_contains = ["tModLoader.dll", "-config", "/srv/game-servers/terraria-tmod/config/serverconfig.txt", "-tmlsavedirectory", "/srv/game-servers/terraria-tmod"]
+argv_contains = ["/opt/game-servers/terraria-tmod/current/tModLoader.dll", "-server", "-config", "/srv/game-servers/terraria-tmod/config/serverconfig.txt", "-tmlsavedirectory", "/srv/game-servers/terraria-tmod"]
 ready_log_pattern = "Server started"
 
 [paths]
-data_roots = ["/opt/game-servers/terraria-tmod", "/srv/game-servers/terraria-tmod"]
+# Application backups contain mutable production state only. The pinned release
+# under /opt is installed and recovered separately.
+data_roots = ["/srv/game-servers/terraria-tmod", "/opt/game-servers/terraria-tmod"]
+backup_roots = ["/srv/game-servers/terraria-tmod"]
 mutable_root = "/srv/game-servers/terraria-tmod"
 log_files = ["/srv/game-servers/terraria-tmod/logs/server.log"]
 backup_root = "/var/backups/game-servers/terraria-tmod"
@@ -28,5 +31,6 @@ version_file = "/opt/game-servers/terraria-tmod/current/version.txt"
 [update]
 kind = "release_symlink"
 download_url = "https://github.com/tModLoader/tModLoader/releases/download/v2026.05.3.0/tModLoader.zip"
+sha256 = "7e8345f1e6bd5214840ee204ba78401547607da9660feb633779c279e7eba3ab"
 executable_relative_path = "start-tModLoaderServer.sh"
 version_command = ["/opt/game-servers/terraria-tmod/current/start-tModLoaderServer.sh", "--version"]

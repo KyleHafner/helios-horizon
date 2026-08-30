@@ -11,6 +11,7 @@ window.HORIZON_COMMANDS = {
     { cmd: "gamemode", args: "<mode> <player>", help: "Change gamemode" },
     { cmd: "tp", args: "<player> <target>", help: "Teleport" },
   ],
+  "minecraft-sunlit-cobblemon": "minecraft",
   "terraria-vanilla": [
     { cmd: "playing", args: "", help: "List connected players" },
     { cmd: "say", args: "<message>", help: "Broadcast a message" },

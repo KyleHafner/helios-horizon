@@ -50,7 +50,7 @@ def _profile(tmp_path: Path, profile_id: ProfileId, port: int) -> Profile:
 def test_clone_never_mutates_or_overwrites_source(tmp_path: Path):
     vanilla = _profile(tmp_path, ProfileId.TERRARIA_VANILLA, 7777)
     tmod = _profile(tmp_path, ProfileId.TERRARIA_TMOD, 7778)
-    source = vanilla.paths.mutable_root / "operator.wld"
+    source = vanilla.paths.mutable_root / "swag.wld"
     source.write_bytes(b"world")
     before = hashlib.sha256(source.read_bytes()).digest()
     service = WorldService(
@@ -60,10 +60,10 @@ def test_clone_never_mutates_or_overwrites_source(tmp_path: Path):
         stopped_check=lambda: True,
     )
 
-    result = service.clone_vanilla_to_tmod("operator.wld", "operator-modded")
+    result = service.clone_vanilla_to_tmod("swag.wld", "swag-modded")
 
     assert hashlib.sha256(source.read_bytes()).digest() == before
-    assert result.destination.name.startswith("operator-modded-")
+    assert result.destination.name.startswith("swag-modded-")
     assert result.destination.read_bytes() == b"world"
     with pytest.raises(SafeError, match="already exists"):
-        service.clone_to_exact_existing_destination("operator.wld", result.destination)
+        service.clone_to_exact_existing_destination("swag.wld", result.destination)

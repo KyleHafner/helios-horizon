@@ -1,99 +1,84 @@
-# Helios Horizon
+# Helios Horizon / game-control
 
-[![CI](https://github.com/KyleHafner/helios-horizon/actions/workflows/ci.yml/badge.svg)](https://github.com/KyleHafner/helios-horizon/actions/workflows/ci.yml)
-[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+[![CI](https://github.com/swagsystems/helios-horizon/actions/workflows/ci.yml/badge.svg)](https://github.com/swagsystems/helios-horizon/actions/workflows/ci.yml)
 
-Helios Horizon is a security-focused control plane for a host that runs one resource-intensive game server at a time. Its retained reference topology coordinates Minecraft, Project Zomboid, and Terraria profiles through fixed runners behind one typed controller, instead of letting the web process invoke arbitrary shell commands.
-
-![Responsive Horizon dashboard using synthetic fixture data](docs/assets/dashboard.png)
-
-> The screenshots and checked-in configuration use synthetic data and documentation-only addresses. This repository contains no production credentials, player database, worlds, backups, or live infrastructure inventory.
-
-## What it demonstrates
-
-- **Fail-closed control boundary:** FastAPI talks to a privileged controller over a fixed Unix socket and typed newline-delimited RPC.
-- **Single-slot orchestration:** starts, stops, restarts, and switches are serialized so mutually exclusive game servers cannot own the heavy-resource slot together.
-- **Bounded operations:** profile IDs, units, paths, ports, console transports, timeouts, and update strategies come from reviewed configuration rather than request-supplied shell text.
-- **Layered web security:** reverse-proxy credential verification, forwarded identity, expiring server-side sessions, CSRF tokens, strict origin checks, and credential redaction.
-- **Recovery-aware workflows:** verified backups, prepare/confirm restore and world-clone flows, rollback-aware switching, and append-only audit records.
-- **Operator visibility:** SSE status updates, logs, events, inactive-aware player history, wall-clock TPS/MSPT evidence, scheduled switches, and idle shutdown.
-- **Performance experiments:** reviewed benchmark presets, persisted comparisons, and an idempotent SwagBench history importer keep tuning evidence attached to the controlled profile instead of scattered across ad-hoc reports.
-- **Deployment hardening:** unprivileged service accounts, systemd sandboxing, fixed writable paths, `NoNewPrivileges`, protected homes, and root-owned runtime locks.
-- **Reference operations surfaces:** sanitized examples for a console broker with loopback-only RCON, `save-off -> flush -> copy/verify -> save-on` online backups, bounded TPS scraping, fixed-profile LazyMC wake, MCP status/wake/TPS tools, and encrypted keep-two B2 reconciliation.
+Helios Horizon (`game-control`) is a single-slot game-server orchestrator for
+the Horizon VM: exactly one game profile owns the active slot at a time. Its operator
+console is [games.heliosorbit.space](https://games.heliosorbit.space). The
+[deployment guide](docs/deployment-example.md) and
+[operations guide](docs/operations-example.md) cover deployment and
+live-operation details.
 
 ## Architecture
 
-```text
-Authenticated operator
-        │
-        ▼
-Reverse proxy / SSO
-        │ fixed proxy credential + identity headers
-        ▼
-FastAPI + static web UI (unprivileged operator path)
-        │ typed RPC over /run/game-control/control.sock
-        ▼
-Slot controller (privileged, peer-credential checked)
-        │
-        ├── fixed systemd runner ── Minecraft
-        ├── fixed systemd runner ── Terraria
-        └── fixed systemd runner ── modded Terraria
+- [`game-slotd`](src/game_control/slotd_main.py) is the privileged daemon. It
+  exposes typed, newline-delimited RPC over
+  `/run/game-control/control.sock`, uses the slot/lease model in
+  [`slot.py`](src/game_control/slot.py), and reconciles interrupted work at
+  startup through [`controller.py`](src/game_control/controller.py).
+- [`game-control-web`](src/game_control/web_main.py) is the unprivileged
+  FastAPI web tier. It projects the typed RPC contract through
+  [`api.py`](src/game_control/api.py), publishes status with SSE, and serves
+  the small vanilla-JavaScript Carbon UI from [`web/`](web/).
+- The controller selects the fixed [`systemd`](src/game_control/adapters/systemd.py)
+  adapter for the three retained VM profiles from the root-owned profiles in
+  `/etc/game-control/profiles.d`. Crafty/PZ files remain source history only.
+- Durable controller events and audit/jobs live in the root-owned state DB
+  ([`state_db.py`](src/game_control/state_db.py)); web sessions use the
+  separate web DB ([`web_db.py`](src/game_control/web_db.py)).
+- [`scripts/verify-deployed.py`](scripts/verify-deployed.py) is the read-only
+  deployment verifier. Use `--root PATH --static` for a staged package and follow
+  [`docs/operations-example.md`](docs/operations-example.md) for how to run it and
+  interpret its results.
 
-LazyMC ── fixed Waker capability ────────┘
-MCP adapter ── Observer/Waker tools ────┘
-Controller backup worker ── encrypted B2 (keep two verified generations)
-```
+## Feature highlights
 
-The web tier cannot choose a socket, unit, executable, or filesystem path. Mutation requests additionally require a valid session, CSRF token, and approved origin. See [architecture](docs/architecture.md) and [security model](docs/security-model.md).
+The console and typed controller currently include:
 
-## Operator experience
+- schedule management, including live schedule editing via
+  [`schedule.py`](src/game_control/schedule.py) and
+  [`schedule_config.py`](src/game_control/schedule_config.py);
+- opt-in controller-owned idle-stop via
+  [`idle_stop.py`](src/game_control/idle_stop.py);
+- per-game player statistics, leaderboards, activity heatmaps, and Minecraft
+  TPS/MSPT telemetry via [`stats_queries.py`](src/game_control/stats_queries.py),
+  [`players.py`](src/game_control/players.py), and [`tps.py`](src/game_control/tps.py);
+- a command palette in [`web/palette.js`](web/palette.js);
+- typed, fail-closed profile configuration editing in
+  [`profile_config.py`](src/game_control/profile_config.py);
+- fresh-JVM SwagBench A/B jobs with root-owned preset selection, artifact
+  validation, retained verdicts, and operator UI in
+  [`benchmarks.py`](src/game_control/benchmarks.py); and
+- one shared durable operation lease across lifecycle, backup, restore,
+  update, clone, configuration, and benchmark work, with caller-stable
+  idempotency keys, bounded transports, startup reconciliation, read-only
+  keyset history queries, and identity-free database-growth telemetry.
 
-The dashboard separates current state from historical evidence. A stopped server is shown as intentionally inactive rather than as a zero-value telemetry source; player-hours and prior sessions remain available, while current occupancy and tick health are labelled as unknown or last observed. The Minecraft tick view charts only samples inside the selected wall-clock range, preserves gaps where Horizon observed no telemetry, and displays MSPT alongside TPS so tick headroom is visible.
+## Development
 
-Benchmark history can be recorded by Horizon directly or imported from reviewed SwagBench JSON artifacts. Import is validation-first and idempotent; see [SwagBench history import](docs/swagbench-history-import.md).
-
-## Repository layout
-
-- `src/game_control/` — controller, RPC protocol, API, auth, scheduling, backup, telemetry, and adapters
-- `web/` — dependency-free JavaScript/CSS dashboard
-- `config/` — sanitized example profiles and runner definitions
-- `ops/` — installer, hardened systemd units, and fixed console helpers
-- `tests/` — unit, integration, packaging, security-boundary, and Playwright browser tests
-- `docs/` — public-safe architecture and deployment guidance
-
-## Local verification
-
-Requirements: Python 3.11+, [`uv`](https://docs.astral.sh/uv/), and a Chromium-compatible Playwright runtime.
-
-```bash
-uv sync --frozen --extra test --python 3.11
-uv run --frozen --extra test --python 3.11 playwright install chromium
-uv run --frozen --extra test --python 3.11 pytest -q
-```
-
-To run only the non-browser suite:
+This repository uses `uv` and Python 3.11+.
 
 ```bash
-uv run --frozen --extra test --python 3.11 pytest -q --ignore=tests/browser
+uv sync
+uv run pytest -q
+uv run pytest tests/browser -q
 ```
 
-## Deployment warning
+Before merging, run [`scripts/check.sh`](scripts/check.sh) for the full quality gate; pass `--cov` when you also want the pytest coverage report.
 
-The files under `config/` and `ops/` are reviewed examples, not a turnkey deployment. A real installation must supply its own service users, paths, SSO/proxy boundary, capability credentials, game-server installation, firewall rules, backups, and restore testing. The web service binds to loopback by default. Never expose it directly to the internet or commit generated configuration and secrets.
+The browser suite uses Playwright and is implemented in
+[`tests/browser/`](tests/browser/). For parallel feature work, create an
+isolated checkout under `.worktrees/` on a named branch, for example:
 
-See [example deployment guidance](docs/deployment-example.md) before adapting the installer.
+```bash
+git worktree add .worktrees/<name> -b <branch> main
+```
 
-The experimental Go wake lobby is intentionally not part of this public release lineage. It remains archived as private research after real-client protocol and gameplay regressions; the supported public reference continues to use the fixed LazyMC waker capability described in the operations examples.
+## Deployment overview
 
-The H1/H2/G11 operational contracts are described in the
-[public operations examples](docs/operations-example.md). Those examples use
-synthetic fixed-profile data, documentation-only addresses, and runtime-only
-secret paths; they are not installed by the baseline example installer.
-
-## Lineage
-
-Horizon moved from design through six gated review revisions and an approval-gated, agent-orchestrated migration. This repository is the sanitized engineering artifact: it preserves the contracts and tests while excluding live topology, credentials, worlds, backup identifiers, and operational evidence.
-
-## License
-
-MIT — see [LICENSE](LICENSE).
+The package installer applies the repository’s daemon, web, three retained
+profiles, runners, and systemd artifacts to the Horizon VM through [`ops/install.py`](ops/install.py)
+(`--apply`). After a controlled deployment, run the read-only verifier linked
+above. The complete operational procedure, safety boundaries, and rollback
+guidance is in [`docs/operations-example.md`](docs/operations-example.md); this
+README intentionally does not duplicate that runbook.

@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import json
 import sqlite3
 from pathlib import Path
+from types import SimpleNamespace
 
 import httpx
 import pytest
@@ -19,6 +21,16 @@ from game_control.models import (
 )
 from game_control.notifications import NotificationService
 from game_control.redaction import Redactor
+
+
+_OPEN_DATABASES: list[sqlite3.Connection] = []
+
+
+@pytest.fixture(autouse=True)
+def close_test_databases():
+    yield
+    while _OPEN_DATABASES:
+        _OPEN_DATABASES.pop().close()
 
 
 def _profile(tmp_path: Path) -> Profile:
@@ -63,6 +75,7 @@ def _db() -> sqlite3.Connection:
           profile_id TEXT, result TEXT, error_code TEXT, detail TEXT);
         """
     )
+    _OPEN_DATABASES.append(db)
     return db
 
 
@@ -204,3 +217,166 @@ def test_missing_secret_is_safe(tmp_path: Path, channel: str):
     with pytest.raises(Exception) as exc:
         service.test(channel, profile.id, actor="operator")
     assert "synthetic" not in str(exc.value)
+
+
+def test_send_delivers_channels_in_fixed_order_with_channel_payloads(tmp_path: Path):
+    profile = _profile(tmp_path)
+    secrets = tmp_path / "secrets"
+    secrets.mkdir()
+    discord = "https://discord.example.invalid/synthetic"
+    (secrets / "discord").write_text(discord)
+    (secrets / "discord").chmod(0o600)
+    (secrets / "telegram").write_text("synthetic-telegram-token")
+    (secrets / "telegram").chmod(0o600)
+    seen: list[tuple[str, dict[str, str]]] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append((str(request.url), json.loads(request.content)))
+        return httpx.Response(204)
+
+    service = NotificationService(
+        {profile.id.value: profile},
+        secret_dir=secrets,
+        database=_db(),
+        http_client=httpx.Client(transport=httpx.MockTransport(handler)),
+        telegram_chat_id="chat-123",
+    )
+
+    assert service.send(profile.id, NotificationEvent.START, 11, "started")
+
+    assert seen == [
+        (discord, {"content": "started"}),
+        ("https://api.telegram.org/botsynthetic-telegram-token/sendMessage", {
+            "chat_id": "chat-123",
+            "text": "started",
+        }),
+    ]
+
+
+def test_disabled_rule_prevents_delivery_and_unknown_event_is_safe(tmp_path: Path):
+    profile = _profile(tmp_path)
+    secrets = tmp_path / "secrets"
+    secrets.mkdir()
+    (secrets / "discord").write_text("https://discord.example.invalid/synthetic")
+    (secrets / "discord").chmod(0o600)
+    db = _db()
+    db.execute(
+        "INSERT INTO notification_rules(profile_id,event,enabled) VALUES(?,?,?)",
+        (profile.id.value, NotificationEvent.START.value, 0),
+    )
+    calls = 0
+
+    def handler(_request: httpx.Request) -> httpx.Response:
+        nonlocal calls
+        calls += 1
+        return httpx.Response(204)
+
+    service = NotificationService(
+        {profile.id.value: profile},
+        secret_dir=secrets,
+        database=db,
+        http_client=httpx.Client(transport=httpx.MockTransport(handler)),
+    )
+
+    assert not service.send(profile.id, NotificationEvent.START, 1, "disabled")
+    assert calls == 0
+    with pytest.raises(Exception) as exc:
+        service.send(profile.id, "hostile-event", 1, "ignored")
+    assert "hostile" not in str(exc.value)
+
+
+def test_delivery_http_failure_is_retryable_and_redacted(tmp_path: Path):
+    profile = _profile(tmp_path)
+    secrets = tmp_path / "secrets"
+    secrets.mkdir()
+    webhook = "https://discord.example.invalid/webhook/http-error"
+    (secrets / "discord").write_text(webhook)
+    (secrets / "discord").chmod(0o600)
+
+    class Response:
+        def raise_for_status(self):
+            raise RuntimeError(f"upstream rejected {webhook}")
+
+    class Client:
+        def post(self, _url, **_kwargs):
+            return Response()
+
+    service = NotificationService(
+        {profile.id.value: profile},
+        secret_dir=secrets,
+        database=_db(),
+        http_client=Client(),
+    )
+
+    with pytest.raises(Exception) as exc:
+        service.send(profile.id, NotificationEvent.START, 1, "started")
+
+    assert exc.value.code == "notification_failed"
+    assert exc.value.retryable is True
+    assert webhook not in (service.last_error or "")
+
+
+def test_invalid_secret_shape_and_symlink_are_not_used(tmp_path: Path):
+    profile = _profile(tmp_path)
+    secrets = tmp_path / "secrets"
+    secrets.mkdir()
+    (secrets / "telegram").write_text("token/with-path")
+    (secrets / "telegram").chmod(0o600)
+    external = tmp_path / "external-secret"
+    external.write_text("https://discord.example.invalid/synthetic")
+    (secrets / "discord").symlink_to(external)
+    service = NotificationService({profile.id.value: profile}, secret_dir=secrets, database=_db())
+
+    with pytest.raises(Exception) as telegram_error:
+        service.test("telegram", profile.id)
+    assert telegram_error.value.code == "notification_unconfigured"
+    with pytest.raises(Exception) as discord_error:
+        service.test("discord", profile.id)
+    assert discord_error.value.code == "notification_unconfigured"
+
+
+def test_set_rule_persists_enabled_state_and_rejects_unsupported_events(tmp_path: Path):
+    profile = _profile(tmp_path)
+    db = _db()
+    service = NotificationService({profile.id.value: profile}, secret_dir=tmp_path / "secrets", database=db)
+
+    config = service.set_rule(
+        SimpleNamespace(profile_id=profile.id, event=NotificationEvent.START, enabled=False),
+        actor="operator",
+    )
+
+    assert config.rules[NotificationEvent.START] is False
+    assert db.execute(
+        "SELECT enabled FROM notification_rules WHERE profile_id=? AND event=?",
+        (profile.id.value, NotificationEvent.START.value),
+    ).fetchone() == (0,)
+    with pytest.raises(Exception) as unsupported:
+        service.set_rule(SimpleNamespace(profile_id=profile.id, event=NotificationEvent.CRASH, enabled=True))
+    assert unsupported.value.code == "notification_failed"
+    with pytest.raises(Exception) as malformed:
+        service.set_rule(SimpleNamespace(profile_id=profile.id, event="not-an-event", enabled=True))
+    assert malformed.value.code == "notification_failed"
+
+
+def test_set_rule_without_database_and_failed_test_are_audited(tmp_path: Path):
+    profile = _profile(tmp_path)
+    action = SimpleNamespace(profile_id=profile.id, event=NotificationEvent.START, enabled=True)
+    without_db = NotificationService({profile.id.value: profile}, secret_dir=tmp_path / "secrets")
+    with pytest.raises(Exception) as no_db_error:
+        without_db.set_rule(action)
+    assert no_db_error.value.code == "notification_failed"
+
+    secrets = tmp_path / "secrets"
+    secrets.mkdir()
+    (secrets / "telegram").write_text("token/with-path")
+    (secrets / "telegram").chmod(0o600)
+    db = _db()
+    service = NotificationService({profile.id.value: profile}, secret_dir=secrets, database=db)
+    with pytest.raises(Exception):
+        service.test("telegram", profile.id, actor="operator")
+
+    assert db.execute("SELECT actor,result,error_code FROM audit").fetchone() == (
+        "operator",
+        "failed",
+        "notification_unconfigured",
+    )

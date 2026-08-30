@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import os
-import subprocess
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -49,6 +48,132 @@ class ProcessMetrics:
     disk_write_bps: float | None = None
 
 
+class HostTelemetrySource:
+    """Bounded procfs/cgroup-v2 source with no subprocess or process labels."""
+
+    def __init__(self, *, proc_root: Path = Path("/proc"), cgroup_root: Path = Path("/sys/fs/cgroup"),
+                 net_root: Path = Path("/sys/class/net"), block_devices: tuple[str, ...] = ()):
+        self.proc_root, self.cgroup_root, self.net_root = proc_root, cgroup_root, net_root
+        self.block_devices = tuple(device for device in block_devices if device and "/" not in device and ".." not in device)
+
+    def collect(self, profile: Any, *, pid: int | None = None) -> dict[str, float | int | None]:
+        result: dict[str, float | int | None] = {}
+        unit = getattr(profile, "systemd_unit", None)
+        if isinstance(unit, str):
+            candidates = []
+            observed = self._observed_cgroup(unit, pid)
+            if observed is not None:
+                candidates.append(observed)
+            # systemd may place game units under either games.slice or
+            # system.slice; inspect only those exact unit paths.
+            candidates.extend(self.cgroup_root / slice_name / unit for slice_name in ("games.slice", "system.slice"))
+            for path in candidates:
+                values = self._io_stat(path / "io.stat")
+                if values:
+                    result.update(values)
+                    break
+        result.update(self._psi(self.proc_root / "pressure" / "io"))
+        result.update(self._diskstats(self.proc_root / "diskstats", self.block_devices))
+        result.update(self._network(self.net_root))
+        return result
+
+    def _observed_cgroup(self, unit: str, pid: int | None) -> Path | None:
+        if not isinstance(pid, int) or isinstance(pid, bool) or pid <= 0:
+            return None
+        try:
+            lines = (self.proc_root / str(pid) / "cgroup").read_text(encoding="ascii", errors="ignore").splitlines()[:32]
+        except OSError:
+            return None
+        for line in lines:
+            parts = line.split(":", 2)
+            if len(parts) != 3 or parts[0] != "0" or parts[1] != "":
+                continue
+            relative = Path(parts[2].lstrip("/"))
+            if relative.is_absolute() or ".." in relative.parts or relative.name != unit:
+                continue
+            return self.cgroup_root / relative
+        return None
+
+    @staticmethod
+    def _io_stat(path: Path) -> dict[str, int]:
+        totals = {"service_io_read_bytes_total": 0, "service_io_write_bytes_total": 0,
+                  "service_io_read_ops_total": 0, "service_io_write_ops_total": 0}
+        try:
+            lines = path.read_text(encoding="ascii", errors="ignore").splitlines()[:256]
+        except OSError:
+            return {}
+        for line in lines:
+            for token in line.split()[1:33]:
+                if "=" not in token:
+                    continue
+                key, raw = token.split("=", 1)
+                try:
+                    value = max(0, int(raw))
+                except ValueError:
+                    continue
+                mapping = {"rbytes": "service_io_read_bytes_total", "wbytes": "service_io_write_bytes_total",
+                           "rios": "service_io_read_ops_total", "wios": "service_io_write_ops_total"}
+                if key in mapping:
+                    totals[mapping[key]] += value
+        return totals
+
+    @staticmethod
+    def _psi(path: Path) -> dict[str, float]:
+        try:
+            lines = path.read_text(encoding="ascii", errors="ignore").splitlines()[:8]
+        except OSError:
+            return {}
+        values: dict[str, float] = {}
+        for line in lines:
+            if not line.startswith(("some ", "full ")):
+                continue
+            for token in line.split()[1:]:
+                if token.startswith("avg10="):
+                    try:
+                        values[f"host_psi_io_{line.split()[0]}_avg10"] = max(0.0, float(token[6:]))
+                    except ValueError:
+                        pass
+        return values
+
+    @staticmethod
+    def _diskstats(path: Path, approved_devices: tuple[str, ...] = ()) -> dict[str, int]:
+        if not approved_devices:
+            return {}
+        approved = frozenset(approved_devices)
+        read_ms = write_ms = 0
+        try:
+            lines = path.read_text(encoding="ascii", errors="ignore").splitlines()[:512]
+        except OSError:
+            return {}
+        for line in lines:
+            fields = line.split()
+            if len(fields) < 14:
+                continue
+            if fields[2] not in approved:
+                continue
+            try:
+                read_ms += max(0, int(fields[6]))
+                write_ms += max(0, int(fields[10]))
+            except ValueError:
+                continue
+        return {"host_disk_read_io_time_ms_total": read_ms, "host_disk_write_io_time_ms_total": write_ms}
+
+    @staticmethod
+    def _network(root: Path) -> dict[str, int]:
+        rx = tx = 0
+        try:
+            interfaces = list(root.iterdir())[:64]
+        except OSError:
+            return {}
+        for interface in interfaces:
+            try:
+                rx += max(0, int((interface / "statistics/rx_bytes").read_text().strip()))
+                tx += max(0, int((interface / "statistics/tx_bytes").read_text().strip()))
+            except (OSError, ValueError):
+                continue
+        return {"host_network_rx_bytes_total": rx, "host_network_tx_bytes_total": tx}
+
+
 def enumerate_cgroup_pids(cgroup: str | os.PathLike[str]) -> tuple[int, ...]:
     """Read a fixed cgroup.procs file, bounded and de-duplicated."""
 
@@ -87,6 +212,7 @@ class MetricSampler:
         disk_usage: Callable[[str | os.PathLike[str]], Any] = psutil.disk_usage,
         process_iter: Callable[..., Any] = psutil.process_iter,
         cgroup_resolver: Callable[[str], str | os.PathLike[str] | None] | None = None,
+        pid_cgroup_resolver: Callable[[int, str], str | os.PathLike[str] | None] | None = None,
         connection_provider: Callable[..., Any] = psutil.net_connections,
         disk_cache_ttl: float = 45.0,
     ):
@@ -95,6 +221,7 @@ class MetricSampler:
         self._disk_usage = disk_usage
         self._process_iter = process_iter
         self._cgroup_resolver = cgroup_resolver or _resolve_control_group
+        self._pid_cgroup_resolver = pid_cgroup_resolver or process_cgroup_path
         self._connection_provider = connection_provider
         self._cgroup_cache: dict[str, Path | None] = {}
         self._disk_cache_ttl = max(0.0, float(disk_cache_ttl))
@@ -266,10 +393,29 @@ class MetricSampler:
         if adapter == AdapterKind.SYSTEMD.value:
             if cgroup_path is None:
                 unit = getattr(profile, "systemd_unit", None)
-                if unit and unit not in self._cgroup_cache:
-                    resolved = self._cgroup_resolver(unit)
-                    self._cgroup_cache[unit] = Path(resolved) if resolved is not None else None
                 path = self._cgroup_cache.get(unit) if unit else None
+                # MainPID is the strongest available cgroup identity and can
+                # change on every activation.  Resolve it on each observed
+                # running sample instead of allowing a pre-exec miss to cache
+                # a guessed slice for the lifetime of slotd.
+                resolved = (
+                    self._pid_cgroup_resolver(pid, unit)
+                    if unit and isinstance(pid, int) and pid > 0
+                    else None
+                )
+                if resolved is not None:
+                    path = Path(resolved)
+                    self._cgroup_cache[unit] = path
+                elif path is None or not path.is_dir():
+                    resolved = self._cgroup_resolver(unit) if unit else None
+                    candidate = Path(resolved) if resolved is not None else None
+                    if candidate is not None and candidate.is_dir():
+                        path = candidate
+                        self._cgroup_cache[unit] = candidate
+                    else:
+                        path = None
+                        if unit:
+                            self._cgroup_cache.pop(unit, None)
             else:
                 path = Path(cgroup_path)
             return enumerate_cgroup_pids(path) if path else ()
@@ -328,7 +474,7 @@ class MetricSampler:
         if not actual:
             return False
         try:
-            if Path(actual).resolve() != Path(expected).resolve():
+            if os.path.realpath(actual) != os.path.realpath(expected):
                 return False
         except (OSError, RuntimeError, ValueError):
             return False
@@ -378,25 +524,66 @@ class MetricSampler:
 
 
 def _resolve_control_group(unit: str) -> Path | None:
-    """Resolve a fixed systemd unit's actual ControlGroup safely."""
+    """Return an existing fixed service cgroup without forking."""
 
     if not isinstance(unit, str) or not unit.endswith(".service") or "/" in unit or ".." in unit:
         return None
+    root = Path("/sys/fs/cgroup")
+    # Game units are explicitly assigned to games.slice.  Keep system.slice as
+    # the second fixed location for controller-owned services and legacy
+    # deployments; never walk arbitrary cgroup paths.
+    for slice_name in ("games.slice", "system.slice"):
+        candidate = root / slice_name / unit
+        if candidate.is_dir():
+            return candidate
+    return None
+
+
+def process_cgroup_path(
+    pid: int,
+    unit: str,
+    *,
+    root: Path = Path("/sys/fs/cgroup"),
+    proc_root: Path = Path("/proc"),
+) -> Path | None:
+    """Resolve a service cgroup from a process' cgroup-v2 membership.
+
+    The unit component is required in the kernel-provided path and the result
+    is truncated at that component so child cgroups cannot narrow accounting.
+    """
+
+    if (
+        not isinstance(pid, int)
+        or pid <= 0
+        or not isinstance(unit, str)
+        or not unit.endswith(".service")
+        or "/" in unit
+        or ".." in unit
+    ):
+        return None
     try:
-        result = subprocess.run(
-            ("/usr/bin/systemctl", "show", unit, "--property=ControlGroup", "--value"),
-            stdin=subprocess.DEVNULL,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.DEVNULL,
-            timeout=2.0,
-            check=False,
-        )
-        raw = result.stdout[:512].decode("utf-8", "replace").strip()
-    except (OSError, subprocess.SubprocessError):
+        rows = (proc_root / str(pid) / "cgroup").read_text(
+            encoding="ascii", errors="ignore"
+        )[:8192].splitlines()
+    except (FileNotFoundError, PermissionError, OSError):
         return None
-    if not raw.startswith("/") or ".." in Path(raw).parts:
-        return None
-    return Path("/sys/fs/cgroup") / raw.lstrip("/")
+    for row in rows[:64]:
+        hierarchy, first_separator, remainder = row.partition(":")
+        controllers, second_separator, raw = remainder.partition(":")
+        if (
+            hierarchy != "0"
+            or not first_separator
+            or not second_separator
+            or controllers
+            or not raw.startswith("/")
+        ):
+            continue
+        relative = Path(raw.lstrip("/"))
+        if ".." in relative.parts or unit not in relative.parts:
+            continue
+        unit_index = relative.parts.index(unit)
+        return root.joinpath(*relative.parts[: unit_index + 1])
+    return None
 
 
 __all__ = [
@@ -404,5 +591,7 @@ __all__ = [
     "ProcessMetrics",
     "MetricSampler",
     "enumerate_cgroup_pids",
+    "process_cgroup_path",
     "systemd_cgroup_path",
+    "HostTelemetrySource",
 ]

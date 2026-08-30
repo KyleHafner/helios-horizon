@@ -1,0 +1,54 @@
+[Unit]
+Description=Sunlit Cobblemon Minecraft game server
+After=network-online.target
+Wants=network-online.target
+RequiresMountsFor=/opt/game-servers/minecraft-sunlit-cobblemon /srv/game-servers/minecraft-sunlit-cobblemon-state /var/backups/game-servers/minecraft-sunlit-cobblemon
+ConditionPathExists=/usr/lib/jvm/java-17-openjdk-amd64/bin/java
+OnFailure=horizon-alert-notify@minecraft-sunlit-cobblemon.service
+
+[Service]
+Type=simple
+User=svc-sunlit
+Group=svc-sunlit
+WorkingDirectory=/srv/game-servers/minecraft-sunlit-cobblemon-current
+Environment=JAVA_HOME=/usr/lib/jvm/java-17-openjdk-amd64
+Environment=GAME_SLOT_REQUIRE_RESERVATION=1
+LoadCredential=minecraft-rcon-password:/etc/game-control/secrets.d/minecraft-rcon-password
+ExecStartPre=/usr/local/libexec/game-sunlit-prepare
+ExecStartPre=/usr/local/libexec/game-sunlit-rcon-prepare
+ExecStart=/usr/local/libexec/game-slot-run minecraft-sunlit-cobblemon
+ExecStop=-/usr/local/libexec/game-sunlit-stop minecraft-sunlit-cobblemon $MAINPID
+ExecStopPost=/usr/local/libexec/game-sunlit-stop minecraft-sunlit-cobblemon verify
+KillMode=control-group
+TimeoutStartSec=600
+TimeoutStopSec=120
+Restart=no
+SuccessExitStatus=130 143
+OOMPolicy=stop
+Slice=games.slice
+CPUAccounting=yes
+MemoryAccounting=yes
+IOAccounting=yes
+MemoryHigh=8G
+MemoryMax=9G
+MemorySwapMax=0
+StandardOutput=journal
+StandardError=journal
+LogNamespace=horizon
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectSystem=strict
+ProtectHome=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+NoNewPrivileges=yes
+RestrictSUIDSGID=yes
+RestrictRealtime=yes
+LockPersonality=yes
+SystemCallArchitectures=native
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+CapabilityBoundingSet=
+ReadOnlyPaths=/opt/game-control /etc/game-control /usr/local/libexec /usr/bin /opt/game-servers/minecraft-sunlit-cobblemon
+ReadWritePaths=/run/game-control /run/game-slot /srv/game-servers/minecraft-sunlit-cobblemon-state
+UMask=0077

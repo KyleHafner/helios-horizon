@@ -6,6 +6,7 @@ import asyncio
 import grp
 import errno
 import inspect
+import json
 import logging
 import os
 import pwd
@@ -25,17 +26,24 @@ from .slot import ReservationStore, SlotInspector
 from .state_db import StateDatabase, STATE_DB_PATH
 from .models import AdapterKind, HealthState
 from .service_wiring import build_service_seams
-from .rcon import RCON_HOST, RCON_PASSWORD_PATH, RCON_PORT, RconClient
+from .rcon import RCON_HOST, RCON_PASSWORD_PATH, RCON_PORT, RconClient, SunlitRconTransport
+from .rcon_telemetry import PersistentRconTelemetry
 from .schedule import parse_schedule
 from .protocol import (
     MAX_REQUEST_BYTES,
+    MAX_RESPONSE_BYTES,
     ErrorCode,
     RpcFailure,
+    RpcResponse,
+    RpcSuccess,
     SafeDetails,
+    StatusSnapshot,
+    Watch,
     failure,
     parse_request_line,
     response_json,
 )
+from .push import WatchCursor, WatchHub
 
 CONTROL_SOCKET = Path("/run/game-control/control.sock")
 ROOT_CONFIG = Path("/etc/game-control/game-control.toml")
@@ -85,6 +93,7 @@ class UnixRpcServer:
             self.gid = gid
         self._server: asyncio.AbstractServer | None = None
         self._bound_inode: int | None = None
+        self.watch_hub = WatchHub()
 
     def authorize_peer(self, uid: int, gid: int) -> bool:
         return uid == self.uid and gid == self.peer_gid
@@ -214,12 +223,17 @@ class UnixRpcServer:
             except ValueError:
                 response = failure(request_id, ErrorCode.INVALID_REQUEST, "invalid request")
             else:
+                if isinstance(request.action, Watch):
+                    await self._watch_client(request, writer)
+                    return
                 response = await self.controller.execute(request)
+                await self._publish_response(request.action.kind, response)
             await self._write(
                 writer,
                 response_json(response),
                 request_kind=request_kind,
                 actor=actor,
+                request_id=request_id,
             )
         except Exception:
             incident = os.urandom(8).hex()
@@ -229,7 +243,13 @@ class UnixRpcServer:
                 details=SafeDetails(incident_id=incident),
             )
             try:
-                await self._write(writer, response_json(response))
+                await self._write(
+                    writer,
+                    response_json(response),
+                    request_kind=request_kind,
+                    actor=actor,
+                    request_id=request_id,
+                )
             except Exception:
                 pass
         finally:
@@ -239,6 +259,45 @@ class UnixRpcServer:
             except (ConnectionError, OSError):
                 pass
 
+    async def _publish_response(self, kind: str, response: RpcResponse) -> None:
+        """Project safe controller results to authenticated watch clients."""
+        if not isinstance(response, RpcSuccess):
+            return
+        result = response.result
+        if hasattr(result, "model_dump"):
+            payload = result.model_dump(mode="json")
+        elif isinstance(result, dict):
+            payload = result
+        else:
+            return
+        # Read-only responses such as GetPerf do not carry a state generation.
+        # Project those observations at the hub's current generation so an
+        # unrelated response cannot regress the watch stream and fail the RPC.
+        # A response that explicitly carries a generation remains subject to
+        # the hub's monotonicity contract.
+        generation = (
+            int(payload["generation"])
+            if isinstance(payload, dict) and "generation" in payload
+            else self.watch_hub.generation
+        )
+        await self.watch_hub.publish(
+            kind, payload, generation=generation, full=isinstance(result, StatusSnapshot)
+        )
+
+    async def _watch_client(self, request, writer: asyncio.StreamWriter) -> None:
+        client = await self.watch_hub.subscribe(
+            WatchCursor(sequence=request.action.cursor, generation=request.action.generation)
+        )
+        try:
+            while not client.disconnected and not writer.is_closing():
+                event = await self.watch_hub.heartbeat(client, timeout=15.0)
+                frame = {"sequence": event.sequence, "generation": event.generation,
+                         "kind": event.kind, "full": event.full, "payload": dict(event.payload)}
+                writer.write((json.dumps(frame, separators=(",", ":")) + "\n").encode())
+                await asyncio.wait_for(writer.drain(), WRITE_TIMEOUT_SECONDS)
+        finally:
+            await self.watch_hub.unsubscribe(client)
+
     @staticmethod
     async def _write(
         writer: asyncio.StreamWriter,
@@ -246,8 +305,13 @@ class UnixRpcServer:
         *,
         request_kind: str,
         actor: str,
+        request_id: UUID | None = None,
     ) -> None:
         try:
+            if len(data) > MAX_RESPONSE_BYTES:
+                data = response_json(
+                    failure(request_id or UUID(int=0), ErrorCode.INTERNAL_ERROR, "response exceeds framing budget")
+                )
             writer.write(data)
             await asyncio.wait_for(writer.drain(), timeout=WRITE_TIMEOUT_SECONDS)
         except (BrokenPipeError, ConnectionResetError):
@@ -314,6 +378,7 @@ def build_controller(config_path: str | os.PathLike[str] = ROOT_CONFIG) -> Contr
     crafty = None
     secret_values: list[str] = []
     sunlit_rcon = None
+    rcon_telemetry = None
     for profile in registry:
         if profile.adapter is AdapterKind.CRAFTY:
             if crafty is None:
@@ -332,6 +397,7 @@ def build_controller(config_path: str | os.PathLike[str] = ROOT_CONFIG) -> Contr
         else:
             if profile.id.value == "minecraft-sunlit-cobblemon":
                 sunlit_rcon = RconClient(**rcon_kwargs)
+                rcon_telemetry = PersistentRconTelemetry(profile.id.value, **rcon_kwargs)
                 adapters[profile.id] = SystemdAdapter(rcon=sunlit_rcon)
             else:
                 adapters[profile.id] = SystemdAdapter()
@@ -379,7 +445,9 @@ def build_controller(config_path: str | os.PathLike[str] = ROOT_CONFIG) -> Contr
         inspector,
         secret_values=tuple(secret_values),
         stats_config=stats_config,
+        sunlit_online_backup=SunlitRconTransport(sunlit_rcon) if sunlit_rcon is not None else None,
         benchmark_config=benchmark_config,
+        rcon_telemetry=rcon_telemetry,
     )
     if services.session_store is not None:
         services.session_store.recover(now=datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"))
@@ -429,9 +497,18 @@ async def _await_systemd_profile_ready(
 
     deadline = asyncio.get_running_loop().time() + max(0.0, timeout_seconds)
     expected_profile = getattr(profile.id, "value", profile.id)
+    try:
+        parameters = inspect.signature(status_service.snapshot).parameters.values()
+        supports_force = any(
+            parameter.kind is inspect.Parameter.VAR_KEYWORD
+            or parameter.name == "force"
+            for parameter in parameters
+        )
+    except (TypeError, ValueError):
+        supports_force = False
     while True:
         try:
-            snapshot = status_service.snapshot()
+            snapshot = status_service.snapshot(**({"force": True} if supports_force else {}))
             if inspect.isawaitable(snapshot):
                 snapshot = await snapshot
             status = next(
@@ -468,8 +545,27 @@ async def _await_systemd_profile_ready(
 async def serve() -> None:
     controller = build_controller()
     server = UnixRpcServer(controller)
+    backups = getattr(controller.services, "backups", None)
+    # Finish all durable restore, job, reservation, and process reconciliation
+    # before exposing the authority-changing Unix socket.
+    try:
+        if backups is not None and hasattr(backups, "reconcile_startup"):
+            backups.reconcile_startup()
+        await controller.reconcile_startup()
+    except BaseException:
+        await server.close()
+        raise
     await server.start()
-    initialization = asyncio.create_task(controller.reconcile_startup())
+    initialization = asyncio.create_task(asyncio.sleep(0))
+    maintenance_task = asyncio.create_task(_maintenance_loop(controller, initialization=initialization))
+    loop_lag_task = asyncio.create_task(_event_loop_lag_loop(controller))
+    telemetry_sampler = getattr(getattr(controller, "services", None), "telemetry_sampler", None)
+    telemetry_task = None
+    if telemetry_sampler is not None:
+        telemetry_task = asyncio.create_task(
+            _run_telemetry_sampler(telemetry_sampler, initialization),
+            name="horizon-telemetry-supervisor",
+        )
     tps_task = None
     tps_sampler = getattr(controller.services, "tps_sampler", None)
 
@@ -509,19 +605,137 @@ async def serve() -> None:
 
     if tps_sampler is not None:
         tps_task = asyncio.create_task(tps_sampler.run(minecraft_running))
+    server_task = asyncio.create_task(server._server.serve_forever())  # type: ignore[union-attr]
+    supervised = {server_task, maintenance_task, initialization, loop_lag_task}
+    if telemetry_task is not None:
+        supervised.add(telemetry_task)
+    if tps_task is not None:
+        supervised.add(tps_task)
     try:
-        await server._server.serve_forever()  # type: ignore[union-attr]
+        while supervised:
+            done, _pending = await asyncio.wait(supervised, return_when=asyncio.FIRST_COMPLETED)
+            for task in done:
+                supervised.discard(task)
+                if task.cancelled():
+                    raise asyncio.CancelledError
+                error = task.exception()
+                if task is initialization:
+                    if error is not None:
+                        raise error
+                    continue
+                if task is maintenance_task:
+                    if error is not None:
+                        raise error
+                    raise RuntimeError("slotd maintenance task exited unexpectedly")
+                if task is telemetry_task:
+                    if error is not None:
+                        raise error
+                    raise RuntimeError("slotd telemetry sampler exited unexpectedly")
+                if task is tps_task:
+                    if error is not None:
+                        raise error
+                    raise RuntimeError("slotd tick telemetry task exited unexpectedly")
+                if task is server_task:
+                    if error is not None:
+                        raise error
+                    raise RuntimeError("slotd RPC server task exited unexpectedly")
+                if error is not None:
+                    raise error
+            if not supervised:
+                return
     finally:
-        if tps_task is not None and not tps_task.done():
-            tps_task.cancel()
-        if tps_task is not None:
-            await asyncio.gather(tps_task, return_exceptions=True)
-        if tps_sampler is not None:
-            await tps_sampler.aclose()
-        if not initialization.done():
-            initialization.cancel()
-        await asyncio.gather(initialization, return_exceptions=True)
-        await server.close()
+        try:
+            if not loop_lag_task.done():
+                loop_lag_task.cancel()
+            await asyncio.gather(loop_lag_task, return_exceptions=True)
+            if not server_task.done():
+                server_task.cancel()
+            await asyncio.gather(server_task, return_exceptions=True)
+            if not maintenance_task.done():
+                maintenance_task.cancel()
+            await asyncio.gather(maintenance_task, return_exceptions=True)
+            if telemetry_task is not None and not telemetry_task.done():
+                telemetry_task.cancel()
+            if telemetry_task is not None:
+                await asyncio.gather(telemetry_task, return_exceptions=True)
+            if telemetry_sampler is not None:
+                shutdown = getattr(telemetry_sampler, "shutdown", None)
+                if callable(shutdown):
+                    result = shutdown()
+                    if inspect.isawaitable(result):
+                        await result
+            if tps_task is not None and not tps_task.done():
+                tps_task.cancel()
+            if tps_task is not None:
+                await asyncio.gather(tps_task, return_exceptions=True)
+            try:
+                if not initialization.done():
+                    initialization.cancel()
+                await asyncio.gather(initialization, return_exceptions=True)
+            finally:
+                if tps_sampler is not None:
+                    await tps_sampler.aclose()
+        finally:
+            try:
+                close_services = getattr(getattr(controller, "services", None), "aclose", None)
+                if not callable(close_services):
+                    close_services = getattr(getattr(controller, "services", None), "close", None)
+                if callable(close_services):
+                    result = close_services()
+                    if inspect.isawaitable(result):
+                        await result
+            finally:
+                await server.close()
+
+
+async def _event_loop_lag_loop(controller: Any, interval: float = 0.25) -> None:
+    """Low-overhead monotonic scheduler lag ring for the read-only perf RPC."""
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + interval
+    while True:
+        await asyncio.sleep(max(0.0, deadline - loop.time()))
+        now = loop.time()
+        controller.performance.record_event_loop_lag(max(0.0, (now - deadline) * 1000.0))
+        # Do not catch up missed periods: one long stall is one observation,
+        # not a burst of synthetic samples at decreasing lag values.
+        deadline = now + interval
+
+
+async def _run_telemetry_sampler(sampler: Any, initialization: asyncio.Task[Any]) -> None:
+    """Start the fixed-cadence sampler only after startup reconciliation."""
+    await initialization
+    task = sampler.start()
+    result = await task
+    return result
+
+
+async def _maintenance_loop(
+    controller: Any,
+    *,
+    interval_seconds: float = 30.0,
+    initialization: asyncio.Task[Any] | None = None,
+) -> None:
+    """Keep controller maintenance alive without a web/status caller."""
+    if initialization is not None:
+        await initialization
+    delay = min(max(0.1, float(interval_seconds)), 300.0)
+    while True:
+        started = asyncio.get_running_loop().time()
+        try:
+            await controller.maintenance_tick()
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logging.getLogger(__name__).exception("slotd maintenance tick failed")
+        finally:
+            try:
+                performance = getattr(controller, "performance", None)
+                recorder = getattr(performance, "record_maintenance", None)
+                if callable(recorder):
+                    recorder((asyncio.get_running_loop().time() - started) * 1000.0)
+            except BaseException:
+                logging.getLogger(__name__).debug("maintenance timing record dropped", exc_info=True)
+        await asyncio.sleep(delay)
 
 
 def main() -> None:

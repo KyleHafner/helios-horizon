@@ -19,6 +19,7 @@ import stat
 import subprocess
 import tarfile
 import tempfile
+import threading
 import time
 import uuid
 from dataclasses import dataclass
@@ -28,6 +29,7 @@ from pathlib import Path, PurePosixPath
 from typing import Any, Callable, Iterable, Protocol
 
 from .errors import SafeError
+from .interim_maintenance_control import maintenance_argv, maintenance_popen
 from .models import BackupDestination, ProfileId
 
 
@@ -35,10 +37,12 @@ _MANIFEST = "manifest.json"
 _ARCHIVE_SUFFIX = ".tar.zst"
 _MARGIN = 1.10
 _B2_RETENTION = 2
-_B2_REMOTE = "example-b2-crypt"
+_B2_REMOTE = "helios-b2-crypt"
 _B2_CONFIG = Path("/etc/game-control/secrets.d/horizon-b2-rclone.conf")
-_B2_PREFIX_ROOT = "example/horizon/app"
+_B2_PREFIX_ROOT = "helios/horizon/app"
+FULL_LXC_PREFIX = "helios/horizon/full-lxc"
 _BACKUP_ID = r"[0-9]{8}T[0-9]{12}Z-[0-9a-f]{12}"
+_MAX_ID = (1 << 32) - 1
 _B2_PROFILES = frozenset(
     {
         ProfileId.MINECRAFT_SUNLIT_COBBLEMON.value,
@@ -46,6 +50,18 @@ _B2_PROFILES = frozenset(
         ProfileId.TERRARIA_TMOD.value,
     }
 )
+
+
+def _root_identity(root: Path) -> str:
+    return hashlib.sha256(str(root).encode("utf-8")).hexdigest()
+
+
+def _root_id(root: Path) -> str:
+    return "root-" + _root_identity(root)[:24]
+# Sunlit's server-side backup mod writes complete rolling world archives here.
+# Horizon protects its own verified application archives instead, so retaining
+# those nested archives would recursively amplify every generation. A restore
+# intentionally discards this redundant tree; the server-side mod recreates it.
 _SUNLIT_REDUNDANT_BACKUP_DIRS = frozenset({"backups"})
 
 
@@ -63,24 +79,31 @@ class OnlineSaveTransport(Protocol):
 
 
 @dataclass(frozen=True)
-class RemoteObject:
-    key: str
-    size_bytes: int = 0
+class B2DestinationConfig:
+    """Source-owned B2 configuration; no operator input reaches these values."""
+
+    destination_id: BackupDestination = BackupDestination.HORIZON_B2
+    remote_name: str = _B2_REMOTE
+    prefix_root: str = _B2_PREFIX_ROOT
+    credential_config: Path = _B2_CONFIG
+    retention: int = _B2_RETENTION
+
+    def __post_init__(self) -> None:
+        if (
+            self.destination_id is not BackupDestination.HORIZON_B2
+            or self.remote_name != _B2_REMOTE
+            or self.prefix_root != _B2_PREFIX_ROOT
+            or self.credential_config != _B2_CONFIG
+            or self.retention != _B2_RETENTION
+        ):
+            raise ValueError("B2 destination configuration is source-owned")
 
 
-def b2_prefix(profile_id: str, backup_class: BackupClass = BackupClass.APPLICATION) -> str:
-    profile = str(getattr(profile_id, "value", profile_id))
-    try:
-        backup_class = BackupClass(backup_class)
-    except (TypeError, ValueError) as exc:
-        raise SafeError("invalid_backup_destination", "backup class is not approved") from exc
-    if profile not in _B2_PROFILES or backup_class is not BackupClass.APPLICATION:
-        raise SafeError("invalid_backup_destination", "backup destination is not approved")
-    return f"{_B2_PREFIX_ROOT}/{profile}"
+B2_DESTINATION = B2DestinationConfig()
 
 
 def _validate_b2_credentials() -> None:
-    """Validate the fixed credential boundary without reading its contents."""
+    """Validate the fixed credential path without opening or parsing it."""
     for directory in (
         Path("/"),
         Path("/etc"),
@@ -90,20 +113,27 @@ def _validate_b2_credentials() -> None:
         try:
             info = os.lstat(directory)
         except OSError as exc:
-            raise SafeError("backup_protection_failed", "remote backup credentials are unavailable") from exc
+            raise SafeError(
+                "backup_protection_failed", "remote backup credentials are unavailable"
+            ) from exc
+        mode = stat.S_IMODE(info.st_mode)
         if (
             stat.S_ISLNK(info.st_mode)
             or not stat.S_ISDIR(info.st_mode)
             or info.st_uid != 0
             or info.st_gid != 0
-            or stat.S_IMODE(info.st_mode) & 0o022
-            or (directory == Path("/etc/game-control/secrets.d") and stat.S_IMODE(info.st_mode) != 0o700)
+            or mode & 0o022
+            or (directory == Path("/etc/game-control/secrets.d") and mode != 0o700)
         ):
-            raise SafeError("backup_protection_failed", "remote backup credentials are unavailable")
+            raise SafeError(
+                "backup_protection_failed", "remote backup credentials are unavailable"
+            )
     try:
         info = os.lstat(_B2_CONFIG)
     except OSError as exc:
-        raise SafeError("backup_protection_failed", "remote backup credentials are unavailable") from exc
+        raise SafeError(
+            "backup_protection_failed", "remote backup credentials are unavailable"
+        ) from exc
     if (
         stat.S_ISLNK(info.st_mode)
         or not stat.S_ISREG(info.st_mode)
@@ -112,18 +142,44 @@ def _validate_b2_credentials() -> None:
         or info.st_gid != 0
         or stat.S_IMODE(info.st_mode) != 0o600
     ):
-        raise SafeError("backup_protection_failed", "remote backup credentials are unavailable")
+        raise SafeError(
+            "backup_protection_failed", "remote backup credentials are unavailable"
+        )
+
+
+@dataclass(frozen=True)
+class RemoteObject:
+    key: str
+    size_bytes: int = 0
+
+
+class B2Transport(Protocol):
+    def upload(self, source: Path, key: str) -> None: ...
+
+    def download(self, key: str, destination: Path) -> None: ...
+
+    def verify(self, source: Path, key: str) -> None: ...
+
+    def list(self, prefix: str) -> Iterable[RemoteObject]: ...
+
+    def delete(self, key: str) -> None: ...
 
 
 class B2CommandTransport:
-    """Fixed-scope rclone transport; credentials never enter argv or errors."""
+    """Client-side encrypted B2 transport using a fixed rclone config.
+
+    Credentials are read by rclone from the root-owned config file. They are
+    never represented in argv, returned output, exceptions, or audit state.
+    """
 
     def __init__(
         self,
         *,
+        destination: B2DestinationConfig = B2_DESTINATION,
         runner: Callable[..., Any] | None = None,
         credential_validator: Callable[[], None] | None = None,
     ) -> None:
+        self.destination = destination
         self.runner = runner or subprocess.run
         self.credential_validator = credential_validator or _validate_b2_credentials
 
@@ -131,7 +187,7 @@ class B2CommandTransport:
         try:
             self.credential_validator()
             return self.runner(
-                argv,
+                maintenance_argv(argv, slice_name="maintenance.slice"),
                 check=True,
                 shell=False,
                 stdout=subprocess.PIPE,
@@ -139,24 +195,23 @@ class B2CommandTransport:
             )
         except SafeError:
             raise
+        except (OSError, subprocess.SubprocessError) as exc:
+            raise SafeError("backup_protection_failed", "remote backup operation failed") from exc
         except Exception as exc:
+            # Test seams and alternate runners must receive the same safe
+            # boundary as subprocess failures; never surface their text.
             raise SafeError("backup_protection_failed", "remote backup operation failed") from exc
 
-    @staticmethod
-    def _approved_key(key: str) -> str:
-        if not isinstance(key, str):
-            raise SafeError("invalid_backup_destination", "backup object is not approved")
-        parts = key.split("/")
-        if len(parts) != 5 or parts[:3] != _B2_PREFIX_ROOT.split("/"):
-            raise SafeError("invalid_backup_destination", "backup object is not approved")
-        if parts[3] not in _B2_PROFILES:
-            raise SafeError("invalid_backup_destination", "backup object is not approved")
-        prefix = b2_prefix(parts[3])
-        if not key.startswith(prefix + "/") or not re.fullmatch(
-            _BACKUP_ID + re.escape(_ARCHIVE_SUFFIX), key.removeprefix(prefix + "/")
-        ):
-            raise SafeError("invalid_backup_destination", "backup object is not approved")
-        return key
+    def _base(self, operation: str) -> list[str]:
+        return [
+            "/usr/bin/rclone",
+            "--config",
+            str(self.destination.credential_config),
+            operation,
+        ]
+
+    def _remote(self, key: str) -> str:
+        return f"{self.destination.remote_name}:{key}"
 
     @staticmethod
     def _approved_prefix(prefix: str) -> str:
@@ -164,11 +219,23 @@ class B2CommandTransport:
             raise SafeError("invalid_backup_destination", "backup destination is not approved")
         return prefix
 
-    def _base(self, operation: str) -> list[str]:
-        return ["/usr/bin/rclone", "--config", str(_B2_CONFIG), operation]
-
-    def _remote(self, key: str) -> str:
-        return f"{_B2_REMOTE}:{key}"
+    @staticmethod
+    def _approved_key(key: str) -> str:
+        if not isinstance(key, str):
+            raise SafeError("invalid_backup_destination", "backup object is not approved")
+        parts = key.split("/")
+        if len(parts) != 5 or parts[:3] != ["helios", "horizon", "app"]:
+            raise SafeError("invalid_backup_destination", "backup object is not approved")
+        if parts[3] not in _B2_PROFILES:
+            raise SafeError("invalid_backup_destination", "backup object is not approved")
+        # Canonical generated keys have exactly app/<profile>/<archive>.
+        canonical_prefix = b2_prefix(parts[3])
+        if not key.startswith(canonical_prefix + "/"):
+            raise SafeError("invalid_backup_destination", "backup object is not approved")
+        basename = key.removeprefix(canonical_prefix + "/")
+        if not re.fullmatch(_BACKUP_ID + re.escape(_ARCHIVE_SUFFIX), basename):
+            raise SafeError("invalid_backup_destination", "backup object is not approved")
+        return key
 
     def upload(self, source: Path, key: str) -> None:
         key = self._approved_key(key)
@@ -178,7 +245,11 @@ class B2CommandTransport:
 
     def download(self, key: str, destination: Path) -> None:
         key = self._approved_key(key)
-        if destination.name != key.rsplit("/", 1)[-1] or destination.exists() or not destination.parent.is_dir():
+        if (
+            destination.name != key.rsplit("/", 1)[-1]
+            or destination.exists()
+            or not destination.parent.is_dir()
+        ):
             raise SafeError("invalid_backup_destination", "backup staging path is not approved")
         self._run(self._base("copyto") + [self._remote(key), str(destination), "--immutable"])
 
@@ -187,7 +258,10 @@ class B2CommandTransport:
         if source.name != key.rsplit("/", 1)[-1] or not source.is_file():
             raise SafeError("invalid_backup_destination", "backup object is not approved")
         prefix = key.rsplit("/", 1)[0]
-        self._run(self._base("cryptcheck") + [str(source.parent), self._remote(prefix), "--one-way", "--fast-list", "--include", source.name])
+        self._run(
+            self._base("cryptcheck")
+            + [str(source.parent), self._remote(prefix), "--one-way", "--fast-list", "--include", source.name]
+        )
 
     def list(self, prefix: str) -> tuple[RemoteObject, ...]:
         prefix = self._approved_prefix(prefix)
@@ -198,18 +272,262 @@ class B2CommandTransport:
             raise SafeError("backup_protection_failed", "remote listing could not be verified") from exc
         if not isinstance(payload, list):
             raise SafeError("backup_protection_failed", "remote listing could not be verified")
-        objects: list[RemoteObject] = []
+        objects = []
         for item in payload:
             if not isinstance(item, dict) or not isinstance(item.get("Name"), str):
                 raise SafeError("backup_protection_failed", "remote listing could not be verified")
             name = item["Name"].lstrip("/")
-            key = name if name.startswith(prefix + "/") else f"{prefix}/{name}"
+            key = name if name.startswith(prefix.rstrip("/") + "/") else f"{prefix.rstrip('/')}/{name}"
             self._approved_key(key)
             objects.append(RemoteObject(key=key, size_bytes=max(0, int(item.get("Size", 0)))))
         return tuple(objects)
 
     def delete(self, key: str) -> None:
-        self._run(self._base("deletefile") + [self._remote(self._approved_key(key))])
+        key = self._approved_key(key)
+        self._run(self._base("deletefile") + [self._remote(key)])
+
+
+@dataclass(frozen=True)
+class ProtectionRecord:
+    backup_id: str
+    profile_id: str
+    destination_id: BackupDestination
+    backup_class: BackupClass
+    remote_key: str
+    local_sha256: str
+    local_verified: bool
+    upload_state: str
+    remote_verified: bool
+    comparison_state: str
+    prune_state: str
+    error_code: str | None = None
+
+
+def b2_prefix(profile_id: str, backup_class: BackupClass = BackupClass.APPLICATION) -> str:
+    """Return a fixed prefix for an allowlisted Horizon profile/class."""
+    profile = str(getattr(profile_id, "value", profile_id))
+    try:
+        backup_class = BackupClass(backup_class)
+    except (TypeError, ValueError) as exc:
+        raise SafeError("invalid_backup_destination", "backup class is not approved") from exc
+    if profile not in _B2_PROFILES or backup_class is not BackupClass.APPLICATION:
+        raise SafeError("invalid_backup_destination", "backup destination is not approved")
+    return f"{_B2_PREFIX_ROOT}/{profile}"
+
+
+def full_lxc_prefix() -> str:
+    """Return the fixed P0 full-LXC boundary, owned outside application B2."""
+    return FULL_LXC_PREFIX
+
+
+def validate_destination(destination: BackupDestination | str, profile_id: str) -> BackupDestination:
+    try:
+        value = BackupDestination(destination)
+    except (TypeError, ValueError) as exc:
+        raise SafeError("invalid_backup_destination", "backup destination is not approved") from exc
+    if value is BackupDestination.HORIZON_B2:
+        b2_prefix(profile_id)
+    return value
+
+
+class B2ProtectionService:
+    """Protect one locally verified archive and prune only verified B2 peers."""
+
+    def __init__(
+        self,
+        *,
+        database: Any | None = None,
+        transport: B2Transport,
+        destination: B2DestinationConfig = B2_DESTINATION,
+        clock: Callable[[], datetime] | None = None,
+    ) -> None:
+        self.database = database
+        self.transport = transport
+        self.destination = destination
+        self.clock = clock or (lambda: datetime.now(timezone.utc))
+        self._memory: dict[tuple[str, str, str], ProtectionRecord] = {}
+        self._lock = threading.RLock()
+
+    def protect(
+        self,
+        record: BackupRecord,
+        *,
+        backup_class: BackupClass = BackupClass.APPLICATION,
+    ) -> ProtectionRecord:
+        with self._lock:
+            if self.database is None:
+                raise SafeError("backup_protection_failed", "durable backup state is unavailable")
+            return self._protect(record, backup_class=backup_class)
+
+    def _protect(
+        self,
+        record: BackupRecord,
+        *,
+        backup_class: BackupClass = BackupClass.APPLICATION,
+    ) -> ProtectionRecord:
+        try:
+            backup_class = BackupClass(backup_class)
+        except (TypeError, ValueError) as exc:
+            raise SafeError("invalid_backup_destination", "backup class is not approved") from exc
+        destination = validate_destination(self.destination.destination_id, record.profile_id)
+        prefix = b2_prefix(record.profile_id, backup_class)
+        remote_key = f"{prefix}/{record.id}{_ARCHIVE_SUFFIX}"
+        digest = _sha256(record.path)
+        if not record.verified or not record.path.is_file():
+            self._save(record, backup_class, remote_key, digest, "not_started", False, "not_started", "not_started", "local_unverified")
+            raise SafeError("backup_protection_failed", "local backup is not verified")
+        self._save(record, backup_class, remote_key, digest, "pending", False, "pending", "not_started", None)
+        try:
+            self.transport.upload(record.path, remote_key)
+        except SafeError:
+            self._save(record, backup_class, remote_key, digest, "failed", False, "failed", "not_started", "upload_failed")
+            raise
+        except Exception as exc:
+            self._save(record, backup_class, remote_key, digest, "failed", False, "failed", "not_started", "upload_failed")
+            raise SafeError("backup_protection_failed", "remote backup upload failed") from exc
+        self._save(record, backup_class, remote_key, digest, "succeeded", False, "pending", "not_started", None)
+        try:
+            self.transport.verify(record.path, remote_key)
+        except SafeError:
+            self._save(record, backup_class, remote_key, digest, "succeeded", False, "failed", "not_started", "remote_check_failed")
+            raise
+        except Exception as exc:
+            self._save(record, backup_class, remote_key, digest, "succeeded", False, "failed", "not_started", "remote_check_failed")
+            raise SafeError("backup_protection_failed", "remote backup verification failed") from exc
+        self._save(record, backup_class, remote_key, digest, "succeeded", True, "verified", "pending", None)
+        try:
+            self._prune(record, backup_class, prefix, remote_key)
+        except SafeError:
+            self._save(record, backup_class, remote_key, digest, "succeeded", True, "verified", "failed", "prune_failed")
+            raise
+        except Exception as exc:
+            self._save(record, backup_class, remote_key, digest, "succeeded", True, "verified", "failed", "prune_failed")
+            raise SafeError("backup_protection_failed", "remote backup pruning failed") from exc
+        return self._save(record, backup_class, remote_key, digest, "succeeded", True, "verified", "succeeded", None)
+
+    def _prune(self, current: BackupRecord, backup_class: BackupClass, prefix: str, current_key: str) -> None:
+        objects = tuple(self.transport.list(prefix))
+        exact = {item.key: item for item in objects if item.key.startswith(prefix + "/")}
+        records = [
+            item for item in self._records(current.profile_id, backup_class)
+            if item.remote_verified
+            and item.comparison_state == "verified"
+            and item.remote_key in exact
+            and item.remote_key.startswith(prefix + "/")
+        ]
+        if not any(item.remote_key == current_key for item in records):
+            raise SafeError("backup_protection_failed", "new remote generation is not verified")
+        records.sort(key=lambda item: _backup_generation(item.backup_id), reverse=True)
+        # Local protection controls only the local archive. Remote retention is
+        # always exactly the newest verified generations in this owned prefix.
+        for item in records[self.destination.retention :]:
+            self.transport.delete(item.remote_key)
+            self._save_by_protection(item, prune_state="deleted")
+
+    def _records(self, profile_id: str, backup_class: BackupClass) -> list[ProtectionRecord]:
+        if self.database is not None and hasattr(self.database, "connection"):
+            rows = self.database.connection.execute(
+                "SELECT backup_id,profile_id,destination_id,backup_class,remote_key,local_sha256,"
+                "local_verified,upload_state,remote_verified,comparison_state,prune_state,error_code "
+                "FROM backup_protections WHERE profile_id=? AND destination_id=? AND backup_class=?",
+                (profile_id, self.destination.destination_id.value, backup_class.value),
+            ).fetchall()
+            return [self._row(row) for row in rows]
+        return [item for item in self._memory.values() if item.profile_id == profile_id and item.backup_class is backup_class]
+
+    def _local_records(self, profile_id: str) -> list[BackupRecord]:
+        if self.database is not None and hasattr(self.database, "list_backups"):
+            result = []
+            for item in self.database.list_backups(profile_id):
+                if isinstance(item, BackupRecord):
+                    result.append(item)
+                elif hasattr(item, "keys"):
+                    result.append(BackupRecord(
+                        id=str(item["id"]), profile_id=str(item["profile_id"]),
+                        created_at=datetime.fromisoformat(str(item["created_at"]).replace("Z", "+00:00")),
+                        size_bytes=int(item["size_bytes"]), verified=bool(item["verified"]),
+                        protected=bool(item["protected"]), path=Path(str(item.get("path", ""))),
+                    ))
+                else:
+                    result.append(BackupRecord(
+                        id=str(item[0]), profile_id=str(item[1]),
+                        created_at=datetime.fromisoformat(str(item[2]).replace("Z", "+00:00")),
+                        size_bytes=int(item[3]), verified=bool(item[4]), protected=bool(item[5]), path=Path(""),
+                    ))
+            return result
+        if self.database is not None and hasattr(self.database, "connection"):
+            rows = self.database.connection.execute(
+                "SELECT id,profile_id,created_at,size_bytes,verified,protected FROM backups WHERE profile_id=?",
+                (profile_id,),
+            ).fetchall()
+            return [BackupRecord(
+                id=str(row[0]), profile_id=str(row[1]),
+                created_at=datetime.fromisoformat(str(row[2]).replace("Z", "+00:00")),
+                size_bytes=int(row[3]), verified=bool(row[4]), protected=bool(row[5]), path=Path(""),
+            ) for row in rows]
+        return []
+
+    def _row(self, row: Any) -> ProtectionRecord:
+        return ProtectionRecord(
+            backup_id=str(row[0]), profile_id=str(row[1]), destination_id=BackupDestination(row[2]),
+            backup_class=BackupClass(row[3]), remote_key=str(row[4]), local_sha256=str(row[5]),
+            local_verified=bool(row[6]), upload_state=str(row[7]), remote_verified=bool(row[8]),
+            comparison_state=str(row[9]), prune_state=str(row[10]), error_code=row[11],
+        )
+
+    def _save(
+        self,
+        record: BackupRecord,
+        backup_class: BackupClass,
+        remote_key: str,
+        digest: str,
+        upload_state: str,
+        remote_verified: bool,
+        comparison_state: str,
+        prune_state: str,
+        error_code: str | None,
+    ) -> ProtectionRecord:
+        value = ProtectionRecord(
+            backup_id=record.id, profile_id=record.profile_id, destination_id=self.destination.destination_id,
+            backup_class=backup_class, remote_key=remote_key, local_sha256=digest, local_verified=record.verified,
+            upload_state=upload_state, remote_verified=remote_verified, comparison_state=comparison_state,
+            prune_state=prune_state, error_code=error_code,
+        )
+        self._memory[(record.id, self.destination.destination_id.value, backup_class.value)] = value
+        if self.database is not None and hasattr(self.database, "connection"):
+            self.database.connection.execute(
+                "INSERT INTO backup_protections(backup_id,profile_id,destination_id,backup_class,remote_key,"
+                "local_sha256,local_verified,upload_state,remote_verified,comparison_state,prune_state,updated_at,error_code) "
+                "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(backup_id,destination_id,backup_class) DO UPDATE SET "
+                "remote_key=excluded.remote_key,local_sha256=excluded.local_sha256,local_verified=excluded.local_verified,"
+                "upload_state=excluded.upload_state,remote_verified=excluded.remote_verified,comparison_state=excluded.comparison_state,"
+                "prune_state=excluded.prune_state,updated_at=excluded.updated_at,error_code=excluded.error_code",
+                (value.backup_id, value.profile_id, value.destination_id.value, value.backup_class.value, value.remote_key,
+                 value.local_sha256, int(value.local_verified), value.upload_state, int(value.remote_verified),
+                 value.comparison_state, value.prune_state, _iso(self.clock()), value.error_code),
+            )
+            self.database.connection.commit()
+        return value
+
+    def _save_by_protection(self, value: ProtectionRecord, *, prune_state: str) -> None:
+        updated = ProtectionRecord(**{**value.__dict__, "prune_state": prune_state})
+        self._memory[(value.backup_id, value.destination_id.value, value.backup_class.value)] = updated
+        if self.database is not None and hasattr(self.database, "connection"):
+            self.database.connection.execute(
+                "UPDATE backup_protections SET prune_state=?,updated_at=? WHERE backup_id=? AND destination_id=? AND backup_class=?",
+                (prune_state, _iso(self.clock()), value.backup_id, value.destination_id.value, value.backup_class.value),
+            )
+            self.database.connection.commit()
+
+
+def _backup_generation(backup_id: str) -> str:
+    return backup_id.split("-", 1)[0]
+
+
+def _iso(value: datetime) -> str:
+    if value.tzinfo is None:
+        value = value.replace(tzinfo=timezone.utc)
+    return value.isoformat()
 
 
 @dataclass(frozen=True)
@@ -228,6 +546,22 @@ class RestoreResult:
     backup_id: str
     rollback: Path | None
     destination: Path
+    rollbacks: tuple[Path | None, ...] = ()
+    destinations: tuple[Path, ...] = ()
+    journal: Path | None = None
+
+
+@dataclass(frozen=True)
+class _RestoreTarget:
+    path: Path
+    uid: int
+    gid: int
+    device: int
+    inode: int
+    parent_device: int = 0
+    parent_inode: int = 0
+    parent_uid: int = 0
+    parent_gid: int = 0
 
 
 class BackupService:
@@ -242,7 +576,10 @@ class BackupService:
         free_space: Callable[[Path], int] | None = None,
         clock: Callable[[], datetime] | None = None,
         tar_runner: Callable[..., Any] | None = None,
+        protection_service: B2ProtectionService | None = None,
         online_transport: OnlineSaveTransport | None = None,
+        telemetry_db: Any | None = None,
+        lease_check: Callable[[], bool] | None = None,
     ) -> None:
         self.profile = profile
         self.database = database
@@ -250,7 +587,14 @@ class BackupService:
         self.free_space = free_space or (lambda path: shutil.disk_usage(path).free)
         self.clock = clock or (lambda: datetime.now(timezone.utc))
         self.tar_runner = tar_runner or subprocess.run
+        self.protection_service = protection_service
         self.online_transport = online_transport
+        self.telemetry_db = telemetry_db
+        self.lease_check = lease_check
+
+    def _assert_lease(self) -> None:
+        if self.lease_check is not None and not self.lease_check():
+            raise SafeError("slot_conflict", "operation lease was lost before backup publication", retryable=True)
 
     @property
     def backup_root(self) -> Path:
@@ -271,12 +615,17 @@ class BackupService:
             protected = bool(getattr(action, "protected", False))
         if destination is None:
             destination = getattr(action, "destination", BackupDestination.LOCAL)
-        try:
-            destination = BackupDestination(destination)
-        except (TypeError, ValueError) as exc:
-            raise SafeError("invalid_backup_destination", "backup destination is not approved") from exc
-        roots = tuple(Path(root) for root in getattr(self.profile.paths, "backup_roots", ()))
-        roots = roots or tuple(Path(root) for root in self.profile.paths.data_roots)
+        destination = validate_destination(destination, str(self.profile.id))
+        if destination is BackupDestination.HORIZON_B2 and (
+            self.protection_service is None or self.protection_service.database is None
+        ):
+            raise SafeError("backup_protection_failed", "durable backup state is unavailable")
+        configured_backup_roots = tuple(
+            Path(root) for root in getattr(self.profile.paths, "backup_roots", ())
+        )
+        roots = configured_backup_roots or tuple(
+            Path(root) for root in self.profile.paths.data_roots
+        )
         self.backup_root.mkdir(parents=True, exist_ok=True, mode=0o700)
         os.chmod(self.backup_root, 0o700)
         estimated = self._estimate(roots)
@@ -290,16 +639,20 @@ class BackupService:
         partial = self.backup_root / f"{backup_id}.partial"
         final = self.backup_root / f"{backup_id}{_ARCHIVE_SUFFIX}"
         staging = Path(tempfile.mkdtemp(prefix=".stage-", dir=self.backup_root))
+        catalog_inserted = False
+        remote_started = False
         try:
             os.chmod(staging, 0o700)
             entries = self._snapshot(roots, staging)
             manifest = {
-                "schema": 1,
+                "schema": 2 if len(roots) > 1 else 1,
                 "profile_id": str(self.profile.id),
                 "backup_id": backup_id,
                 "created_at": now.isoformat(),
                 "entries": entries,
             }
+            if len(roots) > 1:
+                manifest["roots"] = [{"id": _root_id(root), "identity": _root_identity(root)} for root in roots]
             manifest_path = staging / _MANIFEST
             _write_json_fsync(manifest_path, manifest)
             filelist = staging / ".filelist"
@@ -317,9 +670,10 @@ class BackupService:
                 "--files-from",
                 str(filelist),
             ]
-            self.tar_runner(argv, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            self.tar_runner(maintenance_argv(argv, slice_name="maintenance.slice"), check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
             _fsync_file(partial)
             self._verify_archive(partial, manifest)
+            self._assert_lease()
             os.replace(partial, final)
             _fsync_dir(self.backup_root)
             record = BackupRecord(
@@ -331,13 +685,33 @@ class BackupService:
                 protected=bool(protected),
                 path=final,
             )
+            self._assert_lease()
             self._insert(record)
+            catalog_inserted = True
+            if destination is BackupDestination.HORIZON_B2:
+                self._assert_lease()
+                if self.protection_service is None:
+                    raise SafeError("backup_protection_failed", "remote backup service unavailable")
+                remote_started = True
+                self.protection_service.protect(record)
+                self._assert_lease()
+            self._assert_lease()
             return record
         except SafeError:
             partial.unlink(missing_ok=True)
+            if not remote_started:
+                final.unlink(missing_ok=True)
+                if catalog_inserted:
+                    self._delete(backup_id)
+            _fsync_dir(self.backup_root)
             raise
         except (OSError, subprocess.SubprocessError, tarfile.TarError, ValueError) as exc:
             partial.unlink(missing_ok=True)
+            if not remote_started:
+                final.unlink(missing_ok=True)
+                if catalog_inserted:
+                    self._delete(backup_id)
+            _fsync_dir(self.backup_root)
             raise SafeError("backup_failed", "backup could not be verified") from exc
         finally:
             shutil.rmtree(staging, ignore_errors=True)
@@ -352,20 +726,27 @@ class BackupService:
         destination: BackupDestination | str | None = None,
         max_snapshot_seconds: float = 120.0,
     ) -> BackupRecord:
-        """Snapshot approved Sunlit data while save writes are quiesced."""
+        """Create a Sunlit backup while briefly quiescing Minecraft saves.
+
+        The save-on call is attempted after every save-off attempt, including
+        failed flush/copy branches. Compression and remote protection do not
+        begin until the game is writing again.
+        """
+        quiesce_started = time.monotonic()
+        quiesce_success = False
         if self.online_transport is None:
             raise SafeError("backup_quiesce_failed", "online backup transport is unavailable")
-        profile_id = str(getattr(self.profile.id, "value", self.profile.id))
-        if profile_id != ProfileId.MINECRAFT_SUNLIT_COBBLEMON.value:
+        if str(getattr(self.profile.id, "value", self.profile.id)) != "minecraft-sunlit-cobblemon":
             raise SafeError("backup_quiesce_failed", "online backup is not approved for this profile")
         if protected is None:
             protected = bool(getattr(action, "protected", False))
         if destination is None:
             destination = getattr(action, "destination", BackupDestination.LOCAL)
-        try:
-            BackupDestination(destination)
-        except (TypeError, ValueError) as exc:
-            raise SafeError("invalid_backup_destination", "backup destination is not approved") from exc
+        destination = validate_destination(destination, str(self.profile.id))
+        if destination is BackupDestination.HORIZON_B2 and (
+            self.protection_service is None or self.protection_service.database is None
+        ):
+            raise SafeError("backup_protection_failed", "durable backup state is unavailable")
         roots = tuple(Path(root) for root in getattr(self.profile.paths, "backup_roots", ()))
         roots = roots or tuple(Path(root) for root in self.profile.paths.data_roots)
         self.backup_root.mkdir(parents=True, exist_ok=True, mode=0o700)
@@ -373,7 +754,6 @@ class BackupService:
         estimated = self._estimate(roots)
         if self.free_space(self.backup_root) < max(1, int(estimated * _MARGIN)):
             raise SafeError("insufficient_space", "insufficient free space for backup")
-
         now = self.clock()
         if now.tzinfo is None:
             now = now.replace(tzinfo=timezone.utc)
@@ -381,7 +761,10 @@ class BackupService:
         partial = self.backup_root / f"{backup_id}.partial"
         final = self.backup_root / f"{backup_id}{_ARCHIVE_SUFFIX}"
         staging = Path(tempfile.mkdtemp(prefix=".online-stage-", dir=self.backup_root))
+        catalog_inserted = False
+        remote_started = False
         failure: BaseException | None = None
+        entries: list[dict[str, Any]] = []
         try:
             os.chmod(staging, 0o700)
             deadline = time.monotonic() + max(1.0, min(float(max_snapshot_seconds), 900.0))
@@ -391,32 +774,36 @@ class BackupService:
                 entries = self._snapshot(roots, staging, copy_files=True, deadline=deadline)
             except BaseException as exc:
                 failure = exc
-                entries = []
             try:
                 self._call_online("save_on")
             except BaseException as exc:
                 failure = exc
             if failure is not None:
                 raise SafeError("backup_quiesce_failed", "online backup quiesce could not be completed") from failure
+            quiesce_success = True
 
             manifest = {
-                "schema": 1,
+                "schema": 2 if len(roots) > 1 else 1,
                 "profile_id": str(self.profile.id),
                 "backup_id": backup_id,
                 "created_at": now.isoformat(),
                 "online_consistent": True,
                 "entries": entries,
             }
-            _write_json_fsync(staging / _MANIFEST, manifest)
+            if len(roots) > 1:
+                manifest["roots"] = [{"id": _root_id(root), "identity": _root_identity(root)} for root in roots]
+            manifest_path = staging / _MANIFEST
+            _write_json_fsync(manifest_path, manifest)
             filelist = staging / ".filelist"
             _write_filelist(filelist, [_MANIFEST] + [entry["archive_path"] for entry in entries])
             argv = [
                 "/usr/bin/tar", "--zstd", "--create", "--file", str(partial),
                 "--directory", str(staging), "--null", "--files-from", str(filelist),
             ]
-            self.tar_runner(argv, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            self.tar_runner(maintenance_argv(argv, slice_name="maintenance.slice"), check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
             _fsync_file(partial)
             self._verify_archive(partial, manifest)
+            self._assert_lease()
             os.replace(partial, final)
             _fsync_dir(self.backup_root)
             record = BackupRecord(
@@ -428,15 +815,48 @@ class BackupService:
                 protected=bool(protected),
                 path=final,
             )
+            self._assert_lease()
             self._insert(record)
+            catalog_inserted = True
+            if destination is BackupDestination.HORIZON_B2:
+                self._assert_lease()
+                if self.protection_service is None:
+                    raise SafeError("backup_protection_failed", "remote backup service unavailable")
+                remote_started = True
+                self.protection_service.protect(record)
+                self._assert_lease()
+            self._assert_lease()
             return record
         except SafeError:
             partial.unlink(missing_ok=True)
+            if not remote_started:
+                final.unlink(missing_ok=True)
+                if catalog_inserted:
+                    self._delete(backup_id)
+            _fsync_dir(self.backup_root)
             raise
         except (OSError, subprocess.SubprocessError, tarfile.TarError, ValueError) as exc:
             partial.unlink(missing_ok=True)
+            if not remote_started:
+                final.unlink(missing_ok=True)
+                if catalog_inserted:
+                    self._delete(backup_id)
+            _fsync_dir(self.backup_root)
             raise SafeError("backup_failed", "backup could not be verified") from exc
         finally:
+            recorder = getattr(self.telemetry_db, "enqueue_sample", None)
+            if callable(recorder):
+                try:
+                    recorder(
+                        self.profile.id,
+                        "backup_quiesce_duration",
+                        min(900_000.0, max(0.0, (time.monotonic() - quiesce_started) * 1000.0)),
+                        ts_ms=int(time.time() * 1000),
+                        state="available",
+                        labels={"result": "success" if quiesce_success else "failure", "source": "slotd"},
+                    )
+                except Exception:
+                    pass
             shutil.rmtree(staging, ignore_errors=True)
 
     def _call_online(self, method: str) -> Any:
@@ -521,7 +941,19 @@ class BackupService:
             if profile_id == ProfileId.MINECRAFT_SUNLIT_COBBLEMON.value and root == mutable_root
             else frozenset()
         )
-        return _walk(root, excluded_top_level=excluded)
+        paths = _walk(root, excluded_top_level=excluded)
+        if profile_id != ProfileId.MINECRAFT_SUNLIT_COBBLEMON.value or root != mutable_root:
+            return paths
+
+        def without_versioned_server_backups() -> Iterable[Path]:
+            for path in paths:
+                relative = path.relative_to(root)
+                parts = relative.parts
+                if len(parts) >= 4 and parts[0] == ".versions" and parts[2] == "backups":
+                    continue
+                yield path
+
+        return without_versioned_server_backups()
 
     def _snapshot(
         self,
@@ -533,14 +965,16 @@ class BackupService:
     ) -> list[dict[str, Any]]:
         entries: list[dict[str, Any]] = []
         for index, root in enumerate(roots):
+            root_id = _root_id(root)
             if root.is_symlink():
                 raise SafeError("backup_failed", "profile data root is a symlink")
-            payload_root = staging / "payload" / str(index)
+            payload_root = staging / "payload" / (root_id if len(roots) > 1 else "")
             payload_root.mkdir(parents=True, mode=0o700)
             if not root.exists():
                 continue
             for source in self._walk_source(root):
-                _check_deadline(deadline)
+                if deadline is not None and time.monotonic() > deadline:
+                    raise SafeError("backup_quiesce_timeout", "online backup staging exceeded its bound")
                 relative = source.relative_to(root)
                 if any(part.endswith(".partial") for part in relative.parts):
                     continue
@@ -553,6 +987,7 @@ class BackupService:
                         digest = _stage_file_copy(source, destination, deadline=deadline)
                         _check_deadline(deadline)
                         os.chmod(destination, 0o400)
+                        _check_deadline(deadline)
                         metadata_path = destination
                     else:
                         _stage_file(source, destination)
@@ -563,8 +998,9 @@ class BackupService:
                     raise SafeError("backup_failed", "backup source could not be read") from exc
                 entries.append(
                     {
-                        "path": relative.as_posix() if len(roots) == 1 else f"{index}/{relative.as_posix()}",
-                        "archive_path": f"payload/{index}/{relative.as_posix()}",
+                        "path": relative.as_posix(),
+                        "root_id": root_id,
+                        "archive_path": (f"payload/{relative.as_posix()}" if len(roots) == 1 else f"payload/{root_id}/{relative.as_posix()}"),
                         "size": source_info.st_size,
                         "mode": stat.S_IMODE(source_info.st_mode),
                         "uid": source_info.st_uid,
@@ -579,6 +1015,8 @@ class BackupService:
         try:
             with tarfile.open(archive_path, mode="r:*") as archive:
                 members = archive.getmembers()
+                for member in members:
+                    _validate_member(member)
                 names = {member.name for member in members}
                 if _MANIFEST not in names:
                     raise SafeError("backup_failed", "backup manifest is missing")
@@ -589,6 +1027,9 @@ class BackupService:
                     member = archive.getmember(entry["archive_path"])
                     if not member.isfile():
                         raise SafeError("backup_failed", "backup contains an invalid member")
+                    uid, gid = _entry_owner(entry, error_code="backup_failed")
+                    if member.uid != uid or member.gid != gid:
+                        raise SafeError("backup_failed", "backup ownership metadata changed")
                     stream = archive.extractfile(member)
                     if stream is None or _hash_stream(stream) != entry["sha256"]:
                         raise SafeError("backup_failed", "backup checksum verification failed")
@@ -696,12 +1137,22 @@ class RestoreService:
         stopped_check: Callable[[], bool] | None = None,
         free_space: Callable[[Path], int] | None = None,
         health_check: Callable[[Path], bool] | None = None,
+        lease_check: Callable[[], bool] | None = None,
     ) -> None:
         self.profile = profile
         self.backup_service = backup_service
         self.stopped_check = stopped_check
         self.free_space = free_space or (lambda path: shutil.disk_usage(path).free)
         self.health_check = health_check
+        self.lease_check = lease_check
+
+    def _assert_lease(self) -> None:
+        if self.lease_check is not None and not self.lease_check():
+            raise SafeError("slot_conflict", "operation lease was lost before publication")
+
+    @property
+    def backup_root(self) -> Path:
+        return Path(self.profile.paths.backup_root)
 
     def restore(
         self,
@@ -731,60 +1182,322 @@ class RestoreService:
                     if external
                     else self._validate_archive(source)
                 )
-                required = sum(int(item.get("size", 0)) for item in manifest["entries"]) + 65536
-                destination_parent = Path(self.profile.paths.mutable_root).parent
-                if self.free_space(destination_parent) < int(required * _MARGIN):
+                targets = self._read_targets(manifest)
+                required_by_root = {root_id: 65536 for root_id in targets}
+                for item in manifest["entries"]:
+                    root_id = item.get("root_id", "root-0")
+                    if root_id not in targets and len(targets) == 1:
+                        root_id = next(iter(targets))
+                    required_by_root[root_id] = required_by_root.get(root_id, 65536) + int(item.get("size", 0))
+                if any(self.free_space(targets[root_id].path.parent) < int(amount * _MARGIN) for root_id, amount in required_by_root.items()):
                     raise SafeError("insufficient_space", "insufficient free space for restore")
                 # Validation is complete before the pre-restore backup or any
                 # destination path is created.
                 self.backup_service.create(protected=True)
-                staging = Path(tempfile.mkdtemp(prefix=".restore-", dir=destination_parent))
-                os.chmod(staging, 0o700)
+                stagings = {root_id: Path(tempfile.mkdtemp(prefix=f".restore-{root_id}-", dir=target.path.parent)) for root_id, target in targets.items()}
+                journal = self.backup_root / f".restore-journal-{uuid.uuid4().hex}.json"
+                _write_json_fsync(journal, {"phase": "staged", "backup_id": manifest["backup_id"], "roots": [{"root_id": rid, "destination": str(target.path), "staging": str(stagings[rid]), "rollback": None, "original_exists": target.inode != 0} for rid, target in targets.items()]})
+                for staging in stagings.values():
+                    os.chmod(staging, 0o700)
                 try:
                     if external:
-                        self._extract_external(source, manifest, staging)
+                        self._extract_external_multi(source, manifest, stagings, targets)
                     else:
-                        self._extract(source, members, manifest, staging)
-                    os.chmod(staging, 0o750)
-                    os.chown(
-                        staging,
-                        int(getattr(self.profile, "owner_uid", os.geteuid())),
-                        int(getattr(self.profile, "owner_gid", os.getegid())),
-                    )
-                    destination = Path(self.profile.paths.mutable_root)
-                    if destination.is_symlink():
-                        raise SafeError("invalid_destination", "restore destination is a symlink")
-                    rollback = destination_parent / f".rollback-{uuid.uuid4().hex}"
-                    if destination.exists():
-                        os.replace(destination, rollback)
+                        self._extract_multi(source, members, manifest, stagings, targets)
+                    for root_id, staging in stagings.items():
+                        os.chmod(staging, 0o750)
+                        _chown_tree(staging, targets[root_id].uid, targets[root_id].gid)
+                        self._assert_target_unchanged(targets[root_id])
+                    rollbacks: list[Path | None] = []
+                    rollback_by_root: dict[str, Path | None] = {}
+                    destinations = [target.path for target in targets.values()]
+                    displaced: list[str] = []
+                    activated: list[str] = []
                     try:
-                        os.replace(staging, destination)
+                        for root_id, target in targets.items():
+                            rollback = target.path.parent / f".rollback-{uuid.uuid4().hex}"
+                            rollback_by_root[root_id] = rollback
+                            _write_json_fsync(journal, {"phase": "displacing", "backup_id": manifest["backup_id"], "displaced": list(displaced), "roots": [{"root_id": rid, "destination": str(targets[rid].path), "staging": str(stagings[rid]), "rollback": str(rollback_by_root.get(rid)) if rollback_by_root.get(rid) else None, "original_exists": targets[rid].inode != 0} for rid in targets]})
+                            self._assert_lease()
+                            if target.path.exists():
+                                os.replace(target.path, rollback)
+                            else:
+                                rollback_by_root[root_id] = None
+                            rollbacks.append(rollback_by_root[root_id])
+                            displaced.append(root_id)
+                            _write_json_fsync(journal, {"phase": "displacing", "backup_id": manifest["backup_id"], "displaced": list(displaced), "roots": [{"root_id": rid, "destination": str(targets[rid].path), "staging": str(stagings[rid]), "rollback": str(rollback_by_root.get(rid)) if rollback_by_root.get(rid) else None, "original_exists": targets[rid].inode != 0} for rid in targets]})
+                        _write_json_fsync(journal, {"phase": "displaced", "backup_id": manifest["backup_id"], "roots": [{"root_id": rid, "destination": str(targets[rid].path), "staging": str(stagings[rid]), "rollback": str(rollback_by_root[rid]) if rollback_by_root[rid] else None, "original_exists": targets[rid].inode != 0} for rid in targets]})
+                        for root_id, target in targets.items():
+                            _write_json_fsync(journal, {"phase": "publishing", "backup_id": manifest["backup_id"], "activated": list(activated), "roots": [{"root_id": rid, "destination": str(targets[rid].path), "staging": str(stagings[rid]), "rollback": str(rollback_by_root[rid]) if rollback_by_root[rid] else None, "original_exists": targets[rid].inode != 0} for rid in targets]})
+                            self._assert_lease()
+                            os.replace(stagings[root_id], target.path)
+                            activated.append(root_id)
+                            _write_json_fsync(journal, {"phase": "publishing", "backup_id": manifest["backup_id"], "activated": list(activated), "roots": [{"root_id": rid, "destination": str(targets[rid].path), "staging": str(stagings[rid]), "rollback": str(rollback_by_root[rid]) if rollback_by_root[rid] else None, "original_exists": targets[rid].inode != 0} for rid in targets]})
                     except Exception:
-                        if rollback.exists():
-                            os.replace(rollback, destination)
+                        for root_id in activated:
+                            target = targets[root_id]
+                            if target.path.exists():
+                                shutil.rmtree(target.path, ignore_errors=True)
+                        for root_id in displaced:
+                            target = targets[root_id]
+                            rollback = rollback_by_root[root_id]
+                            if rollback is not None and rollback.exists():
+                                os.replace(rollback, target.path)
                         raise
+                    destination = targets[next(iter(targets))].path
                     result = RestoreResult(
                         backup_id=str(manifest["backup_id"]),
-                        rollback=rollback if rollback.exists() else None,
+                        rollback=next((item for item in rollbacks if item is not None), None),
                         destination=destination,
+                        rollbacks=tuple(rollbacks),
+                        destinations=tuple(destinations),
+                        journal=journal,
                     )
-                    if self.health_check is not None and self.health_check(destination):
+                    _write_json_fsync(journal, {"phase": "activated", "backup_id": manifest["backup_id"], "roots": [{"root_id": rid, "destination": str(targets[rid].path), "staging": str(stagings[rid]), "rollback": str(rollback_by_root[rid]) if rollback_by_root[rid] else None, "original_exists": targets[rid].inode != 0} for rid in targets]})
+                    if self.health_check is not None and all(
+                        self.health_check(item) for item in destinations
+                    ):
                         self.finalize(result)
                     return result
                 except SafeError:
-                    shutil.rmtree(staging, ignore_errors=True)
+                    for staging in stagings.values():
+                        shutil.rmtree(staging, ignore_errors=True)
                     raise
                 finally:
-                    if staging.exists():
-                        shutil.rmtree(staging, ignore_errors=True)
+                    for staging in stagings.values():
+                        if staging.exists():
+                            shutil.rmtree(staging, ignore_errors=True)
         except SafeError:
             raise
         except (OSError, tarfile.TarError, ValueError, KeyError) as exc:
             raise SafeError("restore_failed", "restore could not be completed") from exc
 
     def finalize(self, result: RestoreResult) -> None:
-        if result.rollback is not None:
-            shutil.rmtree(result.rollback, ignore_errors=True)
+        for rollback in result.rollbacks or ((result.rollback,) if result.rollback is not None else ()):
+            if rollback is None:
+                continue
+            shutil.rmtree(rollback, ignore_errors=True)
+            if rollback.exists():
+                raise SafeError("restore_finalize_failed", "restore rollback cleanup failed")
+            _fsync_dir(rollback.parent)
+        if result.journal is not None:
+            try:
+                result.journal.unlink(missing_ok=True)
+            except OSError as exc:
+                raise SafeError("restore_finalize_failed", "restore journal cleanup failed") from exc
+            _fsync_dir(self.backup_root)
+
+    def rollback(self, result: RestoreResult) -> None:
+        destinations = result.destinations or ((result.destination,) if result.destination is not None else ())
+        rollbacks = result.rollbacks or ((result.rollback,) if result.rollback is not None else ())
+        for destination, rollback in zip(destinations, rollbacks):
+            if rollback is None:
+                if destination.exists() or destination.is_symlink():
+                    shutil.rmtree(destination, ignore_errors=True)
+                    _fsync_dir(destination.parent)
+                continue
+            if rollback is not None and rollback.exists():
+                if destination.exists():
+                    shutil.rmtree(destination)
+                os.replace(rollback, destination)
+                _fsync_dir(destination.parent)
+        if result.journal is not None:
+            result.journal.unlink(missing_ok=True)
+
+    def reconcile(self) -> None:
+        """Finish or roll back interrupted restore publications idempotently."""
+        for journal in self.backup_root.glob(".restore-journal-*.json"):
+            try:
+                info = os.lstat(journal)
+                if (not stat.S_ISREG(info.st_mode) or info.st_uid != 0 or info.st_gid != 0 or
+                    stat.S_IMODE(info.st_mode) != 0o600 or info.st_nlink != 1):
+                    raise SafeError("restore_reconcile_failed", "restore journal is not trusted")
+                fd = os.open(journal, os.O_RDONLY | os.O_NOFOLLOW)
+                try:
+                    bound = os.fstat(fd)
+                    if bound.st_dev != info.st_dev or bound.st_ino != info.st_ino or bound.st_size > 1_048_576:
+                        raise SafeError("restore_reconcile_failed", "restore journal changed")
+                    record = json.loads(os.read(fd, bound.st_size).decode("utf-8"))
+                finally:
+                    os.close(fd)
+                phase, roots = self._validate_journal(record)
+                if phase == "staged":
+                    for item in roots:
+                        staging = Path(item["staging"])
+                        if staging.exists():
+                            shutil.rmtree(staging, ignore_errors=True)
+                elif phase in {"displacing", "displaced", "publishing", "activated"}:
+                    if phase == "activated" and self.health_check is not None and all(self.health_check(Path(item["destination"])) for item in roots):
+                        for item in roots:
+                            if item.get("rollback"):
+                                rollback = Path(item["rollback"])
+                                shutil.rmtree(rollback, ignore_errors=True)
+                                if rollback.exists():
+                                    raise SafeError("restore_reconcile_failed", "restore rollback cleanup failed")
+                    else:
+                        activated = set(record.get("activated", []))
+                        displaced = set(record.get("displaced", []))
+                        for item in roots:
+                            destination = Path(item["destination"])
+                            rollback = item.get("rollback")
+                            if rollback and Path(rollback).exists() and (phase not in {"publishing", "displacing"} or item["root_id"] in activated or item["root_id"] in displaced or not destination.exists()):
+                                if destination.exists():
+                                    shutil.rmtree(destination, ignore_errors=True)
+                                os.replace(rollback, destination)
+                            elif not item.get("original_exists", True) and (item["root_id"] in activated or item["root_id"] in displaced):
+                                if destination.exists() or destination.is_symlink():
+                                    shutil.rmtree(destination, ignore_errors=True)
+                                    _fsync_dir(destination.parent)
+                            staging = Path(item["staging"])
+                            if staging.exists():
+                                shutil.rmtree(staging, ignore_errors=True)
+                else:
+                    continue
+                journal.unlink(missing_ok=True)
+                if journal.exists():
+                    raise SafeError("restore_reconcile_failed", "restore journal cleanup failed")
+                _fsync_dir(self.backup_root)
+            except SafeError:
+                raise
+            except (OSError, ValueError, KeyError, TypeError, json.JSONDecodeError) as exc:
+                raise SafeError("restore_reconcile_failed", "restore journal is corrupt") from exc
+
+    def _validate_journal(self, record: dict[str, Any]) -> tuple[str, list[dict[str, Any]]]:
+        if not isinstance(record, dict) or record.get("backup_id") is None:
+            raise SafeError("restore_reconcile_failed", "restore journal is corrupt")
+        phase = record.get("phase")
+        if phase not in {"staged", "displacing", "displaced", "publishing", "activated"}:
+            raise SafeError("restore_reconcile_failed", "restore journal phase is invalid")
+        approved = self._approved_roots()
+        roots = record.get("roots")
+        if not isinstance(roots, list) or len(roots) != len(approved):
+            raise SafeError("restore_reconcile_failed", "restore journal roots are invalid")
+        expected = {str(path): _root_id(path) for path in approved}
+        seen: set[str] = set()
+        for item in roots:
+            if not isinstance(item, dict) or item.get("root_id") in seen:
+                raise SafeError("restore_reconcile_failed", "restore journal roots are invalid")
+            rid, destination = item.get("root_id"), item.get("destination")
+            if rid not in set(expected.values()) or destination not in expected or expected[destination] != rid:
+                raise SafeError("restore_reconcile_failed", "restore journal destination is invalid")
+            if not isinstance(item.get("original_exists"), bool):
+                raise SafeError("restore_reconcile_failed", "restore journal original state is invalid")
+            parent = Path(destination).parent
+            for field in ("staging", "rollback"):
+                value = item.get(field)
+                if value is None and field == "rollback":
+                    continue
+                candidate = Path(value)
+                prefix = f".restore-{rid}-" if field == "staging" else ".rollback-"
+                if candidate.parent != parent or not candidate.name.startswith(prefix) or candidate.name == prefix:
+                    raise SafeError("restore_reconcile_failed", "restore journal path is invalid")
+            seen.add(rid)
+        if seen != set(expected.values()):
+            raise SafeError("restore_reconcile_failed", "restore journal roots are incomplete")
+        for field in ("activated", "displaced"):
+            values = record.get(field, [])
+            if not isinstance(values, list) or len(values) != len(set(values)) or not set(values).issubset(seen):
+                raise SafeError("restore_reconcile_failed", "restore journal state is invalid")
+        return phase, roots
+
+    def _approved_roots(self) -> tuple[Path, ...]:
+        roots = tuple(Path(root) for root in getattr(self.profile.paths, "backup_roots", ()))
+        return roots or tuple(Path(root) for root in self.profile.paths.data_roots)
+
+    def _read_targets(self, manifest: dict[str, Any]) -> dict[str, _RestoreTarget]:
+        roots = self._approved_roots()
+        schema = manifest.get("schema")
+        if schema == 1:
+            if len(roots) != 1:
+                raise SafeError("invalid_backup", "legacy backup is ambiguous for multiple roots")
+            root_ids = ["root-0"]
+        elif schema == 2:
+            descriptors = manifest.get("roots")
+            roots_by_identity = {_root_identity(root): root for root in roots}
+            identities = set(roots_by_identity)
+            valid_descriptors = (
+                isinstance(descriptors, list)
+                and all(isinstance(item, dict) for item in descriptors)
+            )
+            if not valid_descriptors:
+                raise SafeError("invalid_backup", "backup root mapping is invalid")
+            if any(not isinstance(item.get("identity"), str) for item in descriptors):
+                raise SafeError("invalid_backup", "backup root mapping is invalid")
+            descriptor_identities = {item.get("identity") for item in descriptors}
+            if (
+                descriptor_identities != identities
+                or len(descriptor_identities) != len(roots)
+                or any(
+                    not isinstance(item.get("id"), str)
+                    or item["id"] != _root_id(roots_by_identity[item["identity"]])
+                    for item in descriptors
+                )
+            ):
+                raise SafeError("invalid_backup", "backup root mapping is invalid")
+            root_ids = [str(item["id"]) for item in descriptors]
+            roots = tuple(roots_by_identity[str(item["identity"])] for item in descriptors)
+        else:
+            raise SafeError("invalid_backup", "unsupported backup schema")
+        result = {}
+        for root_id, root in zip(root_ids, roots):
+            target = self._read_target(root)
+            result[root_id] = target
+        return result
+
+    def _read_target(self, destination: Path | None = None) -> _RestoreTarget:
+        destination = destination or Path(self.profile.paths.mutable_root)
+        try:
+            info = os.lstat(destination)
+        except OSError as exc:
+            if exc.errno == errno.ENOENT:
+                try:
+                    parent = os.lstat(destination.parent)
+                except OSError as parent_exc:
+                    raise SafeError("invalid_destination", "restore destination is unavailable") from parent_exc
+                return _RestoreTarget(destination, parent.st_uid, parent.st_gid, parent.st_dev, 0, parent.st_dev, parent.st_ino, parent.st_uid, parent.st_gid)
+            raise SafeError("invalid_destination", "restore destination is unavailable") from exc
+        if stat.S_ISLNK(info.st_mode) or not stat.S_ISDIR(info.st_mode):
+            raise SafeError("invalid_destination", "restore destination is not a directory")
+        if info.st_nlink < 2:
+            raise SafeError("invalid_destination", "restore destination has unsafe links")
+        try:
+            child_directories = sum(
+                entry.is_dir(follow_symlinks=False) for entry in os.scandir(destination)
+            )
+        except OSError as exc:
+            raise SafeError("invalid_destination", "restore destination cannot be trusted") from exc
+        if info.st_nlink != 2 + child_directories:
+            raise SafeError("invalid_destination", "restore destination has unsafe links")
+        uid = _bounded_id(info.st_uid, error_code="invalid_destination")
+        gid = _bounded_id(info.st_gid, error_code="invalid_destination")
+        parent = os.lstat(destination.parent)
+        return _RestoreTarget(destination, uid, gid, info.st_dev, info.st_ino, parent.st_dev, parent.st_ino, parent.st_uid, parent.st_gid)
+
+    def _assert_target_unchanged(self, target: _RestoreTarget) -> None:
+        if target.inode == 0:
+            try:
+                parent = os.lstat(target.path.parent)
+            except OSError as exc:
+                raise SafeError("invalid_destination", "restore destination changed") from exc
+            if (target.path.exists() or target.path.is_symlink() or parent.st_dev != target.parent_device or parent.st_ino != target.parent_inode or parent.st_uid != target.parent_uid or parent.st_gid != target.parent_gid):
+                raise SafeError("invalid_destination", "restore destination changed")
+            return
+        try:
+            info = os.lstat(target.path)
+        except OSError as exc:
+            raise SafeError("invalid_destination", "restore destination changed") from exc
+        if (
+            stat.S_ISLNK(info.st_mode)
+            or not stat.S_ISDIR(info.st_mode)
+            or info.st_dev != target.device
+            or info.st_ino != target.inode
+            or info.st_uid != target.uid
+            or info.st_gid != target.gid
+        ):
+            raise SafeError("invalid_destination", "restore destination changed")
+        parent = os.lstat(target.path.parent)
+        if (parent.st_dev, parent.st_ino, parent.st_uid, parent.st_gid) != (target.parent_device, target.parent_inode, target.parent_uid, target.parent_gid):
+            raise SafeError("invalid_destination", "restore destination changed")
 
     def _validate_archive(self, archive: tarfile.TarFile) -> tuple[list[tarfile.TarInfo], dict[str, Any]]:
         members = archive.getmembers()
@@ -802,7 +1515,7 @@ class RestoreService:
             manifest = json.load(stream)
         except (json.JSONDecodeError, UnicodeDecodeError) as exc:
             raise SafeError("invalid_backup", "backup manifest is invalid") from exc
-        if manifest.get("schema") != 1 or manifest.get("profile_id") != str(self.profile.id):
+        if manifest.get("schema") not in (1, 2) or manifest.get("profile_id") != str(self.profile.id):
             raise SafeError("wrong_profile", "backup belongs to another profile")
         entries = manifest.get("entries")
         if not isinstance(entries, list):
@@ -810,8 +1523,6 @@ class RestoreService:
         if any(not isinstance(entry, dict) for entry in entries):
             raise SafeError("invalid_backup", "backup manifest is invalid")
         by_name = {member.name: member for member in members}
-        expected_uid = int(getattr(self.profile, "owner_uid", os.geteuid()))
-        expected_gid = int(getattr(self.profile, "owner_gid", os.getegid()))
         for entry in entries:
             archive_name = entry.get("archive_path")
             if not isinstance(archive_name, str) or archive_name not in by_name:
@@ -826,11 +1537,12 @@ class RestoreService:
             ):
                 raise SafeError("invalid_backup", "backup manifest contains an unsafe path")
             member = by_name[archive_name]
+            if manifest.get("schema") == 2 and entry.get("root_id") not in {item.get("id") for item in manifest.get("roots", ())}:
+                raise SafeError("invalid_backup", "backup root mapping is invalid")
             if member.issym() or member.islnk() or not member.isfile():
                 raise SafeError("invalid_backup", "backup contains an invalid member")
-            if archive_name == _MANIFEST or int(member.uid) != expected_uid or int(member.gid) != expected_gid:
-                raise SafeError("ownership_mismatch", "backup ownership does not match profile")
-            if int(entry.get("uid", -1)) != expected_uid or int(entry.get("gid", -1)) != expected_gid:
+            uid, gid = _entry_owner(entry, error_code="ownership_mismatch")
+            if archive_name == _MANIFEST or member.uid != uid or member.gid != gid:
                 raise SafeError("ownership_mismatch", "backup ownership does not match profile")
             if int(entry.get("size", -1)) != int(member.size):
                 raise SafeError("checksum_mismatch", "backup size verification failed")
@@ -843,27 +1555,70 @@ class RestoreService:
             or set(by_name) != {_MANIFEST} | {entry["archive_path"] for entry in entries}
         ):
             raise SafeError("invalid_backup", "backup manifest does not match archive")
+        if manifest.get("schema") == 2 and {entry.get("root_id") for entry in entries} - {item.get("id") for item in manifest.get("roots", ())}:
+            raise SafeError("invalid_backup", "backup root mapping is invalid")
         if not isinstance(manifest.get("backup_id"), str) or not manifest["backup_id"]:
             raise SafeError("invalid_backup", "backup manifest is invalid")
         return members, manifest
 
-    def _extract(self, archive: tarfile.TarFile, members: list[tarfile.TarInfo], manifest: dict[str, Any], staging: Path) -> None:
+    def _extract(
+        self,
+        archive: tarfile.TarFile,
+        members: list[tarfile.TarInfo],
+        manifest: dict[str, Any],
+        staging: Path,
+        uid: int,
+        gid: int,
+    ) -> None:
         entries = {entry["archive_path"]: entry for entry in manifest["entries"]}
         for member in members:
             if member.name == _MANIFEST:
                 continue
             entry = entries[member.name]
-            target = staging / PurePosixPath(entry["path"])
+            relative = entry["path"]
+            if manifest.get("schema") == 1 and relative.startswith("0/"):
+                relative = relative[2:]
+            target = staging / PurePosixPath(relative)
             if not _within(target, staging):
                 raise SafeError("invalid_backup", "backup path escapes destination")
             target.parent.mkdir(parents=True, exist_ok=True, mode=0o750)
+            os.chown(target.parent, uid, gid, follow_symlinks=False)
             source = archive.extractfile(member)
             if source is None:
                 raise SafeError("restore_failed", "backup member could not be read")
             with target.open("xb") as destination:
                 shutil.copyfileobj(source, destination)
             os.chmod(target, 0o640)
-            os.chown(target, int(getattr(self.profile, "owner_uid", os.geteuid())), int(getattr(self.profile, "owner_gid", os.getegid())))
+            os.chown(target, uid, gid, follow_symlinks=False)
+
+    def _extract_multi(
+        self, archive: tarfile.TarFile, members: list[tarfile.TarInfo], manifest: dict[str, Any],
+        stagings: dict[str, Path], targets: dict[str, _RestoreTarget],
+    ) -> None:
+        if manifest.get("schema") == 1:
+            return self._extract(archive, members, manifest, stagings["root-0"], targets["root-0"].uid, targets["root-0"].gid)
+        entries = {entry["archive_path"]: entry for entry in manifest["entries"]}
+        for member in members:
+            if member.name == _MANIFEST:
+                continue
+            entry = entries[member.name]
+            root_id = entry["root_id"]
+            staging = stagings[root_id]
+            relative = entry["path"]
+            if manifest.get("schema") == 1 and relative.startswith("0/"):
+                relative = relative[2:]
+            target = staging / PurePosixPath(relative)
+            if not _within(target, staging):
+                raise SafeError("invalid_backup", "backup path escapes destination")
+            target.parent.mkdir(parents=True, exist_ok=True, mode=0o750)
+            os.chown(target.parent, targets[root_id].uid, targets[root_id].gid, follow_symlinks=False)
+            source = archive.extractfile(member)
+            if source is None:
+                raise SafeError("restore_failed", "backup member could not be read")
+            with target.open("xb") as destination:
+                shutil.copyfileobj(source, destination)
+            os.chmod(target, 0o640)
+            os.chown(target, targets[root_id].uid, targets[root_id].gid, follow_symlinks=False)
 
     def _validate_external(self, archive: "_ExternalArchive") -> tuple[list["_ExternalMember"], dict[str, Any]]:
         members = archive.members
@@ -876,15 +1631,13 @@ class RestoreService:
             manifest = json.loads(archive.read(_MANIFEST))
         except (json.JSONDecodeError, UnicodeDecodeError) as exc:
             raise SafeError("invalid_backup", "backup manifest is invalid") from exc
-        if manifest.get("schema") != 1 or manifest.get("profile_id") != str(self.profile.id):
+        if manifest.get("schema") not in (1, 2) or manifest.get("profile_id") != str(self.profile.id):
             raise SafeError("wrong_profile", "backup belongs to another profile")
         entries = manifest.get("entries")
         if not isinstance(entries, list):
             raise SafeError("invalid_backup", "backup manifest is invalid")
         if any(not isinstance(entry, dict) for entry in entries):
             raise SafeError("invalid_backup", "backup manifest is invalid")
-        expected_uid = int(getattr(self.profile, "owner_uid", os.geteuid()))
-        expected_gid = int(getattr(self.profile, "owner_gid", os.getegid()))
         for entry in entries:
             archive_name = entry.get("archive_path")
             relative_path = entry.get("path")
@@ -898,11 +1651,12 @@ class RestoreService:
             ):
                 raise SafeError("invalid_backup", "backup manifest contains an unsafe path")
             member = by_name[archive_name]
+            if manifest.get("schema") == 2 and entry.get("root_id") not in {item.get("id") for item in manifest.get("roots", ())}:
+                raise SafeError("invalid_backup", "backup root mapping is invalid")
             if not member.isfile:
                 raise SafeError("invalid_backup", "backup contains an invalid member")
-            if member.uid != expected_uid or member.gid != expected_gid:
-                raise SafeError("ownership_mismatch", "backup ownership does not match profile")
-            if int(entry.get("uid", -1)) != expected_uid or int(entry.get("gid", -1)) != expected_gid:
+            uid, gid = _entry_owner(entry, error_code="ownership_mismatch")
+            if member.uid != uid or member.gid != gid:
                 raise SafeError("ownership_mismatch", "backup ownership does not match profile")
             if member.size != int(entry.get("size", -1)):
                 raise SafeError("checksum_mismatch", "backup size verification failed")
@@ -916,24 +1670,49 @@ class RestoreService:
             or set(by_name) != {_MANIFEST} | {entry.get("archive_path") for entry in entries}
         ):
             raise SafeError("invalid_backup", "backup manifest does not match archive")
+        if manifest.get("schema") == 2 and {entry.get("root_id") for entry in entries} - {item.get("id") for item in manifest.get("roots", ())}:
+            raise SafeError("invalid_backup", "backup root mapping is invalid")
         if not isinstance(manifest.get("backup_id"), str) or not manifest["backup_id"]:
             raise SafeError("invalid_backup", "backup manifest is invalid")
         return members, manifest
 
-    def _extract_external(self, archive: "_ExternalArchive", manifest: dict[str, Any], staging: Path) -> None:
+    def _extract_external(
+        self,
+        archive: "_ExternalArchive",
+        manifest: dict[str, Any],
+        staging: Path,
+        uid: int,
+        gid: int,
+    ) -> None:
         for entry in manifest["entries"]:
             target = staging / PurePosixPath(entry["path"])
             if not _within(target, staging):
                 raise SafeError("invalid_backup", "backup path escapes destination")
             target.parent.mkdir(parents=True, exist_ok=True, mode=0o750)
+            os.chown(target.parent, uid, gid, follow_symlinks=False)
             with archive.open(entry["archive_path"]) as source, target.open("wb") as destination:
                 shutil.copyfileobj(source, destination)
             os.chmod(target, 0o640)
-            os.chown(
-                target,
-                int(getattr(self.profile, "owner_uid", os.geteuid())),
-                int(getattr(self.profile, "owner_gid", os.getegid())),
-            )
+            os.chown(target, uid, gid, follow_symlinks=False)
+
+    def _extract_external_multi(
+        self, archive: "_ExternalArchive", manifest: dict[str, Any],
+        stagings: dict[str, Path], targets: dict[str, _RestoreTarget],
+    ) -> None:
+        if manifest.get("schema") == 1:
+            return self._extract_external(archive, manifest, stagings["root-0"], targets["root-0"].uid, targets["root-0"].gid)
+        for entry in manifest["entries"]:
+            root_id = entry["root_id"]
+            staging = stagings[root_id]
+            target = staging / PurePosixPath(entry["path"])
+            if not _within(target, staging):
+                raise SafeError("invalid_backup", "backup path escapes destination")
+            target.parent.mkdir(parents=True, exist_ok=True, mode=0o750)
+            os.chown(target.parent, targets[root_id].uid, targets[root_id].gid, follow_symlinks=False)
+            with archive.open(entry["archive_path"]) as source, target.open("xb") as destination:
+                shutil.copyfileobj(source, destination)
+            os.chmod(target, 0o640)
+            os.chown(target, targets[root_id].uid, targets[root_id].gid, follow_symlinks=False)
 
 
 def _walk(root: Path, *, excluded_top_level: frozenset[str] = frozenset()) -> Iterable[Path]:
@@ -944,9 +1723,9 @@ def _walk(root: Path, *, excluded_top_level: frozenset[str] = frozenset()) -> It
             with os.scandir(current) as scan:
                 children = sorted(scan, key=lambda item: item.name, reverse=True)
                 for item in children:
-                    if item.name.endswith(".partial"):
-                        continue
                     if current == root and item.name in excluded_top_level:
+                        continue
+                    if item.name.endswith(".partial"):
                         continue
                     path = Path(item.path)
                     if item.is_symlink():
@@ -961,36 +1740,52 @@ def _walk(root: Path, *, excluded_top_level: frozenset[str] = frozenset()) -> It
 
 def _stage_file(source: Path, destination: Path) -> None:
     """Snapshot a stopped source without copying multi-gigabyte worlds."""
+
+    def copy_with_owner() -> None:
+        source_info = source.stat(follow_symlinks=False)
+        shutil.copy2(source, destination, follow_symlinks=False)
+        # copy2 preserves mode and timestamps, but not numeric ownership.  A
+        # VM with separate bind mounts for mutable and backup roots takes this
+        # fallback even when both binds share one underlying filesystem.
+        os.chown(
+            destination,
+            source_info.st_uid,
+            source_info.st_gid,
+            follow_symlinks=False,
+        )
+
     try:
         os.link(source, destination, follow_symlinks=False)
     except (TypeError, NotImplementedError):
-        shutil.copy2(source, destination, follow_symlinks=False)
+        copy_with_owner()
     except OSError as exc:
         if exc.errno not in (errno.EXDEV, errno.EOPNOTSUPP, errno.ENOTSUP, errno.EPERM):
             raise
-        shutil.copy2(source, destination, follow_symlinks=False)
-
-
-def _check_deadline(deadline: float | None) -> None:
-    if deadline is not None and time.monotonic() > deadline:
-        raise SafeError("backup_quiesce_timeout", "online backup staging exceeded its bound")
+        copy_with_owner()
 
 
 def _stage_file_copy(source: Path, destination: Path, *, deadline: float | None = None) -> str:
+    """Copy an online-quiesced file; hardlinks would keep a live inode."""
+    source_info = source.stat(follow_symlinks=False)
     digest = hashlib.sha256()
-    try:
-        with source.open("rb") as input_stream, destination.open("wb") as output_stream:
-            while True:
-                _check_deadline(deadline)
-                chunk = input_stream.read(1024 * 1024)
-                if not chunk:
-                    break
-                output_stream.write(chunk)
-                digest.update(chunk)
-            output_stream.flush()
-            os.fsync(output_stream.fileno())
-    except OSError as exc:
-        raise SafeError("backup_failed", "backup source could not be read") from exc
+    with source.open("rb") as source_stream, destination.open("wb") as destination_stream:
+        while True:
+            _check_deadline(deadline)
+            chunk = source_stream.read(1024 * 1024)
+            if not chunk:
+                break
+            destination_stream.write(chunk)
+            digest.update(chunk)
+        destination_stream.flush()
+        os.fsync(destination_stream.fileno())
+    _check_deadline(deadline)
+    os.chmod(destination, stat.S_IMODE(source_info.st_mode), follow_symlinks=False)
+    os.utime(
+        destination,
+        ns=(source_info.st_atime_ns, source_info.st_mtime_ns),
+        follow_symlinks=False,
+    )
+    os.chown(destination, source_info.st_uid, source_info.st_gid, follow_symlinks=False)
     return digest.hexdigest()
 
 
@@ -1003,6 +1798,47 @@ def _validate_member(member: tarfile.TarInfo) -> None:
         raise SafeError("invalid_backup", "backup contains an unsafe member")
     if not member.isfile() and name != _MANIFEST:
         raise SafeError("invalid_backup", "backup contains an unsupported member")
+    _bounded_id(member.uid, error_code="invalid_backup")
+    _bounded_id(member.gid, error_code="invalid_backup")
+
+
+def _bounded_id(value: Any, *, error_code: str) -> int:
+    if isinstance(value, bool) or not isinstance(value, int) or not 0 <= value <= _MAX_ID:
+        raise SafeError(error_code, "ownership metadata is invalid")
+    return value
+
+
+def _entry_owner(entry: dict[str, Any], *, error_code: str) -> tuple[int, int]:
+    return (
+        _bounded_id(entry.get("uid"), error_code=error_code),
+        _bounded_id(entry.get("gid"), error_code=error_code),
+    )
+
+
+def _chown_tree(root: Path, uid: int, gid: int) -> None:
+    pending = [root]
+    paths = []
+    while pending:
+        current = pending.pop()
+        try:
+            info = os.lstat(current)
+        except OSError as exc:
+            raise SafeError("restore_failed", "staged restore is not trustworthy") from exc
+        if stat.S_ISLNK(info.st_mode) or not (stat.S_ISDIR(info.st_mode) or stat.S_ISREG(info.st_mode)):
+            raise SafeError("restore_failed", "staged restore contains an unsafe member")
+        paths.append(current)
+        if stat.S_ISDIR(info.st_mode):
+            try:
+                children = list(os.scandir(current))
+            except OSError as exc:
+                raise SafeError("restore_failed", "staged restore is not trustworthy") from exc
+            for child in children:
+                pending.append(Path(child.path))
+    for path in reversed(paths):
+        try:
+            os.chown(path, uid, gid, follow_symlinks=False)
+        except OSError as exc:
+            raise SafeError("restore_failed", "staged restore ownership could not be set") from exc
 
 
 def _within(path: Path, root: Path) -> bool:
@@ -1018,6 +1854,11 @@ def _sha256(path: Path) -> str:
         return _hash_stream(stream)
 
 
+def _check_deadline(deadline: float | None) -> None:
+    if deadline is not None and time.monotonic() >= deadline:
+        raise SafeError("backup_quiesce_timeout", "online backup staging exceeded its bound")
+
+
 def _hash_stream(stream: Any) -> str:
     digest = hashlib.sha256()
     for chunk in iter(lambda: stream.read(1024 * 1024), b""):
@@ -1026,11 +1867,16 @@ def _hash_stream(stream: Any) -> str:
 
 
 def _write_json_fsync(path: Path, value: Any) -> None:
-    with path.open("w", encoding="utf-8") as stream:
+    temp = path.with_name(f".{path.name}.{uuid.uuid4().hex}.tmp")
+    fd = os.open(temp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+    with os.fdopen(fd, "w", encoding="utf-8") as stream:
         json.dump(value, stream, sort_keys=True, separators=(",", ":"))
         stream.write("\n")
         stream.flush()
         os.fsync(stream.fileno())
+    os.replace(temp, path)
+    os.chmod(path, 0o600)
+    _fsync_dir(path.parent)
 
 
 def _write_filelist(path: Path, values: Iterable[str]) -> None:
@@ -1057,10 +1903,12 @@ def _fsync_dir(path: Path) -> None:
 def _verify_zstd_stream(archive_path: Path, manifest: dict[str, Any]) -> None:
     expected = {_MANIFEST} | {entry["archive_path"] for entry in manifest["entries"]}
     entries = {entry["archive_path"]: entry for entry in manifest["entries"]}
+    for entry in manifest["entries"]:
+        _entry_owner(entry, error_code="backup_failed")
     process: subprocess.Popen[bytes] | None = None
     seen: set[str] = set()
     try:
-        process = subprocess.Popen(
+        process = maintenance_popen(
             ["/usr/bin/zstd", "-dc", "--", str(archive_path)],
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
@@ -1084,6 +1932,9 @@ def _verify_zstd_stream(archive_path: Path, manifest: dict[str, Any]) -> None:
                 entry = entries.get(member.name)
                 if entry is None or not member.isfile() or int(member.size) != int(entry["size"]):
                     raise SafeError("backup_failed", "backup archive contents changed")
+                uid, gid = _entry_owner(entry, error_code="backup_failed")
+                if member.uid != uid or member.gid != gid:
+                    raise SafeError("backup_failed", "backup ownership metadata changed")
                 stream = archive.extractfile(member)
                 if stream is None or _hash_stream(stream) != entry["sha256"]:
                     raise SafeError("backup_failed", "backup checksum verification failed")
@@ -1124,7 +1975,7 @@ class _ExternalArchive:
         self._staging = Path(tempfile.mkdtemp(prefix=".zstd-", dir=path.parent))
         process: subprocess.Popen[bytes] | None = None
         try:
-            process = subprocess.Popen(
+            process = maintenance_popen(
                 ["/usr/bin/zstd", "-dc", "--", str(path)],
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,

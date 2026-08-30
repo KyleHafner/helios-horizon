@@ -1,0 +1,19 @@
+[Unit]
+Description=Disposable Horizon failure alert drill (%i)
+OnFailure=horizon-alert-notify@drill-%i.service
+StartLimitIntervalSec=60s
+StartLimitBurst=1
+
+[Service]
+Type=oneshot
+ExecStartPre=/usr/bin/sh -c 'case "$1" in minecraft|controller|web) exit 0;; *) exit 1;; esac' -- %i
+ExecStart=/usr/bin/false
+Restart=no
+TimeoutStartSec=5s
+User=root
+Group=root
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=yes
+UMask=0077

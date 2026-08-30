@@ -8,11 +8,15 @@ one call through the injected RPC client.
 from __future__ import annotations
 
 import inspect
+import json
+import asyncio
 from typing import Any, Callable, Mapping
 from uuid import UUID, uuid4
 
 from fastapi import APIRouter, HTTPException, Request, Response
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, Response as FastAPIResponse
+import csv
+import io
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator
 
 from .protocol import (
@@ -34,12 +38,14 @@ from .protocol import (
     GetStatsTps,
     GetProfileConfig,
     GetBenchmarks,
+    ExportBenchmarks,
     SetProfileConfig,
     GetSchedules,
     ScheduleSpec,
     SetSchedules,
     ListAudit,
     ListBackups,
+    ListAggregateBackups,
     ListEvents,
     LogOptions,
     PageOptions,
@@ -50,6 +56,7 @@ from .protocol import (
     PrepareWorldClone,
     Restart,
     RunBenchmark,
+    CancelBenchmark,
     RpcAction,
     RpcFailure,
     RpcProvenance,
@@ -64,6 +71,7 @@ from .protocol import (
     TestNotification,
 )
 from .models import BackupDestination, NotificationEvent, ProfileId
+from .introspection import signature_parameters
 
 
 class StrictBody(BaseModel):
@@ -133,17 +141,56 @@ class BenchmarkBody(StrictBody):
         return value
 
 
+# Log records are bounded by a byte budget in the controller; retain the
+# protocol's public count limit for compatibility and cursor pagination.
+MAX_LOG_PAGE_RECORDS = 5000
+MAX_MUTATION_BODY_BYTES = 64 * 1024
+BODY_READ_TIMEOUT_SECONDS = 5.0
+
+
+async def _read_mutation_body(request: Request) -> dict[str, Any]:
+    """Read a mutation body with one total deadline and hard byte bound."""
+    declared_values = request.headers.getlist("content-length")
+    if len(declared_values) > 1:
+        raise HTTPException(400, "invalid content length")
+    declared = declared_values[0] if declared_values else None
+    if declared is not None and not declared.isdigit():
+        raise HTTPException(400, "invalid content length")
+    if declared is not None and int(declared) > MAX_MUTATION_BODY_BYTES:
+        raise HTTPException(413, "request body too large")
+    raw = bytearray()
+    try:
+        async with asyncio.timeout(BODY_READ_TIMEOUT_SECONDS):
+            async for chunk in request.stream():
+                if len(raw) + len(chunk) > MAX_MUTATION_BODY_BYTES:
+                    raise HTTPException(413, "request body too large")
+                raw.extend(chunk)
+    except TimeoutError as exc:
+        raise HTTPException(408, "request body read timed out") from exc
+    if declared is not None and int(declared) != len(raw):
+        raise HTTPException(400, "content length mismatch")
+    try:
+        payload = json.loads(bytes(raw)) if raw else {}
+    except Exception as exc:
+        raise HTTPException(422, "invalid request") from exc
+    if not isinstance(payload, dict):
+        raise HTTPException(422, "invalid request")
+    return payload
+
+
 ROUTE_ACTIONS: dict[str, type] = {
     "GET /api/v1/status": GetStatus,
     "GET /api/v1/profiles": GetProfiles,
     "GET /api/v1/profiles/{profile_id}": GetProfiles,
     "GET /api/v1/profiles/{profile_id}/logs": GetLogs,
     "GET /api/v1/profiles/{profile_id}/backups": ListBackups,
+    "GET /api/v1/backups": ListAggregateBackups,
     "GET /api/v1/profiles/{profile_id}/stats/summary": GetStatsSummary,
     "GET /api/v1/profiles/{profile_id}/stats/heatmap": GetStatsHeatmap,
     "GET /api/v1/profiles/{profile_id}/stats/tps": GetStatsTps,
     "GET /api/v1/profiles/{profile_id}/config": GetProfileConfig,
     "GET /api/v1/profiles/{profile_id}/benchmarks": GetBenchmarks,
+    "GET /api/v1/benchmarks/{profile_id}/export": ExportBenchmarks,
     "GET /api/v1/schedules": GetSchedules,
     "GET /api/v1/events": ListEvents,
     "GET /api/v1/audit": ListAudit,
@@ -173,6 +220,7 @@ ROUTE_ACTIONS: dict[str, type] = {
     "POST /api/v1/profiles/{profile_id}/notifications/test": TestNotification,
     "POST /api/v1/profiles/{profile_id}/config": SetProfileConfig,
     "POST /api/v1/profiles/{profile_id}/benchmarks": RunBenchmark,
+    "POST /api/v1/benchmarks/{job_id}/cancel": CancelBenchmark,
     "POST /api/v1/schedules": SetSchedules,
     "POST /api/v1/notifications/test": TestNotification,
 }
@@ -183,7 +231,7 @@ def _page(request: Request, *, logs: bool = False):
         limit = int(request.query_params.get("limit", "100"))
     except ValueError as exc:
         raise HTTPException(422, "invalid pagination") from exc
-    if not 1 <= limit <= (5000 if logs else 500):
+    if not 1 <= limit <= (MAX_LOG_PAGE_RECORDS if logs else 500):
         raise HTTPException(422, "invalid pagination")
     cursor = request.query_params.get("cursor")
     if cursor is not None and (len(cursor) > 256 or "\x00" in cursor):
@@ -231,6 +279,8 @@ def _action(path: str, method: str, profile_id: ProfileId | None, payload: Mappi
             return GetLogs(kind="get_logs", profile_id=profile_id, page=_page(request, logs=True))
         if action_type is ListBackups:
             return ListBackups(kind="list_backups", profile_id=profile_id, page=_page(request))
+        if action_type is ListAggregateBackups:
+            return ListAggregateBackups(kind="list_aggregate_backups", page=_page(request))
         if action_type is ListEvents:
             return ListEvents(kind="list_events", page=_page(request))
         if action_type is GetStatsSummary:
@@ -238,30 +288,38 @@ def _action(path: str, method: str, profile_id: ProfileId | None, payload: Mappi
                 kind="get_stats_summary",
                 profile_id=profile_id,
                 days=request.query_params.get("days"),
+                hours=request.query_params.get("hours"),
             )
         if action_type is GetStatsHeatmap:
             return GetStatsHeatmap(
                 kind="get_stats_heatmap",
                 profile_id=profile_id,
                 days=request.query_params.get("days", 90),
+                hours=request.query_params.get("hours"),
             )
         if action_type is GetStatsTps:
             return GetStatsTps(
                 kind="get_stats_tps",
                 profile_id=profile_id,
                 window=request.query_params.get("window", "6h"),
+                resolution=request.query_params.get("resolution", "auto"),
+                limit=request.query_params.get("limit", 500),
             )
         if action_type is GetProfileConfig:
             if payload:
                 raise HTTPException(422, "invalid request")
             return GetProfileConfig(kind="get_profile_config", profile_id=profile_id)
         if action_type is GetBenchmarks:
-            if payload:
-                raise HTTPException(422, "invalid request")
-            return GetBenchmarks(kind="get_benchmarks", profile_id=profile_id)
+            return GetBenchmarks(kind="get_benchmarks", profile_id=profile_id, **{key: value for key, value in payload.items() if value is not None})
+        if action_type is ExportBenchmarks:
+            return ExportBenchmarks(kind="export_benchmarks", profile_id=profile_id, **{key: value for key, value in payload.items() if value is not None})
         if action_type is RunBenchmark:
             body = BenchmarkBody.model_validate(payload)
             return RunBenchmark(kind="run_benchmark", profile_id=profile_id, **body.model_dump())
+        if action_type is CancelBenchmark:
+            if set(payload) != {"job_id"}:
+                raise HTTPException(422, "invalid request")
+            return CancelBenchmark(kind="cancel_benchmark", job_id=str(payload["job_id"]))
         if action_type is GetSchedules:
             if payload:
                 raise HTTPException(422, "invalid request")
@@ -353,6 +411,7 @@ def _status(response: RpcResponse) -> int:
         ErrorCode.SLOT_CONFLICT: 409,
         ErrorCode.CONFIRMATION_EXPIRED: 410,
         ErrorCode.CONFIRMATION_MISMATCH: 409,
+        ErrorCode.REQUEST_ID_CONFLICT: 409,
         ErrorCode.UNAUTHORIZED_PEER: 403,
         ErrorCode.INVALID_REQUEST: 400,
     }.get(response.error.code, 503 if response.error.retryable else 400)
@@ -368,9 +427,10 @@ class ApiService:
         action: RpcAction,
         *,
         provenance: RpcProvenance = RpcProvenance.SERVICE,
+        request_id: UUID | None = None,
     ) -> RpcResponse:
         request = RpcRequest(
-            request_id=uuid4(),
+            request_id=request_id or uuid4(),
             actor=actor,
             provenance=provenance,
             action=action,
@@ -386,9 +446,29 @@ class ApiService:
 
 def _accepts_two(callback: Callable[..., Any]) -> bool:
     try:
-        return len(inspect.signature(callback).parameters) >= 2
+        return len(signature_parameters(callback)) >= 2
     except (TypeError, ValueError):
         return True
+
+
+def _idempotency_key(request: Request) -> UUID | None:
+    """Parse one caller-supplied operation key for a mutation."""
+
+    values = request.headers.getlist("idempotency-key")
+    if not values:
+        return None
+    if len(values) != 1:
+        raise HTTPException(422, "invalid idempotency key")
+    value = values[0]
+    if len(value) > 128 or not value:
+        raise HTTPException(422, "invalid idempotency key")
+    try:
+        parsed = UUID(value)
+    except (ValueError, AttributeError) as exc:
+        raise HTTPException(422, "invalid idempotency key") from exc
+    if str(parsed) != value:
+        raise HTTPException(422, "invalid idempotency key")
+    return parsed
 
 
 def add_api_routes(
@@ -402,11 +482,13 @@ def add_api_routes(
     async def invoke(request: Request, response: Response, *, profile_id: ProfileId | None, payload: Mapping[str, Any], mutation: bool = False):
         actor = await auth_dependency(request, response, mutation=mutation)
         action = _action(request.url.path, request.method, profile_id, payload, request)
+        request_id = _idempotency_key(request) if mutation else None
         try:
             rpc_response = await service.call(
                 actor,
                 action,
                 provenance=RpcProvenance.WEB_HUMAN,
+                request_id=request_id,
             )
         except Exception:
             return JSONResponse(
@@ -455,6 +537,10 @@ def add_api_routes(
     async def backups(profile_id: ProfileId, request: Request, response: Response):
         return await invoke(request, response, profile_id=profile_id, payload={})
 
+    @router.get("/backups")
+    async def aggregate_backups(request: Request, response: Response):
+        return await invoke(request, response, profile_id=None, payload={})
+
     @router.get("/profiles/{profile_id}/stats/summary")
     async def stats_summary(profile_id: ProfileId, request: Request, response: Response):
         return await invoke(request, response, profile_id=profile_id, payload={})
@@ -487,21 +573,44 @@ def add_api_routes(
     async def profile_config(profile_id: ProfileId, request: Request, response: Response):
         return await invoke(request, response, profile_id=profile_id, payload={})
 
+    @router.get("/benchmarks/{profile_id}/export")
+    async def benchmark_export_first(profile_id: ProfileId, request: Request, response: Response):
+        fmt = request.query_params.get("format", "json")
+        if fmt not in {"json", "csv"}:
+            raise HTTPException(422, "format must be json or csv")
+        try:
+            limit = int(request.query_params.get("limit", "100"))
+        except ValueError as exc:
+            raise HTTPException(422, "invalid pagination") from exc
+        if not 1 <= limit <= 100:
+            raise HTTPException(422, "invalid pagination")
+        result = await invoke(request, response, profile_id=profile_id, payload={"limit": limit, "format": fmt})
+        if isinstance(result, FastAPIResponse):
+            return result
+        model = result.model_dump(mode="json") if hasattr(result, "model_dump") else result
+        if fmt == "json":
+            return FastAPIResponse(content=model.get("content", "{}"), media_type="application/json")
+        output = io.StringIO(); writer = csv.writer(output, lineterminator="\n")
+        return FastAPIResponse(content=model.get("content", ""), media_type="text/csv", headers={"Content-Disposition": 'attachment; filename="horizon-benchmarks.csv"', "X-Content-Type-Options": "nosniff"})
+
     @router.get("/profiles/{profile_id}/benchmarks")
     async def benchmarks(profile_id: ProfileId, request: Request, response: Response):
-        return await invoke(request, response, profile_id=profile_id, payload={})
+        query = request.query_params
+        payload = {
+            "cursor": query.get("cursor"),
+            "limit": query.get("limit", "20"),
+            "format": query.get("format", "json"),
+        }
+        return await invoke(request, response, profile_id=profile_id, payload=payload)
 
     @router.get("/schedules")
     async def schedules(request: Request, response: Response):
         return await invoke(request, response, profile_id=None, payload={})
 
-    async def mutation(request: Request, response: Response, profile_id: ProfileId | None = None):
-        try:
-            payload = await request.json() if request.headers.get("content-length", "0") not in {"", "0"} else {}
-        except Exception as exc:
-            raise HTTPException(422, "invalid request") from exc
-        if not isinstance(payload, dict):
-            raise HTTPException(422, "invalid request")
+    async def mutation(request: Request, response: Response, profile_id: ProfileId | None = None, job_id: str | None = None):
+        payload = await _read_mutation_body(request)
+        if job_id is not None:
+            payload = {**payload, "job_id": job_id}
         return await invoke(request, response, profile_id=profile_id, payload=payload, mutation=True)
 
     for route, action_type in ROUTE_ACTIONS.items():

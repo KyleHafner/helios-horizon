@@ -342,6 +342,24 @@ class ReservationStore:
             self.reservation_path.unlink(missing_ok=True)
             return True
 
+    def owns_live(
+        self,
+        profile: str | ProfileId,
+        operation_id: str,
+        state_generation: int = 0,
+    ) -> bool:
+        """Atomically verify exact ownership, expiry, and controller liveness."""
+        profile_id = _profile(profile)
+        with operation_transaction(self.operation_path):
+            current = _reservation_from_json(_read_json(self.reservation_path))
+            return bool(
+                current is not None
+                and current.profile_id == profile_id
+                and current.operation_id == operation_id
+                and current.state_generation == state_generation
+                and self._live(current)
+            )
+
     def transfer_if_owned(
         self,
         profile: str | ProfileId,

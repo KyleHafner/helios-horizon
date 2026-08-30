@@ -1,0 +1,12 @@
+[Unit]
+Description=Check the Horizon Minecraft Bore relay every 30 seconds
+
+[Timer]
+OnBootSec=2min
+OnUnitActiveSec=30s
+AccuracySec=5s
+RandomizedDelaySec=5s
+Unit=horizon-bore-liveness.service
+
+[Install]
+WantedBy=timers.target

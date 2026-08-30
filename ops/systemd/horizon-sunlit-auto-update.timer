@@ -1,0 +1,11 @@
+[Unit]
+Description=Daily official Sunlit Cobblemon update check
+
+[Timer]
+OnCalendar=*-*-* 05:00:00 America/New_York
+RandomizedDelaySec=20m
+Persistent=true
+Unit=horizon-sunlit-auto-update.service
+
+[Install]
+WantedBy=timers.target

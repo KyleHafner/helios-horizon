@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 import shutil
 import threading
-from datetime import datetime, timedelta, timezone
+from datetime import datetime
 from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import urlparse
@@ -111,33 +111,17 @@ def page(web_server):
             ],
         }
         names = [
-            {"id": "minecraft", "display_name": "Minecraft", "adapter": "crafty", "operations": ["start", "stop", "restart"]},
+            {"id": "minecraft", "display_name": "Minecraft", "adapter": "crafty", "operations": ["start", "stop", "restart"], "public_endpoint": {"host": "mc.example.test", "port": 25565}},
             {"id": "pz-rising", "display_name": "Project Zomboid", "adapter": "systemd", "operations": ["start", "stop", "restart"]},
             {"id": "terraria-tmod", "display_name": "Terraria tModLoader", "adapter": "systemd", "operations": ["start", "stop", "restart", "command"]},
             {"id": "terraria-vanilla", "display_name": "Terraria Vanilla", "adapter": "systemd", "operations": ["start", "stop", "restart", "command"]},
             {"id": "future-game", "display_name": "Future Game", "adapter": "systemd", "operations": ["start", "stop", "restart"]},
         ]
-        tps_now = datetime.now(timezone.utc)
-        tps_samples = [
-            {"timestamp": (tps_now - timedelta(seconds=90)).isoformat(), "tps": 19.91, "mspt": 15.2},
-            {"timestamp": (tps_now - timedelta(seconds=45)).isoformat(), "tps": 20.0, "mspt": 12.8},
-            {"timestamp": tps_now.isoformat(), "tps": 20.0, "mspt": 13.1},
+        latest = {"status": status}
+        schedules = [
+            {"cron": "0 8 * * 4", "profile": "pz-rising", "next_fire": "2026-07-16T08:00:00Z", "enabled": False},
+            {"cron": "0 20 * * 5", "profile": "minecraft", "next_fire": "2026-07-17T20:00:00Z", "enabled": True},
         ]
-        latest = {
-            "status": status,
-            "stats": {
-                "failures": set(),
-                "summary": {
-                    "total_hours": 1,
-                    "unique_players": 1,
-                    "leaderboard": [{"player": "Guest", "hours": 1, "sessions": 1, "last_seen": "2026-07-11T12:00:00Z"}],
-                    "player_tracking": "names",
-                    "occupancy": {"latest": 1, "samples": []},
-                },
-                "heatmap": {"buckets": [[(day + hour) % 4 for hour in range(24)] for day in range(7)]},
-                "tps": {"window": "24h", "samples": tps_samples},
-            },
-        }
 
         def fulfill(route):
             request = route.request
@@ -146,6 +130,13 @@ def page(web_server):
                 return route.fulfill(json={"actor": "operator@example.test", "csrf_token": "test-token", "expires_at": None})
             if path == "/api/v1/status":
                 return route.fulfill(json=latest["status"])
+            if path == "/api/v1/schedules":
+                if request.method == "POST":
+                    schedules[:] = [{
+                        **item,
+                        "next_fire": "2026-07-17T20:00:00Z" if item.get("enabled", True) else None,
+                    } for item in request.post_data_json["entries"]]
+                return route.fulfill(json={"schedules": schedules})
             if path == "/api/v1/perf":
                 return route.fulfill(json={
                     "GET /api/v1/status": {"count": 50, "p50_ms": 12.0, "p95_ms": 24.0, "max_ms": 31.0},
@@ -155,14 +146,20 @@ def page(web_server):
                 })
             if path == "/api/v1/profiles":
                 return route.fulfill(json=names)
+            if path == "/api/v1/audit":
+                return route.fulfill(json={"items": [
+                    {"id": "a5", "timestamp": "2026-07-11T12:05:00Z", "actor": "operator", "action": "backup", "profile_id": "minecraft", "result": "succeeded", "error_code": None, "detail": "completed"},
+                    {"id": "a4", "timestamp": "2026-07-11T12:04:00Z", "actor": "operator", "action": "start", "profile_id": "minecraft", "result": "failed", "error_code": "start_timeout", "detail": "start timed out"},
+                    {"id": "a3", "timestamp": "2026-07-11T12:03:00Z", "actor": "operator", "action": "stop", "profile_id": "minecraft", "result": "rejected", "error_code": "slot_conflict", "detail": "player fence"},
+                    {"id": "a2", "timestamp": "2026-07-11T12:02:00Z", "actor": "operator", "action": "backup", "profile_id": "minecraft", "result": "failed", "error_code": "backup_failed", "detail": "backup failed"},
+                    {"id": "a1", "timestamp": "2026-07-11T12:01:00Z", "actor": "operator", "action": "backup", "profile_id": "minecraft", "result": "failed", "error_code": "backup_failed", "detail": "backup failed"},
+                ], "next_cursor": None})
+            if path == "/api/v1/events":
+                return route.fulfill(json={"items": [{"id": "e1", "timestamp": "2026-07-11T12:04:30Z", "profile_id": "minecraft", "code": "start_cleanup_succeeded", "message": "Horizon stopped the process left by a failed start."}], "next_cursor": None})
             if path.endswith("/stats/heatmap"):
-                if "heatmap" in latest["stats"]["failures"]:
-                    return route.fulfill(status=503, json={"detail": "simulated heatmap failure"})
-                return route.fulfill(json=latest["stats"]["heatmap"])
+                return route.fulfill(json={"buckets": [[(day + hour) % 4 for hour in range(24)] for day in range(7)]})
             if path.endswith("/stats/tps"):
-                if "tps" in latest["stats"]["failures"]:
-                    return route.fulfill(status=503, json={"detail": "simulated TPS failure"})
-                return route.fulfill(json=latest["stats"]["tps"])
+                return route.fulfill(json={"samples": [{"timestamp": "2026-07-11T12:00:00Z", "tps": 20, "mspt": 12}]})
             if path == "/api/v1/stream":
                 payload = json.dumps(latest["status"], separators=(",", ":"))
                 return route.fulfill(
@@ -189,11 +186,15 @@ def page(web_server):
                         "unique_players": 0,
                         "leaderboard": [],
                         "player_tracking": "count",
-                        "occupancy": {"latest": 3, "samples": [{"timestamp": tps_now.isoformat(), "count": 3}]},
+                        "occupancy": {"latest": 3, "samples": []},
                     })
-                if "summary" in latest["stats"]["failures"]:
-                    return route.fulfill(status=503, json={"detail": "simulated summary failure"})
-                return route.fulfill(json=latest["stats"]["summary"])
+                return route.fulfill(json={
+                    "total_hours": 1,
+                    "unique_players": 1,
+                    "leaderboard": [{"player": "Guest", "hours": 1, "sessions": 1, "last_seen": "2026-07-11T12:00:00Z"}],
+                    "player_tracking": "names",
+                    "occupancy": {"latest": 1, "samples": []},
+                })
             if path.endswith("/config"):
                 profile_id = path.split("/")[4]
                 if request.method == "POST":
@@ -205,6 +206,11 @@ def page(web_server):
                 ]})
             if "/stats/" in path:
                 return route.fulfill(json={"window": "24h", "samples": [], "buckets": []})
+            if path == "/api/v1/backups":
+                return route.fulfill(json={"items": [
+                    {"id": f"{profile['id']}-backup", "profile_id": profile["id"], "created_at": "2026-07-10T12:00:00Z", "size_bytes": 1073741824, "verified": True, "protected": False}
+                    for profile in names
+                ], "next_cursor": None})
             if path.endswith("/backups"):
                 profile_id = path.split("/")[4]
                 return route.fulfill(json={"items": [
@@ -221,7 +227,7 @@ def page(web_server):
         page.wait_for_selector('[data-profile-id="minecraft"]', timeout=5000)
         page._dashboard_fixture = latest  # type: ignore[attr-defined]
         yield page
-        assert [error for error in console_errors if "503 (Service Unavailable)" not in error] == []
+        assert console_errors == []
         assert page_errors == []
         context.close()
         browser.close()
@@ -229,13 +235,15 @@ def page(web_server):
 
 def test_dashboard_contract_and_stable_card_updates(page: Page):
     assert page.locator("main").get_by_role("heading", name="Dashboard").is_visible()
-    assert page.get_by_text("active slot", exact=True).is_visible()
+    assert page.get_by_text("current session", exact=True).is_visible()
     assert page.get_by_role("button", name="Switch server…", exact=True).is_visible()
     assert page.locator('[data-profile-id]').count() == 5
     assert page.locator("#active-slot-title").is_visible()
     assert page.locator("#active-slot-title").inner_text() == "Minecraft"
-    assert page.locator("#active-slot-summary").inner_text() == ""
+    assert page.locator("#active-slot-summary").inner_text() == "The server is healthy and its game port is ready."
+    page.wait_for_function("document.querySelector('#session-automation').textContent.includes('Minecraft')")
     assert page.locator("#active-manage").get_attribute("href") == "#/servers/minecraft/console"
+    assert page.locator("#active-manage").is_visible()
     assert page.get_by_text("Minecraft", exact=True).count() >= 1
     assert page.get_by_text("Project Zomboid", exact=True).count() >= 1
     assert page.get_by_text("Terraria Vanilla", exact=True).count() >= 1
@@ -281,10 +289,79 @@ def test_dashboard_contract_and_stable_card_updates(page: Page):
     assert page.locator('[data-profile-id="minecraft"] .cpu-sparkline').get_attribute("aria-label") == "CPU usage 12.5 percent"
 
 
+def test_incident_fault_rail_groups_failures_and_marks_later_success(page: Page):
+    page.wait_for_selector("#incident-list-compact .incident-item")
+    assert page.locator("#incident-list-compact .incident-item").count() == 3
+    assert page.locator("#incident-summary").inner_text() == "2 needing review · 1 resolved in the recent record"
+    assert page.locator("#incident-list-compact").get_by_text("Start timed out", exact=True).is_visible()
+    assert page.locator("#incident-list-compact").get_by_text("Backup failed", exact=True).is_visible()
+    assert page.locator("#incident-list-compact").get_by_text("2 occurrences", exact=False).is_visible()
+    assert page.locator('#incident-list-compact .incident-item[data-state="resolved"]').count() == 1
+
+    page.get_by_role("navigation").get_by_text("Incidents", exact=True).click()
+    page.wait_for_selector("#events-view:not([hidden])")
+    assert page.get_by_role("heading", name="Controller failures", exact=True).is_visible()
+    assert page.locator("#incident-list .incident-item").count() == 3
+    assert page.locator("#events-list").get_by_text("start_cleanup_succeeded", exact=False).is_visible()
+    assert page.locator("#incident-history-summary").is_visible()
+    assert page.get_by_text("latest 200 audit records", exact=True).is_visible()
+
+
+def test_session_deck_desktop_layout_stays_compact(page: Page, tmp_path: Path):
+    page.set_viewport_size({"width": 1368, "height": 826})
+    page.reload()
+    page.wait_for_selector('[data-profile-id="minecraft"]', timeout=5000)
+    hero = page.locator("#active-slot")
+    shortcuts = page.locator(".session-shortcuts")
+    assert hero.evaluate("(node) => node.getBoundingClientRect().height < 420")
+    assert shortcuts.evaluate("(node) => node.getBoundingClientRect().height <= 44")
+    assert shortcuts.locator("a").evaluate_all(
+        "(links) => links.every((link) => link.getBoundingClientRect().width >= 60 && link.getBoundingClientRect().height <= 44)"
+    )
+    assert page.evaluate("document.documentElement.scrollWidth <= window.innerWidth")
+    page.screenshot(path=str(tmp_path / "horizon-session-desktop-1368x826.png"))
+
+    connection_state = page.locator("#conn-state")
+    connection_state.evaluate("(node) => { node.dataset.state = 'live'; node.textContent = 'Live'; }")
+    assert connection_state.evaluate("(node) => node.getBoundingClientRect().width <= 1")
+    connection_state.evaluate("(node) => { node.dataset.state = 'offline'; node.textContent = 'Offline'; }")
+    assert connection_state.evaluate("(node) => node.getBoundingClientRect().width > 1")
+
+
 def test_profile_cards_follow_fallback_order_when_api_reversed(page: Page):
     assert page.locator("#profile-cards").locator("[data-profile-id]").evaluate_all(
         "(cards) => cards.map((card) => card.dataset.profileId)"
     ) == ["minecraft", "terraria-vanilla", "terraria-tmod", "pz-rising", "future-game"]
+
+
+def test_dashboard_automation_uses_soonest_enabled_schedule(page: Page):
+    summary = page.locator("#session-automation")
+    assert summary.inner_text().startswith("Minecraft · ")
+    assert "Project Zomboid" not in summary.inner_text()
+
+
+def test_dashboard_automation_empty_state(page: Page):
+    base = page.url.split("#", 1)[0]
+    page.goto(f"{base}#/servers/minecraft/config")
+    page.wait_for_selector("#schedule-list [data-schedule-row]")
+    for _ in range(2):
+        page.once("dialog", lambda dialog: dialog.accept())
+        with page.expect_response(lambda response: response.request.method == "POST" and response.url.endswith("/api/v1/schedules")):
+            page.locator("#schedule-list [data-schedule-remove]").first.click()
+    page.goto(f"{base}#/")
+    expect(page.locator("#session-automation")).to_have_text("None scheduled")
+
+
+def test_dashboard_automation_rerenders_after_schedule_mutation(page: Page):
+    base = page.url.split("#", 1)[0]
+    page.goto(f"{base}#/servers/minecraft/config")
+    toggle = page.get_by_role("switch", name="Disable schedule for Minecraft at 0 20 * * 5")
+    page.once("dialog", lambda dialog: dialog.accept())
+    with page.expect_response(lambda response: response.request.method == "POST" and response.url.endswith("/api/v1/schedules")):
+        toggle.click()
+    expect(page.locator("#session-automation")).to_have_text("None scheduled")
+    page.goto(f"{base}#/")
+    assert page.locator("#session-automation").inner_text() == "None scheduled"
 
 
 def test_future_profile_is_appended_after_known_cards(page: Page):
@@ -358,9 +435,225 @@ def test_empty_slot_copy_and_owner_dot(page: Page):
             ]}
         }))"""
     )
-    assert page.get_by_role("heading", name="Nothing is running", exact=True).is_visible()
-    assert page.get_by_text("No server currently owns the active slot.", exact=True).count() >= 1
+    assert page.locator("#active-slot-title").inner_text() == "Minecraft"
+    assert page.get_by_text("Offline. Horizon can start it now.", exact=True).is_visible()
+    assert page.locator("#session-primary").inner_text() == "Start Minecraft"
     assert page.locator(".server-dot.is-owner").count() == 0
+
+
+def test_session_deck_explains_readiness_and_recovery_states(page: Page):
+    assert page.locator("#session-endpoint").inner_text() == "mc.example.test"
+    assert page.get_by_role("button", name="Copy Minecraft join address", exact=True).is_visible()
+    assert page.locator('#session-runway [data-state="complete"]').count() == 4
+    page.wait_for_function("document.querySelector('#session-backup').textContent.includes('Verified')")
+    assert page.locator("#session-backup").inner_text().startswith("Verified ")
+
+    page.evaluate(
+        """() => window.dispatchEvent(new MessageEvent('game-control-status', {data: {
+          generation: 5, profiles: [{profile_id: 'minecraft', state: 'starting',
+            health: 'unknown', slot_owner: 'minecraft', active_job_id: 'start', pid: null,
+            players_online: null, required_ports_ready: false}]
+        }}))"""
+    )
+    assert page.locator("#active-slot-summary").inner_text() == "Start accepted. Waiting for the server process."
+    assert page.locator('[data-session-phase="process"]').get_attribute("data-state") == "active"
+    assert page.locator('[data-session-phase="process"]').get_attribute("aria-current") == "step"
+    assert page.locator("#session-readiness-summary").text_content() == "Readiness: 1 of 4 checks complete · process in progress"
+    assert page.locator("#active-players").inner_text() == "Not observed"
+
+    page.evaluate(
+        """() => window.dispatchEvent(new MessageEvent('game-control-status', {data: {
+          generation: 6, profiles: [{profile_id: 'minecraft', state: 'starting',
+            health: 'unknown', slot_owner: 'minecraft', active_job_id: 'start', pid: 202,
+            players_online: null, required_ports_ready: false}]
+        }}))"""
+    )
+    assert page.locator("#active-slot-summary").inner_text() == "The server process is loading. Waiting for the game port."
+    assert page.locator('[data-session-phase="process"]').get_attribute("data-state") == "complete"
+    assert page.locator('[data-session-phase="port"]').get_attribute("data-state") == "active"
+
+    page.evaluate(
+        """() => window.dispatchEvent(new MessageEvent('game-control-status', {data: {
+          generation: 7, profiles: [
+            {profile_id: 'minecraft', state: 'blocked', health: 'unknown', slot_owner: 'pz-rising', pid: null, required_ports_ready: false},
+            {profile_id: 'pz-rising', state: 'running', health: 'healthy', slot_owner: 'pz-rising', pid: 303, players_online: 2, required_ports_ready: true}
+          ]
+        }}))"""
+    )
+    assert page.locator("#active-slot-title").inner_text() == "Project Zomboid"
+    assert page.locator("#active-slot-summary").inner_text() == "The server is healthy and its game port is ready."
+    assert page.locator("#active-manage").get_attribute("href") == "#/servers/pz-rising/console"
+    assert page.locator("#session-primary").inner_text() == "Open console"
+    assert page.locator("#active-manage").is_hidden()
+    page.wait_for_function("document.querySelector('#session-backup').textContent.includes('Verified')")
+    assert page.locator("#session-backup").inner_text().startswith("Verified ")
+
+
+def test_session_deck_failed_state_has_explicit_safe_retry(page: Page):
+    page.evaluate(
+        """() => window.dispatchEvent(new MessageEvent('game-control-status', {data: {
+          generation: 71, profiles: [{profile_id: 'minecraft', state: 'failed', health: 'unhealthy',
+            slot_owner: null, pid: null, players_online: null, required_ports_ready: false}]
+        }}))"""
+    )
+    assert page.locator("#active-slot-summary").inner_text() == "The last operation failed. Horizon will preserve the evidence if you retry."
+    assert page.locator("#session-primary").inner_text() == "Retry start"
+
+
+def test_session_deck_refuses_join_copy_without_health_and_ownership(page: Page):
+    page.evaluate(
+        """() => window.dispatchEvent(new MessageEvent('game-control-status', {data: {
+          generation: 10, profiles: [{profile_id: 'minecraft', state: 'running', health: 'unhealthy',
+            slot_owner: 'minecraft', pid: 202, players_online: null, required_ports_ready: true}]
+        }}))"""
+    )
+    assert page.locator("#active-slot-summary").inner_text() == "The game port is open, but health is unhealthy."
+    assert page.locator("#session-primary").inner_text() == "Diagnose health"
+    assert page.locator("#session-copy-endpoint").is_disabled()
+    assert page.locator('[data-session-phase="ready"]').get_attribute("data-state") == "waiting"
+
+    page.evaluate(
+        """() => window.dispatchEvent(new MessageEvent('game-control-status', {data: {
+          generation: 11, profiles: [{profile_id: 'minecraft', state: 'running', health: 'healthy',
+            slot_owner: null, pid: 202, players_online: null, required_ports_ready: true}]
+        }}))"""
+    )
+    assert page.locator("#active-slot-summary").inner_text() == "The process is running without active-slot ownership. Review events before joining."
+    assert page.locator("#session-primary").inner_text() == "Review ownership"
+    assert page.locator("#session-copy-endpoint").is_disabled()
+
+
+def test_session_deck_primary_start_uses_existing_typed_mutation(page: Page):
+    page.route(
+        "**/api/v1/profiles/minecraft/start",
+        lambda route: route.fulfill(json={"job_id": "job-42", "state": "running"}),
+    )
+    page.evaluate(
+        """() => window.dispatchEvent(new MessageEvent('game-control-status', {data: {
+          generation: 8, profiles: [{profile_id: 'minecraft', state: 'stopped', health: 'unknown', slot_owner: null,
+            pid: null, players_online: null, required_ports_ready: false}]
+        }}))"""
+    )
+    requests = []
+    page.on("request", lambda request: requests.append(request) if request.method == "POST" else None)
+    page.locator("#session-primary").click()
+    assert any("/profiles/minecraft/start" in request.url for request in requests)
+    page.wait_for_function("document.querySelector('#session-operation').dataset.result === 'accepted'")
+    operation = page.locator("#session-operation").inner_text()
+    assert "Start accepted by Horizon. Job job-42." in operation
+    assert "This tab notice is transient; the Audit trail is durable." in operation
+
+
+def test_session_deck_keeps_mutation_failure_visible(page: Page):
+    page.evaluate(
+        """() => {
+          const realFetch = window.fetch.bind(window);
+          window.fetch = (input, options = {}) => String(input).includes('/api/v1/profiles/minecraft/start')
+            ? Promise.reject(new Error('simulated connection loss'))
+            : realFetch(input, options);
+        }"""
+    )
+    page.evaluate(
+        """() => window.dispatchEvent(new MessageEvent('game-control-status', {data: {
+          generation: 9, profiles: [{profile_id: 'minecraft', state: 'stopped', health: 'unknown', slot_owner: null,
+            pid: null, players_online: null, required_ports_ready: false}]
+        }}))"""
+    )
+    page.locator("#session-primary").click()
+    operation = page.locator("#session-operation")
+    page.wait_for_function("document.querySelector('#session-operation').dataset.result === 'unknown'")
+    assert operation.get_attribute("data-result") == "unknown"
+    assert operation.inner_text() == "Start outcome is unknown. Horizon is reconciling the original operation; observed status will settle this notice."
+    assert page.locator("#active-slot-summary").inner_text() == "Offline. Horizon can start it now."
+
+
+def test_observed_completion_is_not_overwritten_by_late_post_ack(page: Page):
+    page.evaluate(
+        """() => {
+          const realFetch = window.fetch.bind(window);
+          window.__resolveStart = null;
+          window.fetch = (input, options = {}) => {
+            if (!String(input).includes('/api/v1/profiles/minecraft/start')) return realFetch(input, options);
+            return new Promise((resolve) => {
+              window.__resolveStart = () => resolve(new Response(JSON.stringify({ok: true}), {
+                status: 200, headers: {'Content-Type': 'application/json'}
+              }));
+            });
+          };
+        }"""
+    )
+    page.evaluate(
+        """() => window.dispatchEvent(new MessageEvent('game-control-status', {data: {
+          generation: 12, profiles: [{profile_id: 'minecraft', state: 'stopped', health: 'unknown', slot_owner: null,
+            pid: null, players_online: null, required_ports_ready: false}]
+        }}))"""
+    )
+    page.locator("#session-primary").click()
+    page.wait_for_function("typeof window.__resolveStart === 'function'")
+    page.evaluate(
+        """() => window.dispatchEvent(new MessageEvent('game-control-status', {data: {
+          generation: 13, profiles: [{profile_id: 'minecraft', state: 'running', health: 'healthy', slot_owner: 'minecraft',
+            pid: 202, players_online: 0, required_ports_ready: true}]
+        }}))"""
+    )
+    assert page.locator("#session-operation").get_attribute("data-result") == "complete"
+    assert page.locator("#session-operation").inner_text() == "Minecraft reached healthy game readiness. This tab notice is transient; the Audit trail is durable."
+    page.evaluate("window.__resolveStart()")
+    page.wait_for_timeout(50)
+    assert page.locator("#session-operation").get_attribute("data-result") == "complete"
+    assert page.locator("#session-operation").inner_text() == "Minecraft reached healthy game readiness. This tab notice is transient; the Audit trail is durable."
+
+
+def test_update_check_requires_explicit_review_before_mutation(page: Page):
+    posts = []
+
+    def update_route(route):
+        request = route.request
+        path = urlparse(request.url).path
+        if request.method == "GET":
+            return route.fulfill(json={"apply_supported": True, "installed_version": "1.21.8", "available_version": "1.21.9"})
+        posts.append(path)
+        if path.endswith("/prepare"):
+            return route.fulfill(json={"confirmation_id": "update-confirmation"})
+        return route.fulfill(json={"ok": True})
+
+    page.route("**/api/v1/profiles/minecraft/update**", update_route)
+    page.route("**/api/v1/update/confirm", update_route)
+    page.goto(f"{page.url.split('#', 1)[0]}#/servers/minecraft/console")
+    page.wait_for_selector("#detail-view:not([hidden])")
+    page.get_by_role("button", name="Check for updates", exact=True).click()
+    page.wait_for_selector("#update-dialog[open]")
+    dialog = page.get_by_role("dialog", name="Apply server update")
+    assert dialog.is_visible()
+    assert dialog.get_by_text("1.21.8", exact=True).is_visible()
+    assert dialog.get_by_text("1.21.9", exact=True).is_visible()
+    assert posts == []
+    dialog.get_by_role("button", name="Apply update", exact=True).click()
+    page.wait_for_function("document.querySelector('#update-dialog').open === false")
+    assert posts == ["/api/v1/profiles/minecraft/update/prepare", "/api/v1/update/confirm"]
+
+
+def test_schedule_management_updates_live_automation_summary(page: Page):
+    page.on("dialog", lambda dialog: dialog.accept())
+    page.goto(f"{page.url.split('#', 1)[0]}#/servers/minecraft/config")
+    page.wait_for_selector("#schedule-list [data-schedule-row]")
+    assert page.locator("#schedule-list [data-schedule-row]").count() == 2
+    assert page.locator("#schedule-list").get_by_text("Minecraft", exact=True).is_visible()
+
+    page.locator("#schedule-cron").fill("30 21 * * 6")
+    page.locator("#schedule-profile").select_option("terraria-vanilla")
+    with page.expect_response(lambda response: response.request.method == "POST" and urlparse(response.url).path == "/api/v1/schedules"):
+        page.locator("#schedule-form").get_by_role("button", name="Add schedule", exact=True).click()
+    assert page.locator("#schedule-list [data-schedule-row]").count() == 3
+    assert page.locator("#schedule-cron").input_value() == ""
+    assert page.evaluate("document.activeElement === document.querySelector('#schedule-cron')")
+
+    second = page.locator('#schedule-list [data-schedule-row="2"]')
+    with page.expect_response(lambda response: response.request.method == "POST" and urlparse(response.url).path == "/api/v1/schedules"):
+        second.get_by_role("switch").click()
+    assert second.get_attribute("data-enabled") == "false"
+    assert second.get_by_text("Disabled · no next fire", exact=True).is_visible()
+    assert "Minecraft" in page.locator("#session-automation").inner_text()
 
 
 def test_sse_patches_dashboard_nodes_and_bounds_cpu_samples(page: Page):
@@ -600,7 +893,7 @@ def test_mobile_drawer_and_server_group_are_keyboard_accessible(page: Page):
     burger.click()
     drawer = page.locator("#sidebar")
     assert drawer.get_attribute("aria-hidden") == "false"
-    page.wait_for_function("document.activeElement === document.querySelector('#drawer-close')")
+    expect(page.locator("#drawer-close")).to_be_focused()
     assert page.locator("#drawer-overlay").get_attribute("hidden") is None
     assert page.get_by_role("button", name="Close navigation").is_visible()
     assert page.get_by_role("button", name="Servers").get_attribute("aria-expanded") == "true"
@@ -609,7 +902,7 @@ def test_mobile_drawer_and_server_group_are_keyboard_accessible(page: Page):
     assert page.locator("#server-nav").get_attribute("hidden") is not None
     page.get_by_role("button", name="Close navigation").click()
     assert drawer.get_attribute("aria-hidden") == "true"
-    expect(page.locator("#drawer-overlay")).to_be_hidden()
+    assert page.locator("#drawer-overlay").get_attribute("hidden") is not None
     assert page.evaluate("document.activeElement === document.querySelector('#menu-toggle')")
     burger.click()
     page.locator("#drawer-overlay").click(position={"x": 350, "y": 12})
@@ -635,10 +928,7 @@ def test_server_detail_route_has_tabs_and_constant_dark_console(page: Page):
     assert page.evaluate("getComputedStyle(document.querySelector('#console-output')).backgroundColor") in {"rgb(8, 10, 11)", "#080a0b"}
     page.get_by_role("tab", name="Console").focus()
     page.keyboard.press("ArrowRight")
-    page.wait_for_function(
-        "document.querySelector('[role=tab][data-detail-tab=metrics]')?.getAttribute('aria-selected') === 'true'"
-    )
-    assert page.get_by_role("tab", name="Metrics").get_attribute("aria-selected") == "true"
+    expect(page.get_by_role("tab", name="Metrics")).to_have_attribute("aria-selected", "true")
     assert page.url.endswith("#/servers/minecraft/metrics")
 
 
@@ -656,15 +946,27 @@ def test_detail_logs_pause_filter_and_backup_restore_prefill(page: Page):
     assert page.get_by_label("Backup ID").input_value() == "backup-1"
 
 
+def test_restore_cancel_never_posts_or_requires_confirmation(page: Page):
+    posts = []
+    page.on("request", lambda request: posts.append(request.url) if request.method == "POST" else None)
+    page.goto(f"{page.url}#/servers/minecraft/backups")
+    page.wait_for_selector("#backup-list")
+    page.get_by_role("button", name="Restore backup-1").click()
+    dialog = page.get_by_role("dialog", name="Restore backup")
+    dialog.get_by_role("button", name="Cancel", exact=True).click()
+    page.wait_for_function("document.querySelector('#restore-dialog').open === false")
+    assert posts == []
+
+
 def test_detail_command_unsupported_is_honest_and_config_sanitized(page: Page):
     page.goto(f"{page.url}#/servers/minecraft/console")
     page.wait_for_selector("#detail-view:not([hidden])")
     assert "not available" in page.locator("#command-note").inner_text().lower()
     assert page.locator("#command-input").is_disabled()
     page.get_by_role("tab", name="Config").click()
-    page.get_by_role("heading", name="Auto-stop").wait_for(state="visible")
-    assert page.locator("#idle-stop-enabled").is_visible()
-    assert page.locator("#idle-stop-minutes").is_visible()
+    expect(page.get_by_role("heading", name="Auto-stop")).to_be_visible()
+    expect(page.locator("#idle-stop-enabled")).to_be_visible()
+    expect(page.locator("#idle-stop-minutes")).to_be_visible()
     page.wait_for_selector("#config-panel [data-config-key]")
     assert page.get_by_role("button", name="Apply changes", exact=True).is_disabled()
     assert not page.locator("#config-panel").inner_text().lower().find("password") >= 0
@@ -677,80 +979,45 @@ def test_config_tab_is_typed_diff_apply_and_restart_aware(page: Page):
     motd.fill("New MOTD")
     assert "1 change" in page.locator("#config-diff").inner_text()
     page.once("dialog", lambda dialog: dialog.accept())
-    page.get_by_role("button", name="Apply changes", exact=True).click()
-    page.get_by_text("Restart required to take effect", exact=False).wait_for(state="visible")
-    assert page.get_by_text("Restart required to take effect", exact=False).is_visible()
+    with page.expect_response(lambda response: response.request.method == "POST" and response.url.endswith("/api/v1/profiles/minecraft/config")) as response_info:
+        page.get_by_role("button", name="Apply changes", exact=True).click()
+    assert response_info.value.json()["restart_required"] == ["motd"]
+    expect(page.get_by_text("Restart required to take effect", exact=False)).to_be_visible()
 
 
 def test_stats_are_game_relevant_and_omit_tick_tiles_for_non_minecraft(page: Page):
     base = page.url.split("#")[0]
     page.goto(f"{base}#/servers/minecraft/stats")
     page.wait_for_selector("#detail-view:not([hidden])")
-    assert page.get_by_role("heading", name="Tick evidence", exact=True).is_visible()
+    assert page.get_by_role("heading", name="Server flight recorder", exact=True).is_visible()
 
     page.goto(f"{base}#/servers/terraria-tmod/stats")
     page.wait_for_selector("#detail-view:not([hidden])")
-    assert not page.get_by_role("heading", name="Tick evidence", exact=True).is_visible()
-    assert page.get_by_role("heading", name="Player record", exact=True).is_visible()
+    assert not page.get_by_role("heading", name="Server flight recorder", exact=True).is_visible()
+    assert page.get_by_role("heading", name="Leaderboard", exact=True).is_visible()
 
     page.goto(f"{base}#/servers/pz-rising/stats")
-    page.wait_for_function("document.querySelector('#detail-title')?.textContent === 'Project Zomboid'")
-    assert not page.get_by_role("heading", name="Tick evidence", exact=True).is_visible()
+    page.wait_for_selector("#detail-view:not([hidden])")
+    assert not page.get_by_role("heading", name="Server flight recorder", exact=True).is_visible()
     page.wait_for_selector("#stats-occupancy-block:not([hidden])", timeout=5000)
     assert page.get_by_role("heading", name="Occupancy", exact=True).is_visible()
-    assert page.get_by_text("Stopped · last observed 3 players at", exact=False).is_visible()
-    assert not page.get_by_role("heading", name="Player record", exact=True).is_visible()
+    assert page.get_by_text("3 online", exact=True).is_visible()
+    assert not page.get_by_role("heading", name="Leaderboard", exact=True).is_visible()
 
 
-def test_session_ledger_uses_wall_clock_ranges_and_explicit_tps_evidence(page: Page):
-    page.goto(f"{page.url.split('#')[0]}#/servers/minecraft/stats")
-    page.wait_for_selector("#stats-tps-chart .chart-line", timeout=5000)
-    assert page.get_by_role("heading", name="Session ledger", exact=True).is_visible()
-    assert page.get_by_text("Server running. Current status and historical observations are shown separately.", exact=True).is_visible()
-    assert page.get_by_role("heading", name="Player record", exact=True).is_visible()
-    assert page.get_by_role("heading", name="Tick evidence", exact=True).is_visible()
-    assert page.locator("label[for='stats-window']").inner_text().startswith("Wall-clock range")
-    assert page.locator("#stats-tps-chart .chart-line").count() == 1
-    assert page.locator("#stats-tps-chart .chart-grid").count() == 3
-    assert page.locator("#stats-heatmap .heatmap-axis").count() == 1
-    assert page.locator("#stats-heatmap .heatmap-legend").count() == 1
-
-
-def test_stats_range_selector_only_refreshes_tick_evidence(page: Page):
-    page.goto(f"{page.url.split('#')[0]}#/servers/minecraft/stats")
-    page.wait_for_selector("#stats-tps-chart .chart-line", timeout=5000)
+def test_stats_window_requests_preserve_one_six_and_24_hour_selection(page: Page):
     requests = []
-    page.on("request", lambda request: requests.append(request.url) if "/stats/" in request.url else None)
-    with page.expect_response(lambda response: response.request.url.endswith("/stats/tps?window=6h"), timeout=5000):
-        page.locator("#stats-window").select_option("6h")
-    assert requests
-    assert all("/stats/tps" in url for url in requests)
-
-
-def test_stats_partial_failures_keep_successful_sections_visible(page: Page):
-    page._dashboard_fixture["stats"]["failures"].add("heatmap")  # type: ignore[attr-defined]
-    page.goto(f"{page.url.split('#')[0]}#/servers/minecraft/stats")
-    page.get_by_text("Player-hours by time of week could not be loaded.", exact=True).wait_for()
-    assert page.get_by_text("Guest", exact=True).is_visible()
-    assert page.locator("#stats-tps-chart .chart-line").count() == 1
-    page._dashboard_fixture["stats"]["failures"].clear()  # type: ignore[attr-defined]
-
-
-def test_tick_evidence_does_not_draw_zero_or_out_of_range_samples(page: Page):
-    stats = page._dashboard_fixture["stats"]  # type: ignore[attr-defined]
-    stats["tps"] = {"window": "24h", "samples": []}
-    page.goto(f"{page.url.split('#')[0]}#/servers/minecraft/stats")
-    page.get_by_text("No tick samples in this wall-clock range.", exact=True).wait_for()
-    assert page.locator("#stats-tps-chart .chart-line").count() == 0
-    assert page.locator("#stats-tps-chart .chart-point").count() == 0
-
-    old = (datetime.now(timezone.utc) - timedelta(days=2)).isoformat()
-    stats["tps"] = {"window": "24h", "samples": [{"timestamp": old, "tps": 20, "mspt": 13}]}
-    page.reload()
-    page.get_by_text("No tick samples in this wall-clock range.", exact=True).wait_for()
-    assert page.get_by_text("LAST OBSERVED 20.00 TPS", exact=True).is_visible()
-    assert page.locator("#stats-tps-chart .chart-line").count() == 0
-    assert page.locator("#stats-tps-chart .chart-point").count() == 0
+    page.on("request", lambda request: requests.append(request.url) if "/stats/summary" in request.url else None)
+    base = page.url.split("#")[0]
+    page.goto(f"{base}#/servers/minecraft/stats")
+    page.wait_for_selector("#stats-window")
+    for value in ("1h", "6h", "24h"):
+        page.locator("#stats-window").select_option(value)
+        page.wait_for_timeout(50)
+    hours = [urlparse(url).query for url in requests]
+    assert any("hours=1" in query for query in hours)
+    assert any("hours=6" in query for query in hours)
+    assert any("hours=24" in query for query in hours)
 
 
 def test_detail_command_hint_matches_available_running_profile(page: Page):
@@ -799,6 +1066,8 @@ def test_detail_mobile_layout_has_no_overflow(page: Page):
 
 
 def test_375px_layout_audit_and_mobile_evidence(page: Page, tmp_path: Path):
+    screenshot_dir = tmp_path / "browser-evidence"
+    screenshot_dir.mkdir()
     page.set_viewport_size({"width": 375, "height": 760})
     page.reload()
     base = page.url.split("#")[0]
@@ -810,6 +1079,8 @@ def test_375px_layout_audit_and_mobile_evidence(page: Page, tmp_path: Path):
     assert page.evaluate(
         "Math.min(...[...document.querySelectorAll('button, a, select, input')].filter((node) => node.offsetParent).map((node) => node.getBoundingClientRect().height)) >= 44"
     )
+    page.wait_for_timeout(300)
+    page.screenshot(path=str(tmp_path / "horizon-session-mobile-375x760.png"))
     page.goto(f"{base}#/servers/minecraft/console")
     page.wait_for_selector("#detail-view:not([hidden])")
     assert page.locator(".detail-tabs").evaluate("(node) => node.scrollWidth > node.clientWidth")
@@ -819,16 +1090,16 @@ def test_375px_layout_audit_and_mobile_evidence(page: Page, tmp_path: Path):
     page.wait_for_selector("#detail-view:not([hidden])")
     page.wait_for_selector("#stats-heatmap .heatmap-row")
     assert page.locator("#stats-heatmap").evaluate("(node) => node.scrollWidth > node.clientWidth")
-    assert page.locator(".stats-table-wrap").evaluate("(node) => node.scrollWidth > node.clientWidth")
+    assert page.locator(".stats-table-wrap").last.evaluate("(node) => node.scrollWidth > node.clientWidth")
     assert page.evaluate("document.documentElement.scrollWidth <= window.innerWidth")
-    page.screenshot(path=str(tmp_path / "horizon-mobile-375x760.png"))
+    page.screenshot(path=str(screenshot_dir / "2026-07-15-horizon-mobile-375x760.png"))
 
     page.set_viewport_size({"width": 768, "height": 1024})
     page.goto(f"{base}#/")
     page.wait_for_selector('[data-profile-id="minecraft"]', timeout=5000)
     assert page.locator("aside.sidebar").evaluate("(node) => Math.round(node.getBoundingClientRect().width)") == 200
     assert page.evaluate("document.documentElement.scrollWidth <= window.innerWidth")
-    page.screenshot(path=str(tmp_path / "horizon-desktop-768x1024.png"))
+    page.screenshot(path=str(screenshot_dir / "2026-07-15-horizon-desktop-768x1024.png"))
 
 
 def test_accessibility_live_regions_and_reduced_motion(page: Page):
@@ -857,15 +1128,13 @@ def test_breakpoint_crossing_resynchronizes_sidebar_state(page: Page):
     sidebar = page.locator("#sidebar")
     assert sidebar.get_attribute("aria-hidden") == "false"
     assert sidebar.get_attribute("inert") is None
-    assert page.locator("#drawer-overlay").get_attribute("hidden") is not None
+    expect(page.locator("#drawer-overlay")).to_be_hidden()
     page.get_by_role("button", name="Settings").click()
     assert page.get_by_role("heading", name="Settings").is_visible()
     page.set_viewport_size({"width": 390, "height": 844})
     expect(sidebar).to_have_attribute("aria-hidden", "true")
     expect(sidebar).to_have_attribute("inert", "")
-    expect(page.get_by_role("button", name="Open navigation")).to_have_attribute(
-        "aria-expanded", "false"
-    )
+    expect(page.get_by_role("button", name="Open navigation")).to_have_attribute("aria-expanded", "false")
 
 
 def test_desktop_shell_uses_internal_main_scrolling(page: Page):
@@ -887,6 +1156,8 @@ def test_mobile_servers_breadcrumb_has_touch_target(page: Page):
 
 
 def test_aggregate_backups_replaces_rows_without_duplicates(page: Page):
+    requests = []
+    page.on("request", lambda request: requests.append(urlparse(request.url).path) if "/backups" in request.url else None)
     page.goto(f"{page.url}#/backups")
     page.wait_for_selector("#aggregate-backup-list .backup-row")
     assert page.locator("#aggregate-backup-list .backup-row").count() == 5
@@ -894,6 +1165,303 @@ def test_aggregate_backups_replaces_rows_without_duplicates(page: Page):
     page.goto(f"{page.url}#/backups")
     page.wait_for_timeout(100)
     assert page.locator("#aggregate-backup-list .backup-row").count() == 5
+    assert set(requests) == {"/api/v1/backups"}
+
+
+def test_flight_recorder_stops_polling_while_document_is_hidden(page: Page):
+    requests = []
+    client_perf = []
+    page.on("request", lambda request: requests.append(request.url) if "/stats/tps" in request.url else None)
+    page.on("request", lambda request: client_perf.append(request.url) if "/perf/client" in request.url else None)
+    page.goto(f"{page.url}#/servers/minecraft/stats")
+    page.wait_for_selector("#stats-tps-chart")
+    page.wait_for_function("() => document.querySelector('#stats-tps-title').closest('.stats-tps-block').getAttribute('aria-busy') === 'false'")
+    page.evaluate("""() => {
+      window.__testVisibility = 'hidden';
+      Object.defineProperty(document, 'visibilityState', {configurable: true, get: () => window.__testVisibility});
+      document.dispatchEvent(new Event('visibilitychange'));
+    }""")
+    before = len(requests)
+    perf_before = len(client_perf)
+    page.wait_for_timeout(4300)
+    assert len(requests) == before
+    assert len(client_perf) == perf_before
+
+
+def test_visible_resume_pauses_mutations_until_fresh_status_arrives(page: Page):
+    pending = []
+
+    def hold_status(route):
+        pending.append(route)
+
+    page.route("**/api/v1/status", hold_status)
+    page.evaluate("""() => {
+      window.__testVisibility = 'hidden';
+      Object.defineProperty(document, 'visibilityState', {configurable: true, get: () => window.__testVisibility});
+      document.dispatchEvent(new Event('visibilitychange'));
+      window.__testVisibility = 'visible';
+      document.dispatchEvent(new Event('visibilitychange'));
+    }""")
+    page.wait_for_timeout(100)
+
+    assert len(pending) == 1
+    assert page.locator("#session-primary").is_disabled()
+    assert page.locator("#session-primary").text_content() == "Checking status…"
+    assert "Actions remain paused" in page.locator("#active-slot-summary").text_content()
+
+    pending[0].fulfill(json={
+        "generation": 2,
+        "observed_at": "2026-07-11T12:01:00Z",
+        "profiles": [{
+            "profile_id": "minecraft", "state": "stopped", "health": "unknown",
+            "slot_owner": None, "active_job_id": None, "pid": None,
+            "started_at": None, "uptime_seconds": None, "cpu_percent": None,
+            "rss_bytes": None, "players_online": 0, "installed_version": "1.21.8",
+            "restart_required": False, "required_ports_ready": False,
+        }],
+    })
+    page.wait_for_function("document.querySelector('#session-primary').textContent === 'Start Minecraft'")
+    assert not page.locator("#session-primary").is_disabled()
+
+
+def test_hidden_document_closes_sse_and_visible_resume_converges_once(page: Page):
+    latest = {
+        "generation": 30,
+        "observed_at": "2026-07-11T12:00:00Z",
+        "profiles": [{
+            "profile_id": "minecraft", "state": "running", "health": "healthy",
+            "slot_owner": "minecraft", "active_job_id": None, "pid": 101,
+            "started_at": "2026-07-11T10:00:00Z", "uptime_seconds": 7200,
+            "cpu_percent": 7.4, "rss_bytes": 128000000, "players_online": 4,
+            "installed_version": "1.21.8", "restart_required": False,
+            "required_ports_ready": True,
+        }],
+    }
+    status_requests = []
+
+    def status_route(route):
+        status_requests.append(route.request.url)
+        route.fulfill(json=latest)
+
+    page.route("**/api/v1/status", status_route)
+    page.add_init_script("""
+      window.__visibility = 'visible';
+      Object.defineProperty(document, 'visibilityState', {configurable: true, get: () => window.__visibility});
+      window.__mockSse = {opens: 0, closes: 0, instances: []};
+      window.EventSource = class MockEventSource {
+        static CONNECTING = 0; static OPEN = 1; static CLOSED = 2;
+        constructor(url) {
+          this.url = url; this.readyState = 1; this.listeners = new Map();
+          window.__mockSse.opens += 1; window.__mockSse.instances.push(this);
+          queueMicrotask(() => { if (this.readyState === 1 && this.onopen) this.onopen(new Event('open')); });
+        }
+        addEventListener(type, callback) {
+          const current = this.listeners.get(type) || []; current.push(callback); this.listeners.set(type, current);
+        }
+        close() { if (this.readyState !== 2) { this.readyState = 2; window.__mockSse.closes += 1; } }
+        emit(type, payload) {
+          if (this.readyState !== 1) return;
+          const event = new MessageEvent(type, {data: JSON.stringify(payload)});
+          (this.listeners.get(type) || []).forEach((callback) => callback(event));
+          if (type === 'message' && this.onmessage) this.onmessage(event);
+        }
+      };
+    """)
+    page.reload()
+    page.wait_for_function("window.__mockSse?.opens >= 1")
+    assert page.evaluate("window.__mockSse.opens") == 1
+    page.evaluate("""() => {
+      window.__appliedSnapshots = 0;
+      window.addEventListener('horizon:status-applied', () => { window.__appliedSnapshots += 1; });
+      window.__visibility = 'hidden';
+      document.dispatchEvent(new Event('visibilitychange'));
+    }""")
+    page.wait_for_function("window.__mockSse.closes === 1")
+    assert page.evaluate("window.__mockSse.instances.filter(source => source.readyState !== EventSource.CLOSED).length") == 0
+    hidden_request_count = len(status_requests)
+    page.evaluate("window.__mockSse.instances[0].emit('status', {generation: 31, profiles: []})")
+    page.wait_for_timeout(700)
+    assert len(status_requests) == hidden_request_count
+    assert page.evaluate("window.__appliedSnapshots") == 0
+
+    latest["generation"] = 32
+    latest["profiles"][0]["players_online"] = 9
+    page.evaluate("window.__visibility = 'visible'; document.dispatchEvent(new Event('visibilitychange'))")
+    page.wait_for_function("window.__mockSse.opens === 2")
+    expect(page.locator('[data-profile-id="minecraft"]')).to_contain_text("9 players")
+    assert len(status_requests) == hidden_request_count + 1
+    assert page.evaluate("window.__mockSse.closes") == 1
+    assert page.evaluate("window.__mockSse.instances.filter(source => source.readyState !== EventSource.CLOSED).length") == 1
+
+    before_emit = page.evaluate("window.__appliedSnapshots")
+    latest_event = {**latest, "generation": 33, "profiles": [{**latest["profiles"][0], "players_online": 10}]}
+    page.evaluate("payload => window.__mockSse.instances[1].emit('status', payload)", latest_event)
+    expect(page.locator('[data-profile-id="minecraft"]')).to_contain_text("10 players")
+    assert page.evaluate("window.__appliedSnapshots") == before_emit + 1
+
+
+def test_sse_replacements_carry_cursor_and_accept_only_newer_ids(page: Page):
+    page.add_init_script("""
+      window.__visibility = 'visible';
+      Object.defineProperty(document, 'visibilityState', {configurable: true, get: () => window.__visibility});
+      window.__mockSse = {opens: 0, closes: 0, instances: []};
+      window.EventSource = class MockEventSource {
+        static CONNECTING = 0; static OPEN = 1; static CLOSED = 2;
+        constructor(url) {
+          this.url = url; this.readyState = 1; this.listeners = new Map();
+          window.__mockSse.opens += 1; window.__mockSse.instances.push(this);
+          queueMicrotask(() => { if (this.readyState === 1 && this.onopen) this.onopen(new Event('open')); });
+        }
+        addEventListener(type, callback) {
+          const current = this.listeners.get(type) || []; current.push(callback); this.listeners.set(type, current);
+        }
+        close() { if (this.readyState !== 2) { this.readyState = 2; window.__mockSse.closes += 1; } }
+        emit(type, payload, lastEventId = '') {
+          if (this.readyState !== 1) return;
+          const event = new MessageEvent(type, {data: JSON.stringify(payload), lastEventId});
+          (this.listeners.get(type) || []).forEach((callback) => callback(event));
+          if (type === 'message' && this.onmessage) this.onmessage(event);
+        }
+      };
+    """)
+    page.reload()
+    page.wait_for_function("window.__mockSse?.opens === 1")
+    page.evaluate("window.__appliedGenerations = []; window.addEventListener('horizon:status-applied', event => window.__appliedGenerations.push(event.detail.generation))")
+    page.evaluate("window.__mockSse.instances[0].emit('status', {generation: 1, profiles: []}, '41')")
+    page.evaluate("""() => {
+      const source = window.__mockSse.instances[0];
+      source.readyState = EventSource.CLOSED;
+      source.onerror(new Event('error'));
+    }""")
+    page.wait_for_function("window.__mockSse.opens === 2", timeout=7000)
+    assert page.evaluate("window.__mockSse.instances[1].url") == "/api/v1/stream?after=41"
+
+    page.evaluate("window.__visibility = 'hidden'; document.dispatchEvent(new Event('visibilitychange'))")
+    page.wait_for_function("window.__mockSse.closes === 1")
+    page.evaluate("window.__visibility = 'visible'; document.dispatchEvent(new Event('visibilitychange'))")
+    page.wait_for_function("window.__mockSse.opens === 3")
+    assert page.evaluate("window.__mockSse.instances[2].url") == "/api/v1/stream?after=41"
+    page.evaluate("window.__mockSse.instances[2].emit('status', {generation: 2, profiles: []}, '42')")
+    assert page.evaluate("window.__appliedGenerations.includes(2)")
+    page.evaluate("""() => {
+      const source = window.__mockSse.instances[2];
+      source.readyState = EventSource.CLOSED;
+      source.onerror(new Event('error'));
+    }""")
+    page.wait_for_function("window.__mockSse.opens === 4", timeout=7000)
+    assert page.evaluate("window.__mockSse.instances[3].url") == "/api/v1/stream?after=42"
+    page.evaluate("""() => {
+      const stale = window.__mockSse.instances[2];
+      const callback = stale.listeners.get('status')[0];
+      callback(new MessageEvent('status', {data: JSON.stringify({generation: 99, profiles: []}), lastEventId: '99'}));
+      const source = window.__mockSse.instances[3];
+      source.readyState = EventSource.CLOSED;
+      source.onerror(new Event('error'));
+    }""")
+    page.wait_for_function("window.__mockSse.opens === 5", timeout=7000)
+    assert page.evaluate("window.__mockSse.instances[4].url") == "/api/v1/stream?after=42"
+
+
+def test_flight_recorder_keeps_cached_layout_and_values_on_poll_failure(page: Page):
+    calls = []
+
+    def tps(route):
+        calls.append(route.request.url)
+        if len(calls) == 1:
+            return route.fulfill(json={"window": "6h", "resolution": "raw", "limit": 720,
+                "samples": [{"ts": "2026-07-11T12:00:00Z", "state": "available", "tps": 19.75, "mspt": 14.5}],
+                "stale": False, "state": "ok"})
+        return route.fulfill(status=200, headers={"Content-Type": "application/json"}, body="{")
+
+    page.route("**/api/v1/profiles/minecraft/stats/tps**", tps)
+    page.goto(f"{page.url}#/servers/minecraft/stats")
+    expect(page.locator("#stats-tps-current")).to_have_text("19.75 TPS")
+    page.evaluate("window.__recorderNode = document.querySelector('#stats-tps-chart'); window.__recorderHeight = document.querySelector('.flight-recorder').getBoundingClientRect().height")
+    page.wait_for_timeout(4300)
+    expect(page.locator("#stats-tps-current")).to_have_text("19.75 TPS")
+    expect(page.locator("#stats-live-state")).to_have_text("Stale")
+    assert page.evaluate("window.__recorderNode === document.querySelector('#stats-tps-chart')")
+    assert page.evaluate("Math.abs(window.__recorderHeight - document.querySelector('.flight-recorder').getBoundingClientRect().height) < 1")
+
+
+def test_flight_recorder_preserves_null_offline_values_and_redraws_on_resize(page: Page):
+    def tps(route):
+        route.fulfill(json={"window": "6h", "resolution": "raw", "limit": 720,
+            "samples": [{"ts": "2026-07-11T12:00:00Z", "state": "inactive", "tps": None, "mspt": None}],
+            "comparisons": {"previous": {"samples": [{"ts": "bad", "state": "available", "tps": None, "mspt": None}]}},
+            "stale": True, "state": "unknown"})
+
+    page.route("**/api/v1/profiles/minecraft/stats/tps**", tps)
+    page.goto(f"{page.url}#/servers/minecraft/stats")
+    expect(page.locator("#stats-live-state")).to_have_text("Server stopped")
+    expect(page.locator("#stats-tps-current")).to_have_text("—")
+    recorder_text = page.locator("#stats-recorder-table").text_content()
+    assert "inactive" in recorder_text and "0.00" not in recorder_text
+    before = page.locator("#stats-tps-chart").evaluate("canvas => canvas.width")
+    page.set_viewport_size({"width": 390, "height": 844})
+    page.wait_for_function("before => document.querySelector('#stats-tps-chart').width !== before", arg=before)
+    after = page.locator("#stats-tps-chart").evaluate("canvas => canvas.width")
+    assert 280 <= after < before
+    page.locator("#stats-comparison").select_option("previous")
+    assert page.locator("#stats-tps-chart").is_visible()
+
+
+def test_flight_recorder_exposes_real_overlays_and_three_accessible_comparisons(page: Page):
+    def tps(route):
+        route.fulfill(json={
+            "window": "6h", "resolution": "raw", "limit": 720, "stale": False, "state": "ok",
+            "samples": [
+                {"ts": "2026-07-11T12:00:00Z", "state": "available", "tps": 18, "mspt": 24},
+                {"ts": "2026-07-11T12:01:00Z", "state": "available", "tps": 20, "mspt": 12},
+            ],
+            "context": {
+                "series": {"cpu_percent": [], "rss_bytes": [], "gc_pause": [
+                    {"ts": "2026-07-11T12:00:00Z", "state": "available", "value": 87}
+                ]},
+                "jobs": [
+                    {"kind": "backup", "state": "succeeded", "started_at": "2026-07-11T12:01:00Z", "ended_at": "2026-07-11T12:01:00Z"},
+                    {"kind": "update", "state": "succeeded", "started_at": "2026-07-11T12:02:00Z", "ended_at": "2026-07-11T12:03:00Z"},
+                    {"kind": "benchmark", "state": "succeeded", "started_at": "2026-07-11T12:04:00Z", "ended_at": "2026-07-11T12:05:00Z"},
+                ],
+            },
+            "comparisons": {
+                "yesterday": {"label": "Yesterday at the same time", "samples": [
+                    {"ts": "2026-07-10T12:00:00Z", "state": "available", "tps": 17, "mspt": 28}
+                ]},
+                "restart": {"label": "Before the latest restart", "split_at": "2026-07-11T11:59:00Z", "samples": [
+                    {"ts": "2026-07-11T11:58:00Z", "state": "available", "tps": 16, "mspt": 30}
+                ]},
+                "preset": {"label": "Benchmark presets", "baseline_preset": "current", "candidate_preset": "candidate",
+                    "verdict": "better", "metrics": {"mspt_p95": {"baseline": 20, "candidate": 15, "unit": "ms"}}},
+            },
+            "time_basis": {"active_runtime_seconds": 3600, "wall_clock_seconds": 21600},
+        })
+
+    page.route("**/api/v1/profiles/minecraft/stats/tps**", tps)
+    page.goto(f"{page.url}#/servers/minecraft/stats")
+    page.wait_for_function("() => document.querySelector('#stats-tps-title').closest('.stats-tps-block').getAttribute('aria-busy') === 'false'")
+
+    comparison = page.get_by_label("Compare")
+    assert comparison.locator('option[value="yesterday"]').is_enabled()
+    assert comparison.locator('option[value="restart"]').is_enabled()
+    assert comparison.locator('option[value="preset"]').is_enabled()
+    comparison.select_option("yesterday")
+    expect(page.locator("#stats-comparison-note")).to_have_text("Yesterday at the same time")
+    assert page.locator("#stats-tps-chart").get_attribute("data-comparison-alignment") == "plus-24h"
+    assert page.locator("#stats-tps-chart").get_attribute("data-comparison-start") == str(
+        int(datetime.fromisoformat("2026-07-11T12:00:00+00:00").timestamp() * 1000)
+    )
+    comparison.select_option("restart")
+    expect(page.locator("#stats-comparison-note")).to_have_text("Before the latest restart")
+    assert page.locator("#stats-tps-chart").get_attribute("data-comparison-alignment") == "wall-clock"
+    assert page.locator("#stats-tps-chart").get_attribute("data-comparison-start") == str(
+        int(datetime.fromisoformat("2026-07-11T11:58:00+00:00").timestamp() * 1000)
+    )
+    comparison.select_option("preset")
+    expect(page.locator("#stats-comparison-note")).to_have_text("current 20.00 ms p95 · candidate 15.00 ms p95")
+    table = page.locator("#stats-recorder-table").text_content()
+    assert "GC pause" in table and "backup" in table
+    assert "backup / update / benchmark windows" in page.get_by_label("Chart legend").text_content()
 
 
 def test_detail_metric_history_only_changes_on_status_snapshot(page: Page):
@@ -917,6 +1485,155 @@ def test_detail_log_severity_widening_refilters_all_cached_rows(page: Page):
     logs.get_by_label("Severity", exact=True).select_option("all")
     assert logs.locator(".log-line").count() == 2
     assert page.locator("#detail-log-footer").inner_text() == "2 lines · 2 network-noise lines hidden · secrets redacted"
+
+
+def test_hidden_detail_polling_pauses_and_visibility_return_refreshes_once(page: Page):
+    log_requests = []
+    page.on("request", lambda request: log_requests.append(request) if "/profiles/minecraft/logs" in request.url else None)
+    page.goto(f"{page.url}#/servers/minecraft/logs")
+    page.wait_for_selector("#detail-view:not([hidden])")
+    page.wait_for_timeout(100)
+    before_hidden = len(log_requests)
+    page.evaluate(
+        """() => {
+          Object.defineProperty(document, 'visibilityState', { configurable: true, value: 'hidden' });
+          document.dispatchEvent(new Event('visibilitychange'));
+        }"""
+    )
+    page.wait_for_timeout(3500)
+    assert len(log_requests) == before_hidden
+    page.evaluate(
+        """() => {
+          Object.defineProperty(document, 'visibilityState', { configurable: true, value: 'visible' });
+          document.dispatchEvent(new Event('visibilitychange'));
+        }"""
+    )
+    page.wait_for_timeout(300)
+    assert len(log_requests) == before_hidden + 1
+
+
+def test_detail_logs_timestamp_since_append_deduplicates_and_preserves_list_node(page: Page):
+    responses = [
+        {"items": [
+            {"timestamp": "2026-07-11T12:00:00Z", "severity": "info", "message": "boot"},
+            {"timestamp": "2026-07-11T12:01:00Z", "severity": "error", "message": "ready"},
+        ], "next_cursor": None},
+        {"items": [
+            {"timestamp": "2026-07-11T12:01:00Z", "severity": "error", "message": "ready"},
+            {"timestamp": "2026-07-11T12:02:00Z", "severity": "info", "message": "steady"},
+        ], "next_cursor": None},
+    ]
+    calls = []
+
+    def logs(route):
+        calls.append(route.request.url)
+        route.fulfill(json=responses[min(len(calls) - 1, 1)])
+
+    page.route("**/api/v1/profiles/minecraft/logs**", logs)
+    page.goto(f"{page.url}#/servers/minecraft/logs")
+    page.wait_for_selector("#detail-log-list .log-line")
+    page.evaluate("window.__detailLogListBefore = document.querySelector('#detail-log-list')")
+    page.evaluate(
+        "window.__detailLogRowsBefore = [...document.querySelectorAll('#detail-log-list .log-line')]"
+    )
+    page.wait_for_timeout(3200)
+    assert len(calls) >= 2
+    assert "since=2026-07-11T12%3A01%3A00Z" in calls[1] or "since=2026-07-11T12:01:00Z" in calls[1]
+    assert page.evaluate("window.__detailLogListBefore === document.querySelector('#detail-log-list')")
+    assert page.evaluate(
+        "window.__detailLogRowsBefore.every((node, index) => node === document.querySelectorAll('#detail-log-list .log-line')[index])"
+    )
+    assert page.locator("#detail-log-list .log-line").count() == 3
+    assert page.locator("#detail-log-list").inner_text().count("ready") == 1
+    assert page.locator("#detail-log-list").inner_text().count("steady") == 1
+    page.evaluate("window.__detailLogRowsAfterAppend = [...document.querySelectorAll('#detail-log-list .log-line')]")
+    page.wait_for_timeout(3200)
+    assert page.evaluate(
+        "window.__detailLogRowsAfterAppend.every((node, index) => node === document.querySelectorAll('#detail-log-list .log-line')[index])"
+    )
+
+
+def test_detail_logs_buffer_trims_old_rows_and_bounds_reconciliation_cache(page: Page):
+    initial = [
+        {"timestamp": f"2026-07-11T12:{index // 60:02d}:{index % 60:02d}Z", "severity": "info", "message": f"line-{index}"}
+        for index in range(200)
+    ]
+    responses = [
+        {"items": initial, "next_cursor": None},
+        {"items": [initial[-1],
+                    {"timestamp": "2026-07-11T12:03:20Z", "severity": "info", "message": "line-200"},
+                    {"timestamp": "2026-07-11T12:03:21Z", "severity": "error", "message": "line-201"}], "next_cursor": None},
+    ]
+    calls = []
+
+    def logs(route):
+        calls.append(route.request.url)
+        route.fulfill(json=responses[min(len(calls) - 1, 1)])
+
+    page.route("**/api/v1/profiles/minecraft/logs**", logs)
+    page.goto(f"{page.url}#/servers/minecraft/logs")
+    page.wait_for_selector("#detail-log-list .log-line")
+    page.evaluate("window.__retainedLogRow = document.querySelectorAll('#detail-log-list .log-line')[2]")
+    page.wait_for_timeout(3200)
+    assert len(calls) >= 2
+    assert page.locator("#detail-log-list .log-line").count() == 200
+    assert "line-0" not in page.locator("#detail-log-list").inner_text()
+    assert "line-2" in page.locator("#detail-log-list").inner_text()
+    assert "line-201" in page.locator("#detail-log-list").inner_text()
+    assert page.evaluate("window.__retainedLogRow === document.querySelectorAll('#detail-log-list .log-line')[0]")
+    page.locator("#detail-log-severity").select_option("error")
+    page.locator("#detail-log-severity").select_option("all")
+    assert page.evaluate("window.__retainedLogRow === document.querySelectorAll('#detail-log-list .log-line')[0]")
+    assert page.locator("#detail-log-list .log-line").count() == 200
+
+
+def test_tps_above_20_and_mspt_render_without_display_clamp(page: Page):
+    def tps(route):
+        route.fulfill(json={"window": "24h", "samples": [
+            {"ts": "2026-07-11T12:00:00Z", "tps": 24.5, "mspt": 37.25},
+            {"ts": "2026-07-11T12:00:30Z", "tps": 22.0, "mspt": 41.0},
+        ], "stale": False, "state": "ok"})
+
+    page.route("**/api/v1/profiles/minecraft/stats/tps**", tps)
+    page.goto(f"{page.url}#/servers/minecraft/stats")
+    page.wait_for_selector("#detail-view:not([hidden])")
+    expect(page.locator("#stats-tps-current")).to_have_text("22.00 TPS")
+    expect(page.locator("#stats-mspt-current")).to_have_text("41.00 ms/tick")
+    assert page.locator("#stats-tps-chart").evaluate("canvas => canvas.width >= canvas.clientWidth && canvas.height >= canvas.clientHeight")
+    assert "Server flight recorder" in page.locator("#stats-tps-chart").get_attribute("aria-label")
+    assert page.locator(".chart-legend-tps").inner_text() == "TPS"
+    assert page.locator(".chart-legend-mspt").inner_text() == "MSPT"
+    expect(page.locator("#stats-recorder-table tr")).to_have_count(2)
+    assert "24.50" in page.locator("#stats-recorder-table").text_content()
+
+
+def test_tps_empty_window_renders_explicit_stale_latest_observation(page: Page):
+    def tps(route):
+        route.fulfill(json={
+            "window": "24h",
+            "resolution": "raw",
+            "samples": [],
+            "latest_ts": "2026-07-09T12:00:00Z",
+            "latest_observation": {
+                "ts": "2026-07-09T12:00:00Z",
+                "tps": 19.25,
+                "mspt": 18.5,
+                "stale": True,
+                "staleness_seconds": 172800,
+            },
+            "stale": True,
+            "state": "unknown",
+        })
+
+    page.route("**/api/v1/profiles/minecraft/stats/tps**", tps)
+    page.goto(f"{page.url}#/servers/minecraft/stats")
+
+    expect(page.locator("#stats-live-state")).to_have_text("Stale")
+    expect(page.locator("#stats-tps-current")).to_have_text("19.25 TPS")
+    expect(page.locator("#stats-mspt-current")).to_have_text("18.50 ms/tick")
+    assert "Last observation:" in page.locator("#stats-tps-note").inner_text()
+    expect(page.locator("#stats-recorder-table tr")).to_have_count(1)
+    expect(page.locator("#stats-recorder-table td")).to_have_text("No telemetry in this window.")
 
 
 def test_malformed_and_unknown_server_hashes_fall_back_to_dashboard(page: Page):

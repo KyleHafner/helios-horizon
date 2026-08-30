@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Restore the example Sunlit immutable-library link and backend properties."""
+"""Restore Sunlit's fixed immutable-library link before a Horizon start."""
 
 from __future__ import annotations
 
@@ -10,9 +10,12 @@ import tempfile
 from pathlib import Path
 
 
-MUTABLE_ROOT = Path("/srv/game-servers/minecraft-sunlit-cobblemon")
+MUTABLE_ROOT = Path("/srv/game-servers/minecraft-sunlit-cobblemon-current")
 LINK = MUTABLE_ROOT / "libraries"
 TARGET = Path("/opt/game-servers/minecraft-sunlit-cobblemon/libraries")
+SERVER_PROPERTIES = MUTABLE_ROOT / "server.properties"
+STATE_ROOT = Path("/srv/game-servers/minecraft-sunlit-cobblemon-state")
+RELEASE_ROOT = Path("/opt/game-servers/minecraft-sunlit-cobblemon/releases")
 FIXED_PROPERTIES = {"server-ip": "127.0.0.1", "server-port": "25566"}
 
 
@@ -27,8 +30,21 @@ def _trusted_directory(path: Path, *, expected_uid: int) -> None:
         raise ValueError("Sunlit directory contract is unsafe")
 
 
+def _trusted_active_runtime() -> None:
+    if not MUTABLE_ROOT.is_symlink():
+        raise ValueError("Sunlit active runtime is unavailable")
+    target = MUTABLE_ROOT.resolve(strict=True)
+    release_root = RELEASE_ROOT.resolve(strict=True)
+    if target.parent != release_root:
+        raise ValueError("Sunlit active runtime is outside the release root")
+
+
 def _fix_backend_properties() -> None:
-    properties = MUTABLE_ROOT / "server.properties"
+    properties = SERVER_PROPERTIES.resolve(strict=True)
+    try:
+        properties.relative_to(STATE_ROOT)
+    except ValueError as exc:
+        raise ValueError("Sunlit server.properties is outside writable state") from exc
     info = properties.lstat()
     if (
         stat.S_ISLNK(info.st_mode)
@@ -75,15 +91,11 @@ def main(argv: list[str] | None = None) -> int:
     if args:
         return 2
     try:
-        _trusted_directory(MUTABLE_ROOT, expected_uid=os.geteuid())
+        _trusted_active_runtime()
+        _trusted_directory(MUTABLE_ROOT.resolve(strict=True), expected_uid=0)
         _trusted_directory(TARGET, expected_uid=0)
         _fix_backend_properties()
-        if LINK.is_symlink():
-            return 0 if os.readlink(LINK) == str(TARGET) else 2
-        if LINK.exists():
-            return 2
-        os.symlink(TARGET, LINK, target_is_directory=True)
-        return 0
+        return 0 if LINK.is_symlink() and os.readlink(LINK) == str(TARGET) else 2
     except (OSError, ValueError):
         return 2
 

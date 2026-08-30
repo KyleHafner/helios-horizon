@@ -1,0 +1,30 @@
+[Unit]
+Description=Terraria tModLoader 1.4.5 candidate game server
+After=network-online.target
+Wants=network-online.target
+AssertPathIsDirectory=/srv/game-servers/terraria-tmod-145-ddffee7/logs/tModLoader-Logs
+AssertPathIsDirectory=/opt/game-servers/terraria-tmod/versions/1.4.5-ddffee7/tModLoader-Logs
+
+[Service]
+Type=simple
+User=tmodloader
+Group=tmodloader
+WorkingDirectory=/srv/game-servers/terraria-tmod-145-ddffee7
+Environment=HOME=/srv/game-servers/terraria-tmod-145-ddffee7/home
+ExecStart=/usr/local/libexec/game-slot-run terraria-tmod-145-candidate
+ExecStop=/usr/local/libexec/game-console-stop terraria-tmod-145-candidate $MAINPID
+KillSignal=SIGINT
+TimeoutStartSec=120
+TimeoutStopSec=90
+Restart=no
+StandardOutput=append:/srv/game-servers/terraria-tmod-145-ddffee7/logs/server.log
+StandardError=append:/srv/game-servers/terraria-tmod-145-ddffee7/logs/server.log
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=yes
+NoNewPrivileges=yes
+RestrictSUIDSGID=yes
+BindPaths=/srv/game-servers/terraria-tmod-145-ddffee7/logs/tModLoader-Logs:/opt/game-servers/terraria-tmod/versions/1.4.5-ddffee7/tModLoader-Logs
+ReadOnlyPaths=/opt/game-control /etc/game-control /usr/local/libexec /usr/bin /srv/game-servers/terraria-vanilla /srv/game-servers/terraria-tmod
+ReadWritePaths=/run/game-control /run/game-slot /srv/game-servers/terraria-tmod-145-ddffee7
+UMask=0077

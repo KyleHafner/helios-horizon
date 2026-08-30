@@ -1,15 +1,21 @@
 {
   "user": "tmodloader",
   "group": "tmodloader",
-  "cwd": "/srv/game-servers/terraria-tmod",
+  "cwd": "/opt/game-servers/terraria-tmod/current",
   "console_fifo": "/run/game-slot/terraria-tmod.console",
   "argv": [
-    "/opt/game-servers/terraria-tmod/current/start-tModLoaderServer.sh",
-    "-nosteam",
+    "/opt/game-servers/terraria-tmod/current/dotnet/dotnet",
+    "/opt/game-servers/terraria-tmod/current/tModLoader.dll",
+    "-server",
     "-config",
     "/srv/game-servers/terraria-tmod/config/serverconfig.txt",
     "-tmlsavedirectory",
     "/srv/game-servers/terraria-tmod"
   ],
-  "environment": {}
+  "environment": {
+    "HOME": "/srv/game-servers/terraria-tmod",
+    "DOTNET_CLI_TELEMETRY_OPTOUT": "1",
+    "DOTNET_NOLOGO": "1",
+    "DOTNET_ROLL_FORWARD": "Disable"
+  }
 }

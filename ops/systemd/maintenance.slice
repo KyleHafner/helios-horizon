@@ -1,0 +1,11 @@
+[Unit]
+Description=Bounded Horizon maintenance child workload boundary
+
+[Slice]
+CPUAccounting=yes
+CPUWeight=50
+MemoryAccounting=yes
+MemoryHigh=2G
+MemoryMax=3G
+MemorySwapMax=0
+IOAccounting=yes

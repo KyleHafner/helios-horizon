@@ -1,0 +1,42 @@
+id = "terraria-tmod-145-candidate"
+display_name = "Terraria tModLoader 1.4.5 candidate"
+adapter = "systemd"
+systemd_unit = "terraria-tmod-145-candidate.service"
+ports = [{ protocol = "tcp", port = 7777, required = true }]
+start_timeout_seconds = 120
+stop_timeout_seconds = 90
+health_timeout_seconds = 120
+min_available_memory_bytes = 3221225472
+min_free_disk_bytes = 8589934592
+operations = ["start", "stop", "restart", "force_stop", "backup", "restore", "clone_target"]
+notification_events = ["start", "stop", "failed_start", "crash", "forced_stop", "slot_conflict", "low_disk", "backup_failure"]
+
+[process]
+executable = "/opt/game-servers/terraria-tmod/versions/1.4.5-ddffee7/dotnet/dotnet"
+argv_contains = [
+    "/opt/game-servers/terraria-tmod/versions/1.4.5-ddffee7/tModLoader.dll",
+    "-server",
+    "-config",
+    "/srv/game-servers/terraria-tmod-145-ddffee7/config/serverconfig.txt",
+    "-tmlsavedirectory",
+    "/srv/game-servers/terraria-tmod-145-ddffee7",
+    "-world",
+    "/srv/game-servers/terraria-tmod-145-ddffee7/worlds/swag_central.wld",
+    "-modpath",
+    "/srv/game-servers/terraria-tmod-145-ddffee7/Mods",
+]
+ready_log_pattern = "Server started"
+
+[paths]
+data_roots = [
+    "/opt/game-servers/terraria-tmod/versions/1.4.5-ddffee7",
+    "/srv/game-servers/terraria-tmod-145-ddffee7",
+]
+mutable_root = "/srv/game-servers/terraria-tmod-145-ddffee7"
+log_files = ["/srv/game-servers/terraria-tmod-145-ddffee7/logs/server.log"]
+backup_root = "/var/backups/game-servers/terraria-tmod-145-ddffee7"
+install_root = "/opt/game-servers/terraria-tmod/versions/1.4.5-ddffee7"
+version_file = "/opt/game-servers/terraria-tmod/versions/1.4.5-ddffee7/version.txt"
+
+[update]
+kind = "manual"

@@ -1,0 +1,35 @@
+id = "minecraft-sunlit-cobblemon"
+display_name = "Sunlit Cobblemon"
+adapter = "systemd"
+systemd_unit = "minecraft-sunlit-cobblemon.service"
+# Minecraft is private behind the fixed lazymc listener. Bore and the public
+# endpoint remain on 25565; Horizon health checks this loopback backend port.
+ports = [{ protocol = "tcp", port = 25566, required = true }]
+start_timeout_seconds = 600
+stop_timeout_seconds = 120
+health_timeout_seconds = 600
+idle_stop_minutes = 30
+min_available_memory_bytes = 8589934592
+min_free_disk_bytes = 16106127360
+public_endpoint = { host = "mc.example.com", port = 25565, protocol = "tcp", relay_unit = "bore-minecraft-fenced.service" }
+operations = ["start", "stop", "restart", "force_stop", "command", "backup", "restore", "update_check", "benchmark"]
+notification_events = ["start", "stop", "failed_start", "crash", "forced_stop", "slot_conflict", "low_disk", "backup_failure", "update_failure", "idle_stop", "sustained_mspt", "memory_growth", "wake_slo", "benchmark_regression"]
+
+[process]
+executable = "/usr/bin/java"
+argv_contains = ["@/opt/game-servers/minecraft-sunlit-cobblemon/libraries/net/minecraftforge/forge/1.20.1-47.4.0/unix_args.txt"]
+
+[paths]
+# Application backups contain only mutable state. The pinned Forge/JAR release
+# under /opt is installed and recovered separately, so restore never collapses
+# immutable and mutable roots into one directory.
+data_roots = ["/srv/game-servers/minecraft-sunlit-cobblemon-state", "/opt/game-servers/minecraft-sunlit-cobblemon/releases", "/srv/game-servers/minecraft-sunlit-cobblemon-current"]
+backup_roots = ["/srv/game-servers/minecraft-sunlit-cobblemon-state"]
+mutable_root = "/srv/game-servers/minecraft-sunlit-cobblemon-state"
+log_files = ["/srv/game-servers/minecraft-sunlit-cobblemon-current/logs/latest.log"]
+backup_root = "/var/backups/game-servers/minecraft-sunlit-cobblemon"
+install_root = "/opt/game-servers/minecraft-sunlit-cobblemon/releases"
+version_file = "/srv/game-servers/minecraft-sunlit-cobblemon-state/.horizon/release.json"
+
+[update]
+kind = "manual"

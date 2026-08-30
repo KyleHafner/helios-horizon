@@ -2,24 +2,32 @@
 Description=Terraria Vanilla game server
 After=network-online.target
 Wants=network-online.target
+OnFailure=horizon-alert-notify@terraria-vanilla.service
 
 [Service]
 Type=simple
 User=terraria-vanilla
 Group=terraria-vanilla
 WorkingDirectory=/srv/game-servers/terraria-vanilla
+Environment=GAME_SLOT_REQUIRE_RESERVATION=1
 ExecStart=/usr/local/libexec/game-slot-run terraria-vanilla
 ExecStop=/usr/local/libexec/game-console-stop terraria-vanilla $MAINPID
 KillSignal=SIGINT
 TimeoutStopSec=90
 Restart=no
+Slice=games.slice
+CPUAccounting=yes
+MemoryAccounting=yes
+IOAccounting=yes
+MemorySwapMax=0
 StandardOutput=journal
 StandardError=journal
+LogNamespace=horizon
 PrivateTmp=yes
 ProtectSystem=strict
 ProtectHome=yes
 NoNewPrivileges=yes
 RestrictSUIDSGID=yes
-ReadOnlyPaths=/opt/game-control /etc/game-control /usr/local/libexec /usr/bin
-ReadWritePaths=/run/game-control /run/game-slot /opt/game-servers/terraria-vanilla /srv/game-servers/terraria-vanilla
+ReadOnlyPaths=/opt/game-control /etc/game-control /usr/local/libexec /usr/bin /opt/game-servers/terraria-vanilla
+ReadWritePaths=/run/game-control /run/game-slot /srv/game-servers/terraria-vanilla
 UMask=0077

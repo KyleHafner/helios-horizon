@@ -19,6 +19,10 @@ class PlayerTracker:
         self._running: dict[str, bool] = {}
         self._last_scan: dict[str, float] = {}
         self._scan_interval = 15.0
+        self._incremental: set[str] = set()
+
+    def register_incremental(self, profile_id: str) -> None:
+        self._incremental.add(str(profile_id))
 
     async def count(self, profile: Any, adapter: Any, *, running: bool) -> int | None:
         profile_id = str(getattr(getattr(profile, "id", None), "value", getattr(profile, "id", "")))
@@ -33,6 +37,8 @@ class PlayerTracker:
             self._last_scan.pop(profile_id, None)
         if not running:
             return 0
+        if profile_id in self._incremental:
+            return len(self._players.setdefault(profile_id, set()))
         now = time.monotonic()
         if profile_id in self._last_scan and now - self._last_scan[profile_id] < self._scan_interval:
             return len(self._players.setdefault(profile_id, set()))
@@ -64,6 +70,20 @@ class PlayerTracker:
         if profile_id not in self._players:
             return None
         return set(self._players[profile_id])
+
+    def ingest_event(self, profile_id: str, event: Any) -> None:
+        """Apply one incremental follower event without replaying old logs."""
+        if getattr(event, "kind", None) == "reset":
+            self.reset(profile_id)
+            return
+        line = str(getattr(event, "line", ""))
+        joined = _TERRARIA_JOIN.search(line)
+        left = _TERRARIA_LEAVE.search(line)
+        players = self._players.setdefault(profile_id, set())
+        if joined:
+            players.add(joined.group("name").strip())
+        elif left:
+            players.discard(left.group("name").strip())
 
 
 __all__ = ["PlayerTracker"]

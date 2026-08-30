@@ -1,0 +1,27 @@
+[Unit]
+Description=Horizon fixed target failure notifier (%i)
+Documentation=man:systemd.service
+RefuseManualStart=yes
+StartLimitIntervalSec=300s
+StartLimitBurst=3
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/libexec/horizon-alert-notify %i
+Restart=on-failure
+RestartSec=2s
+TimeoutStartSec=15s
+User=root
+Group=root
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictSUIDSGID=yes
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+ReadOnlyPaths=/usr /etc /opt/game-control
+ReadWritePaths=/var/lib/game-control
+UMask=0077

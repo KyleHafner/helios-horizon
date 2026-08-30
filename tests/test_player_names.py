@@ -3,11 +3,11 @@ from game_control.players import PlayerTracker
 
 
 def test_extract_from_json_list_string():
-    assert _extract_player_names({"players": "['PlayerOne', 'Guest1']"}) == ("PlayerOne", "Guest1")
+    assert _extract_player_names({"players": "['Swag', 'Guest1']"}) == ("Swag", "Guest1")
 
 
 def test_extract_from_real_list():
-    assert _extract_player_names({"online_players": ["PlayerOne"]}) == ("PlayerOne",)
+    assert _extract_player_names({"online_players": ["Swag"]}) == ("Swag",)
 
 
 def test_extract_missing_returns_none():
@@ -20,11 +20,11 @@ def test_extract_empty_list_is_known_empty():
 
 def test_player_tracker_names_returns_copy_for_tracked_profile():
     tracker = PlayerTracker()
-    tracker._players["terraria-tmod"] = {"PlayerOne"}
+    tracker._players["terraria-tmod"] = {"Swag"}
     names = tracker.names("terraria-tmod")
-    assert names == {"PlayerOne"}
+    assert names == {"Swag"}
     names.add("mutated")
-    assert tracker.names("terraria-tmod") == {"PlayerOne"}
+    assert tracker.names("terraria-tmod") == {"Swag"}
 
 
 def test_player_tracker_names_returns_none_for_untracked_profile():

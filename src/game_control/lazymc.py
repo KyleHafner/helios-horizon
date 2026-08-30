@@ -1,9 +1,9 @@
 """Fixed local lazymc supervisor/helper.
 
 The helper is lazymc's long-lived ``server.command`` child, but it is only a
-capability client, not a Java launcher or process owner. It requests a typed
-wake from Horizon, observes the controller-owned health gate, then polls typed
-status until Horizon reports its player-aware idle stop. It never accepts a
+capability client, not a Java launcher or process owner. It makes one bounded
+wake request whose response is produced by Horizon's controller-owned health
+gate, then polls typed status only for Horizon's player-aware idle stop. It never accepts a
 URL, profile, unit, path, command, or token from a caller and never signals a
 Java process or issues a stop/restart action.
 """
@@ -22,8 +22,9 @@ from uuid import uuid4
 from .capability import CAPABILITY_START_PROFILE
 
 
-CAPABILITY_WAKE_URL = "http://127.0.0.1:8444/api/v1/capability/wake"
-CAPABILITY_STATUS_URL = "http://127.0.0.1:8444/api/v1/capability/status"
+CAPABILITY_ORIGIN = os.environ.get("HORIZON_CAPABILITY_ORIGIN", "http://192.0.2.10:8444").rstrip("/")
+CAPABILITY_WAKE_URL = f"{CAPABILITY_ORIGIN}/api/v1/capability/wake"
+CAPABILITY_STATUS_URL = f"{CAPABILITY_ORIGIN}/api/v1/capability/status"
 CAPABILITY_AUDIENCE = "lazymc"
 WAKE_TOKEN_CREDENTIAL = Path("/run/credentials/lazymc-minecraft.service/wake-token")
 SYSTEMD_CREDENTIAL_ROOT = Path("/run/credentials")
@@ -84,7 +85,7 @@ class LazyWakeClient:
         self.clock = clock or time.monotonic
         self.sleep = sleep or time.sleep
 
-    def _post(self, url: str, request_id: str) -> dict[str, Any]:
+    def _post(self, url: str, request_id: str, *, timeout: float = REQUEST_TIMEOUT_SECONDS) -> dict[str, Any]:
         if url not in {CAPABILITY_WAKE_URL, CAPABILITY_STATUS_URL}:
             raise LazyWakeError("capability endpoint is not approved", retryable=False)
         body = json.dumps({"request_id": request_id, "action": {"kind": "wake" if url == CAPABILITY_WAKE_URL else "status"}}, separators=(",", ":")).encode()
@@ -100,7 +101,7 @@ class LazyWakeClient:
             method="POST",
         )
         try:
-            with self.opener(request, timeout=REQUEST_TIMEOUT_SECONDS) as response:
+            with self.opener(request, timeout=timeout) as response:
                 raw = response.read(64 * 1024 + 1)
         except (OSError, urllib.error.URLError, TimeoutError) as exc:
             raise LazyWakeError("capability service unavailable") from exc
@@ -148,25 +149,24 @@ class LazyWakeClient:
     def wake_and_wait(self, *, grace_seconds: float = STARTUP_GRACE_SECONDS) -> None:
         if not isinstance(grace_seconds, (int, float)) or not 1 <= grace_seconds <= STARTUP_GRACE_SECONDS:
             raise LazyWakeError("startup grace is outside its bound", retryable=False)
-        wake = self._post(CAPABILITY_WAKE_URL, str(uuid4()))
-        if self._error(wake) is not None:
-            raise LazyWakeError("controller rejected wake")
         deadline = self.clock() + float(grace_seconds)
+        request_id = str(uuid4())
         while self.clock() < deadline:
             try:
-                status = self._post(CAPABILITY_STATUS_URL, str(uuid4()))
+                remaining = max(1.0, deadline - self.clock())
+                wake = self._post(CAPABILITY_WAKE_URL, request_id, timeout=remaining)
             except LazyWakeError as exc:
                 if not exc.retryable:
                     raise
                 self.sleep(min(POLL_INTERVAL_SECONDS, max(0.0, deadline - self.clock())))
                 continue
-            if self._error(status) is not None:
-                raise LazyWakeError("controller status failed")
-            if self._healthy(status):
+            if wake.get("state") == "ready":
                 return
-            if self._failed(status):
-                raise LazyWakeError("controller health gate failed")
-            self.sleep(min(POLL_INTERVAL_SECONDS, max(0.0, deadline - self.clock())))
+            error = wake.get("error")
+            if isinstance(error, dict) and error.get("code") == "request_in_progress" and error.get("retryable") is True:
+                self.sleep(min(POLL_INTERVAL_SECONDS, max(0.0, deadline - self.clock())))
+                continue
+            raise LazyWakeError("controller rejected wake")
         raise LazyWakeError("controller health gate timed out")
 
     def wait_until_stopped(self) -> None:

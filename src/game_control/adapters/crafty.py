@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import ast
 import os
+import re
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -14,7 +15,12 @@ from ..protocol import LogLine
 from .base import AdapterError, AdapterObservation
 
 _MAX_LOG_BYTES = 256 * 1024
+_MAX_VERSION_LENGTH = 128
+_UNKNOWN_VERSION = "unknown"
 _CA_PATH = Path("/etc/game-control/crafty-ca.pem")
+_VERSION_KEYS = ("VERSION", "MINECRAFT_VERSION", "MC_VERSION", "SERVER_VERSION", "FORGE_VERSION")
+_VERSION_TOKEN = re.compile(r"^\d+(?:\.\d+){1,3}(?:[-+][A-Za-z0-9_.-]+)?$")
+_VERSION_IN_TEXT = re.compile(r"\d+(?:\.\d+){1,3}(?:[-+][A-Za-z0-9_.-]+)?")
 
 
 class CraftyAdapter:
@@ -141,12 +147,7 @@ class CraftyAdapter:
         pid = _first_int(payload, "pid", "process_id")
         players = _first_int(payload, "players_online", "online_players", "online", "players")
         crashed = _first_bool(payload, "crashed", "is_crashed")
-        pings = payload.get("int_ping_results")
-        ping_ok = None
-        if isinstance(pings, dict):
-            ping_ok = all(bool(value) for value in pings.values()) if pings else None
-        elif isinstance(pings, list):
-            ping_ok = all(bool(value) for value in pings) if pings else None
+        ping_ok = _ping_health(payload.get("int_ping_results"))
         healthy = _first_bool(payload, "healthy", "health")
         if healthy is None:
             if bool(running) and crashed is False and ping_ok is True:
@@ -162,7 +163,7 @@ class CraftyAdapter:
             started_at=_first_datetime(payload, "started_at", "start_time", "started"),
             players_online=players,
             player_names=_extract_player_names(payload),
-            installed_version=_first_string(payload, "version", "installed_version"),
+            installed_version=parse_version_text(_first_value(payload, "version", "installed_version")),
             required_ports_ready=_first_bool(payload, "required_ports_ready", "ports_ready"),
         )
 
@@ -253,6 +254,72 @@ def _first_string(payload: dict[str, Any], *keys: str) -> str | None:
     if not isinstance(value, str) or len(value) > 256:
         return None
     return None if value.casefold() in {"false", "none", "null", ""} else value
+
+
+def _ping_health(value: Any) -> bool | None:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        normalized = value.strip().casefold()
+        if normalized == "true":
+            return True
+        if normalized == "false":
+            return False
+        try:
+            value = ast.literal_eval(value)
+        except (ValueError, SyntaxError):
+            return None
+    if isinstance(value, dict):
+        return all(bool(item) for item in value.values()) if value else None
+    if isinstance(value, list):
+        return all(bool(item) for item in value) if value else None
+    return None
+
+
+def parse_version_text(value: Any) -> str | None:
+    """Extract a bounded server version from a scalar or variables.txt body."""
+    if not isinstance(value, str):
+        return None
+    text = value.strip()
+    if not text:
+        return None
+
+    lines = text.splitlines()
+    fields: dict[str, str] = {}
+    for line in lines:
+        line = line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, candidate = line.split("=", 1)
+        fields[key.strip().upper()] = candidate.strip().strip('"').strip("'")
+
+    for key in _VERSION_KEYS:
+        candidate = fields.get(key)
+        if candidate and _VERSION_TOKEN.fullmatch(candidate):
+            return candidate[:_MAX_VERSION_LENGTH]
+
+    for key in ("SERVER_JAR", "JAR_FILE", "JAR"):
+        candidate = fields.get(key)
+        if candidate:
+            match = _VERSION_IN_TEXT.search(candidate)
+            if match:
+                return match.group(0)[:_MAX_VERSION_LENGTH]
+
+    for line in lines:
+        candidate = line.strip()
+        if not candidate or candidate.startswith("#") or "=" in candidate:
+            continue
+        match = _VERSION_IN_TEXT.search(candidate)
+        if match:
+            return match.group(0)[:_MAX_VERSION_LENGTH]
+
+    if len(lines) == 1:
+        if _VERSION_TOKEN.fullmatch(text):
+            return text[:_MAX_VERSION_LENGTH]
+        match = _VERSION_IN_TEXT.search(text)
+        if match:
+            return match.group(0)[:_MAX_VERSION_LENGTH]
+    return _UNKNOWN_VERSION
 
 
 def _first_datetime(payload: dict[str, Any], *keys: str) -> datetime | None:

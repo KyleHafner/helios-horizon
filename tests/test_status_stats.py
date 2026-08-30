@@ -19,7 +19,7 @@ async def test_status_records_running_names_and_closes_on_stop():
             return AdapterObservation(
                 running=self.running,
                 players_online=1 if self.running else 0,
-                player_names=("PlayerOne",) if self.running else (),
+                player_names=("Swag",) if self.running else (),
             )
 
     class Store:
@@ -43,10 +43,10 @@ async def test_status_records_running_names_and_closes_on_stop():
         clock=lambda: now,
     )
 
-    await service.snapshot()
+    await service.snapshot(persist=True)
     adapter.running = False
-    await service.snapshot()
+    await service.snapshot(persist=True)
 
-    assert store.records[0][0] == ("terraria-tmod", {"PlayerOne"}, 1)
+    assert store.records[0][0] == ("terraria-tmod", {"Swag"}, 1)
     assert store.records[0][1]["source"] == "log"
     assert store.stops[0][0] == ("terraria-tmod",)

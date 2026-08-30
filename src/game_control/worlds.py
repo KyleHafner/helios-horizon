@@ -36,12 +36,18 @@ class WorldService:
         backup_service: Any,
         stopped_check: Callable[..., bool] | None = None,
         clock: Callable[[], datetime] | None = None,
+        lease_check: Callable[[], bool] | None = None,
     ) -> None:
         self.vanilla = vanilla_profile
         self.tmod = tmod_profile
         self.backup_service = backup_service
         self.stopped_check = stopped_check
         self.clock = clock or (lambda: datetime.now(timezone.utc))
+        self.lease_check = lease_check
+
+    def _assert_lease(self) -> None:
+        if self.lease_check is not None and not self.lease_check():
+            raise SafeError("slot_conflict", "operation lease was lost before publication")
 
     def clone_vanilla_to_tmod(
         self,
@@ -78,6 +84,7 @@ class WorldService:
             os.chmod(target, 0o640)
             # Hard-linking is an exclusive publish on the same filesystem;
             # unlike replace(), it cannot overwrite a concurrent destination.
+            self._assert_lease()
             os.link(target, destination)
             target.unlink()
             os.rmdir(staging)

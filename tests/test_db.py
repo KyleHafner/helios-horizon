@@ -69,7 +69,7 @@ def test_fresh_jobs_schema_has_integer_completion_sequence(tmp_path: Path, monke
         for row in db.connection.execute("PRAGMA table_info(jobs)")
     }
     assert columns["completion_seq"].upper() == "INTEGER"
-    assert db.connection.execute("PRAGMA user_version").fetchone()[0] == 3
+    assert db.connection.execute("PRAGMA user_version").fetchone()[0] == 4
     db.close()
 
 
@@ -114,7 +114,7 @@ def test_backup_protection_schema_rejects_orphans_invalid_states_and_duplicate_k
     db.close()
 
 
-def test_legacy_jobs_migration_backfills_absolute_chronological_completion_sequence(
+def test_legacy_jobs_require_offline_migration(
     tmp_path: Path, monkeypatch
 ):
     directory = tmp_path / "state"
@@ -172,18 +172,8 @@ def test_legacy_jobs_migration_backfills_absolute_chronological_completion_seque
     raw.close()
     path.chmod(0o600)
 
-    db = StateDatabase.open(path)
-    assert db.connection.execute(
-        "SELECT id,completion_seq FROM jobs ORDER BY completion_seq"
-    ).fetchall() == [("row-c", 1), ("row-a", 2), ("row-b", 3)]
-    assert db.connection.execute("PRAGMA user_version").fetchone()[0] == 3
-    db.close()
-
-    reopened = StateDatabase.open(path)
-    assert reopened.connection.execute(
-        "SELECT id,completion_seq FROM jobs ORDER BY completion_seq"
-    ).fetchall() == [("row-c", 1), ("row-a", 2), ("row-b", 3)]
-    reopened.close()
+    with pytest.raises(RuntimeError, match="horizon-state-migrate"):
+        StateDatabase.open(path)
 
 
 def test_state_audit_and_events_are_append_only(tmp_path: Path, monkeypatch):
