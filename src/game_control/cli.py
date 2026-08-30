@@ -13,7 +13,7 @@ from collections.abc import Sequence
 from pathlib import Path
 from typing import Any
 
-from . import backup_command, capability_issue, deployment_verify, journal_evidence, jvm_args, session_revoke
+from . import backup_command, capability_issue, deployment_verify, journal_evidence, jvm_args, session_revoke, sunlit_update
 
 
 _UNSAFE_TEXT = re.compile(r"[;&|$`()<>\x00-\x1f]")
@@ -60,6 +60,13 @@ def _jvm(args: argparse.Namespace) -> int:
     if args.action == "activate":
         return jvm_args.activate()
     return jvm_args.rollback()
+
+
+def _sunlit(args: argparse.Namespace) -> int:
+    result = sunlit_update.run(check_only=args.check)
+    if result is not None:
+        print(result)
+    return 0
 
 
 def _reject_duplicate_options(argv: Sequence[str]) -> None:
@@ -136,7 +143,7 @@ def _parser() -> argparse.ArgumentParser:
     sunlit_commands = sunlit.add_subparsers(dest="sunlit_command", required=True)
     update = sunlit_commands.add_parser("update")
     update.add_argument("--check", action="store_true")
-    update.set_defaults(handler=_pending)
+    update.set_defaults(handler=_sunlit)
 
     return parser
 

@@ -68,20 +68,21 @@ def test_inactive_gate_defers_before_staging(monkeypatch) -> None:
 def test_systemd_timer_and_installer_are_wired() -> None:
     service = (ROOT / "ops/systemd/horizon-sunlit-auto-update.service").read_text(encoding="utf-8")
     timer = (ROOT / "ops/systemd/horizon-sunlit-auto-update.timer").read_text(encoding="utf-8")
+    from game_control.deployment_manifest import get_manifest
+
+    installed_names = {
+        spec.target.rsplit("/", 1)[-1]
+        for spec in get_manifest().files
+        if spec.target.startswith("/usr/local/libexec/")
+    }
     assert "ExecStart=/usr/local/libexec/horizon-sunlit-auto-update" in service
     assert "TimeoutStartSec=4h" in service
     assert "OnCalendar=*-*-* 05:00:00 America/New_York" in timer
     assert "Persistent=true" in timer
-    from game_control.deployment_manifest import get_manifest
-
-    helper_sources = {
-        spec.source.rsplit("/", 1)[-1]
-        for spec in get_manifest().files
-        if spec.target.startswith("/usr/local/libexec/")
-    }
-    assert {
+    for name in (
         "horizon-sunlit-auto-update",
         "horizon-sunlit-update-rpc",
         "horizon-sunlit-manifest",
         "horizon-sunlit-stage",
-    } <= helper_sources
+    ):
+        assert name in installed_names
