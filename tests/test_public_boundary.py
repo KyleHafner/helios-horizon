@@ -82,6 +82,20 @@ def test_example_absolute_path_must_use_the_explicit_namespace(tmp_path: Path) -
     assert _categories(root) == {("config/examples/profile.toml", 1, "example-path-namespace")}
 
 
+@pytest.mark.parametrize(
+    "value",
+    (
+        "/srv/example-minecraft/../../private",
+        "/etc/horizon-example/../private",
+        "file:///etc/horizon-example/profile.toml",
+    ),
+)
+def test_example_path_cannot_escape_or_bypass_the_namespace(tmp_path: Path, value: str) -> None:
+    root = _repository(tmp_path, {"config/examples/profile.toml": f'path = "{value}"\n'})
+
+    assert _categories(root) == {("config/examples/profile.toml", 1, "example-path-namespace")}
+
+
 def test_non_dns_programming_tokens_are_narrowly_exempt(tmp_path: Path) -> None:
     enum_token = "BackupDestination" + "." + "LOCAL"
     property_token = "user" + "." + "home"

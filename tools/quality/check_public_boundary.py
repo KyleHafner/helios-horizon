@@ -6,7 +6,7 @@ from __future__ import annotations
 import argparse
 from dataclasses import dataclass
 import ipaddress
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 import re
 import stat
 import subprocess
@@ -53,6 +53,7 @@ PRIVATE_DNS = re.compile(
     re.IGNORECASE,
 )
 ABSOLUTE_PATH = re.compile(r"(?<![A-Za-z0-9_.:/-])/(?:[A-Za-z0-9_.~!$&'()*+,;=:@%+-]+/?)+")
+FILE_URI = re.compile(r"(?<![A-Za-z0-9_.-])file:", re.IGNORECASE)
 
 REFUSED_NETWORKS = tuple(
     ipaddress.ip_network(".".join(parts) + suffix)
@@ -147,6 +148,13 @@ def _is_example_surface(relative: str) -> bool:
 
 
 def _allowed_example_path(value: str) -> bool:
+    if "\\" in value or "//" in value:
+        return False
+    candidate = PurePosixPath(value)
+    if not candidate.is_absolute() or any(part in {".", ".."} for part in candidate.parts):
+        return False
+    if candidate.as_posix() != value:
+        return False
     exact_prefixes = (
         "/etc/horizon-example",
         "/var/lib/horizon-example",
@@ -178,6 +186,8 @@ def _line_findings(relative: str, line_number: int, line: str) -> set[Finding]:
         if match.group(0) not in NON_DNS_TOKENS:
             findings.add(Finding(relative, line_number, "private-dns"))
     if _is_example_surface(relative):
+        if FILE_URI.search(line):
+            findings.add(Finding(relative, line_number, "example-path-namespace"))
         for match in ABSOLUTE_PATH.finditer(line):
             if not _allowed_example_path(match.group(0).rstrip("/")):
                 findings.add(Finding(relative, line_number, "example-path-namespace"))
