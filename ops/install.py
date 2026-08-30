@@ -206,9 +206,13 @@ class Installer:
 
     def _read_runtime_manifest(self) -> dict[str, tuple[str, str]]:
         manifest = self._runtime_manifest()
-        if not manifest.exists():
+        try:
+            manifest_stat = manifest.lstat()
+        except FileNotFoundError:
             return {}
-        if manifest.is_symlink() or not manifest.is_file():
+        except OSError as exc:
+            raise RuntimeError("runtime manifest is unreadable") from exc
+        if stat.S_ISLNK(manifest_stat.st_mode) or not stat.S_ISREG(manifest_stat.st_mode):
             raise RuntimeError("runtime manifest is not a regular file")
         entries: dict[str, tuple[str, str]] = {}
         for line in manifest.read_text(encoding="ascii").splitlines():
@@ -362,12 +366,28 @@ class Installer:
         for path in sorted(self._managed_parent_paths(expected_files, runtime_files), key=str):
             self._validate_existing_chain(path, "managed parent")
 
+    def _validate_file_directory_collisions(
+        self,
+        expected_files: dict[Path, tuple[Path, int]],
+    ) -> None:
+        directory_paths = {
+            path for path, _mode, _user, _group in self.directories()
+        }
+        for file_path in sorted(expected_files, key=str):
+            if any(
+                file_path == directory_path
+                or file_path in directory_path.parents
+                for directory_path in directory_paths
+            ):
+                raise RuntimeError(f"managed file/directory target collision: {file_path}")
+
     def _preflight_install(
         self,
         expected_files: dict[Path, tuple[Path, int]],
         runtime_files: dict[Path, tuple[Path, int]],
     ) -> None:
         self._validate_existing_chain(self.root, "install root")
+        self._validate_file_directory_collisions(expected_files)
         self._validate_boundaries(expected_files, runtime_files)
         for destination in sorted(expected_files, key=str):
             self._validate_managed_destination(destination, "managed destination")

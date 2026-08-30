@@ -1309,6 +1309,44 @@ def test_installer_rejects_stale_runtime_hardlink_before_removal_or_copy(tmp_pat
     assert outside_alias.exists()
 
 
+def test_runtime_manifest_reader_rejects_dangling_symlink_without_mutation(tmp_path: Path) -> None:
+    from ops.install import Installer
+
+    root = tmp_path / "root"
+    manifest = root / "opt/game-control/.horizon-runtime-manifest"
+    manifest.parent.mkdir(parents=True)
+    manifest.symlink_to(tmp_path / "outside-missing")
+    before = _filesystem_fingerprint(tmp_path)
+
+    with pytest.raises(RuntimeError, match="runtime manifest is not a regular file"):
+        Installer(root)._read_runtime_manifest()
+
+    assert _filesystem_fingerprint(tmp_path) == before
+
+
+def test_installer_rejects_declared_file_directory_collision_before_mutation(tmp_path: Path, monkeypatch) -> None:
+    from ops.install import Installer
+
+    root = tmp_path / "root"
+    installer = Installer(root, skip_systemd_verify=True)
+    collision = installer.target("/etc/game-control/game-control.toml")
+    original_directories = installer.directories
+    monkeypatch.setattr(
+        installer,
+        "directories",
+        lambda: (*original_directories(), (collision, 0o755, "root", "root")),
+    )
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (outside / "sentinel").write_bytes(b"outside-preserved\n")
+    before = _filesystem_fingerprint(tmp_path)
+
+    with pytest.raises(RuntimeError, match="managed file/directory target collision"):
+        installer.apply()
+
+    assert _filesystem_fingerprint(tmp_path) == before
+
+
 @pytest.mark.parametrize("kind", ("symlink", "hardlink"))
 def test_preflight_sources_rejects_source_links_without_target_mutation(tmp_path: Path, kind: str) -> None:
     from ops.install import Installer
