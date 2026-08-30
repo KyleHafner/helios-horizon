@@ -28,22 +28,24 @@ _RCON_LIST_RESPONSE = re.compile(
     r"(?: (?P<names>.*))?\Z"
 )
 _MINECRAFT_PLAYER_NAME = re.compile(r"\A[A-Za-z0-9_]{1,16}\Z")
-_SYSTEMD_ZONE_OFFSETS = {
-    "UTC": 0,
-    "GMT": 0,
-    # Helios runs in America/New_York. Keep this fallback deliberately narrow:
-    # abbreviations such as CST and BST are ambiguous across regions.
-    "EST": -5,
-    "EDT": -4,
-}
+_SYSTEMD_PROPERTY_KEY = re.compile(r"\A[A-Za-z_][A-Za-z0-9_]*\Z")
 
 
-def _systemd_fields(payload: bytes) -> dict[str, str]:
+def _systemd_fields(payload: bytes) -> dict[str, str] | None:
     fields: dict[str, str] = {}
-    for line in payload.decode("utf-8", "replace").splitlines():
+    try:
+        text = payload.decode("utf-8")
+    except UnicodeDecodeError:
+        return None
+    for line in text.splitlines():
         key, separator, value = line.partition("=")
-        if separator:
-            fields[key] = value.strip()
+        if (
+            not separator
+            or _SYSTEMD_PROPERTY_KEY.fullmatch(key) is None
+            or key in fields
+        ):
+            return None
+        fields[key] = value.strip()
     return fields
 
 
@@ -182,6 +184,8 @@ class SystemdAdapter:
         if code:
             return False
         fields = _systemd_fields(stdout)
+        if fields is None:
+            return False
         active = fields.get("ActiveState", "")
         job = fields.get("Job", "")
         allowed = {"inactive"} if require_inactive else {"inactive", "failed"}
@@ -225,13 +229,17 @@ class SystemdAdapter:
         if code:
             return AdapterObservation(running=False, healthy=False)
         fields = _systemd_fields(stdout)
+        if fields is None:
+            return AdapterObservation(running=False, healthy=False)
         active = fields.get("ActiveState", "")
         substate = fields.get("SubState", "")
         pid = _parse_pid(fields.get("MainPID", ""))
         running = active == "active" and substate in {"running", "listening", "exited"}
-        started_at = _parse_started_at(fields.get("ExecMainStartTimestamp", ""))
+        started_at = _parse_monotonic_started_at(
+            fields.get("ExecMainStartTimestampMonotonic", "")
+        )
         if started_at is None:
-            started_at = _parse_monotonic_started_at(fields.get("ExecMainStartTimestampMonotonic", ""))
+            started_at = _parse_started_at(fields.get("ExecMainStartTimestamp", ""))
         players_online = None
         player_names = None
         profile_id = getattr(profile.id, "value", str(profile.id))
@@ -348,33 +356,22 @@ def _parse_started_at(value: str) -> datetime | None:
     try:
         parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
     except ValueError:
-        # Python's %Z parser only accepts UTC/GMT and the process-local names;
-        # on a UTC CI runner it rejects a valid systemd `... EDT` value.  The
-        # deployment-local abbreviations emitted by systemd have fixed offsets
-        # here, so parse them without consulting the runner's TZ.
-        zone = value.rsplit(" ", 1)[-1]
-        offset_hours = _SYSTEMD_ZONE_OFFSETS.get(zone)
-        if offset_hours is not None:
+        base, separator, zone = value.rpartition(" ")
+        if not separator or zone not in {"UTC", "GMT"}:
             try:
-                parsed = datetime.strptime(
-                    value.rsplit(" ", 1)[0], "%a %Y-%m-%d %H:%M:%S"
-                ).replace(
-                    tzinfo=timezone(timedelta(hours=offset_hours), name=zone)
-                )
-                return parsed
+                parsed = datetime.strptime(value, "%a %Y-%m-%d %H:%M:%S %z")
             except ValueError:
                 return None
-        for fmt in ("%a %Y-%m-%d %H:%M:%S %Z", "%a %Y-%m-%d %H:%M:%S %z"):
-            try:
-                parsed = datetime.strptime(value, fmt)
-                if fmt.endswith("%Z"):
-                    parsed = parsed.astimezone()
-                break
-            except ValueError:
-                continue
         else:
-            return None
-    return parsed if parsed.tzinfo is not None else None
+            try:
+                parsed = datetime.strptime(base, "%a %Y-%m-%d %H:%M:%S").replace(
+                    tzinfo=timezone.utc
+                )
+            except ValueError:
+                return None
+    if parsed.tzinfo is None or parsed.utcoffset() is None:
+        return None
+    return parsed
 
 
 def _parse_monotonic_started_at(value: str) -> datetime | None:

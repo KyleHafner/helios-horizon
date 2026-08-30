@@ -1,4 +1,7 @@
 import asyncio
+import os
+import subprocess
+import sys
 import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -235,6 +238,63 @@ async def test_observe_parses_hostile_properties_without_trusting_partial_values
     assert observation.required_ports_ready is None
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "payload",
+    [
+        b"ActiveState=active\nSubState=running\nMainPID=987\n"
+        b"ActiveState=inactive\n",
+        b"ActiveState=active\nSubState=running\nMainPID=987\n"
+        b"malformed-property\n",
+        b"ActiveState=active\nSubState=running\nMainPID=987\n=empty-key\n",
+        b"ActiveState=active\nSubState=running\nMainPID=987\ninvalid key=value\n",
+        b"ActiveState=active\nSubState=running\nMainPID=987\ninvalid utf8=\xff\n",
+    ],
+)
+async def test_duplicate_or_malformed_systemd_properties_fail_closed(payload: bytes) -> None:
+    observation = await _observe_from(payload)
+    assert observation.running is False
+    assert observation.healthy is False
+    assert observation.pid is None
+    assert observation.started_at is None
+
+
+@pytest.mark.asyncio
+async def test_stop_settle_rejects_duplicate_or_malformed_systemd_properties() -> None:
+    adapter = SystemdAdapter()
+
+    async def run(_argv, **_kwargs):
+        return 0, b"ActiveState=inactive\nActiveState=failed\nJob=\n", b""
+
+    adapter._run = run
+    assert await adapter._stop_job_settled(_profile()) is False
+
+
+@pytest.mark.asyncio
+async def test_observe_prefers_monotonic_activation_over_realtime(monkeypatch) -> None:
+    fixed_now = 1_000_000.0
+    monkeypatch.setattr(systemd_module.time, "monotonic", lambda: fixed_now)
+    observation = await _observe_from(
+        (
+            f"ActiveState=active\nSubState=running\nMainPID=987\n"
+            f"ExecMainStartTimestamp=Mon 2026-07-13 08:00:00 EDT\n"
+            f"ExecMainStartTimestampMonotonic={int((fixed_now - 2) * 1_000_000)}\n"
+        ).encode()
+    )
+    assert observation.started_at is not None
+    assert observation.started_at.tzinfo == timezone.utc
+
+
+@pytest.mark.asyncio
+async def test_observe_falls_back_to_explicit_realtime_when_monotonic_unusable() -> None:
+    observation = await _observe_from(
+        b"ActiveState=active\nSubState=running\nMainPID=987\n"
+        b"ExecMainStartTimestamp=2026-07-13T12:00:00+00:00\n"
+        b"ExecMainStartTimestampMonotonic=not-a-number\n"
+    )
+    assert observation.started_at == datetime(2026, 7, 13, 12, tzinfo=timezone.utc)
+
+
 @pytest.mark.parametrize("value", ["", "n/a", "0", "not-a-date", "Mon 2026-07-13 12:00:00"])
 def test_parse_started_at_rejects_empty_invalid_and_naive_values(value) -> None:
     assert systemd_module._parse_started_at(value) is None
@@ -246,7 +306,9 @@ def test_parse_started_at_rejects_empty_invalid_and_naive_values(value) -> None:
         "2026-07-13T12:00:00Z",
         "2026-07-13T12:00:00+00:00",
         "Mon 2026-07-13 12:00:00 UTC",
+        "Mon 2026-07-13 12:00:00 GMT",
         "Mon 2026-07-13 08:00:00 -0400",
+        "Mon 2026-07-13 17:30:00 +05:30",
     ],
 )
 def test_parse_started_at_accepts_aware_systemd_formats(value) -> None:
@@ -255,25 +317,36 @@ def test_parse_started_at_accepts_aware_systemd_formats(value) -> None:
     assert parsed.tzinfo is not None
 
 
-def test_parse_started_at_interprets_dst_abbreviation_as_host_local_time() -> None:
-    parsed = systemd_module._parse_started_at("Mon 2026-07-13 08:00:00 EDT")
-    assert parsed is not None
-    assert parsed.tzname() == "EDT"
-    assert parsed.utcoffset() == timedelta(hours=-4)
-
-
 @pytest.mark.parametrize(
-    ("value", "offset"),
+    "value",
     [
-        ("Mon 2026-01-12 08:00:00 EST", timedelta(hours=-5)),
-        ("Mon 2026-07-13 08:00:00 EDT", timedelta(hours=-4)),
-        ("Mon 2026-07-13 12:00:00 UTC", timedelta(0)),
+        "Mon 2026-01-12 08:00:00 EST",
+        "Mon 2026-07-13 08:00:00 EDT",
+        "Mon 2026-07-13 08:00:00 CST",
     ],
 )
-def test_parse_started_at_abbreviations_are_independent_of_runner_timezone(value, offset) -> None:
-    parsed = systemd_module._parse_started_at(value)
-    assert parsed is not None
-    assert parsed.utcoffset() == offset
+def test_parse_started_at_rejects_unconfigured_abbreviations(value) -> None:
+    assert systemd_module._parse_started_at(value) is None
+
+
+@pytest.mark.parametrize("tz_name", ["UTC", "Pacific/Honolulu"])
+def test_parse_started_at_is_independent_of_process_timezone(tz_name) -> None:
+    script = (
+        "from game_control.adapters.systemd import _parse_started_at\n"
+        "print(_parse_started_at('Mon 2026-07-13 08:00:00 -0400').isoformat())\n"
+    )
+    environment = os.environ.copy()
+    environment["PYTHONPATH"] = str(Path(__file__).parents[1] / "src")
+    environment["TZ"] = tz_name
+    result = subprocess.run(
+        [sys.executable, "-c", script],
+        cwd=Path(__file__).parents[1],
+        env=environment,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    assert result.stdout.strip() == "2026-07-13T08:00:00-04:00"
 
 
 @pytest.mark.parametrize("value", ["", "not-a-pid", "0", "-1", "  "])
