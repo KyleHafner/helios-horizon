@@ -99,7 +99,7 @@ def test_b2_argv_has_fixed_remote_cryptcheck_and_no_shell_or_credentials(tmp_pat
         calls.append((argv, kwargs))
         return subprocess.CompletedProcess(argv, 0, stdout=b"[]", stderr=b"")
 
-    monkeypatch.setattr("game_control.interim_maintenance_control.active_block_schedulers", lambda: ("none",))
+    monkeypatch.setattr("game_control.maintenance_process.active_block_schedulers", lambda: ("none",))
     transport = B2CommandTransport(runner=runner, credential_validator=lambda: None)
     key = "helios/horizon/app/minecraft-sunlit-cobblemon/20260805T000000000000Z-0123456789ab.tar.zst"
     stage_dir = tmp_path / "stage"

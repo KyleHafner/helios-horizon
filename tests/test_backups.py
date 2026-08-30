@@ -110,7 +110,7 @@ def test_offline_archive_runner_receives_maintenance_prefix(tmp_path: Path, monk
     (profile.paths.mutable_root / "world.wld").write_text("world")
     calls = []
 
-    monkeypatch.setattr("game_control.interim_maintenance_control.active_block_schedulers", lambda: ("none",))
+    monkeypatch.setattr("game_control.maintenance_process.active_block_schedulers", lambda: ("none",))
 
     def fail_tar(argv, **_kwargs):
         calls.append(argv)
@@ -129,7 +129,7 @@ def test_online_archive_runner_receives_maintenance_prefix(tmp_path: Path, monke
     (profile.paths.mutable_root / "world.wld").write_text("world")
     calls = []
 
-    monkeypatch.setattr("game_control.interim_maintenance_control.active_block_schedulers", lambda: ("none",))
+    monkeypatch.setattr("game_control.maintenance_process.active_block_schedulers", lambda: ("none",))
 
     class Online:
         def save_off(self):
@@ -161,7 +161,7 @@ def test_external_zstd_reader_receives_maintenance_prefix(tmp_path: Path, monkey
 
     observed = []
     real_popen = backups.subprocess.Popen
-    monkeypatch.setattr("game_control.interim_maintenance_control.active_block_schedulers", lambda: ("none",))
+    monkeypatch.setattr("game_control.maintenance_process.active_block_schedulers", lambda: ("none",))
 
     def recording_popen(argv, *args, **kwargs):
         observed.append(argv)

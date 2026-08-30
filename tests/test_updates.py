@@ -247,7 +247,7 @@ def test_minecraft_is_manual_only(tmp_path: Path):
 
 def test_pz_uses_fixed_steamcmd_argv(tmp_path: Path, monkeypatch):
     profile = _profile(tmp_path, ProfileId.PZ_RISING, "steamcmd_in_place")
-    monkeypatch.setattr("game_control.interim_maintenance_control.active_block_schedulers", lambda: ("none",))
+    monkeypatch.setattr("game_control.maintenance_process.active_block_schedulers", lambda: ("none",))
     seen: list[list[str]] = []
     service = UpdateService(
         profiles={profile.id.value: profile},

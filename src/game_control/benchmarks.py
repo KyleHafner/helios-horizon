@@ -28,7 +28,7 @@ from .driver_preflight import (
     _validate_frozen_provenance,
     _validate_preflight_payload,
 )
-from .interim_maintenance_control import maintenance_popen
+from .maintenance_process import maintenance_popen
 from .models import ProfileId
 from .protocol import (
     BenchmarkMetricView,

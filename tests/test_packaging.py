@@ -394,7 +394,7 @@ def test_phase4_slices_and_fixed_maintenance_template_are_bounded() -> None:
     assert "MemoryHigh=2G" in maintenance and "MemoryMax=3G" in maintenance
     assert "MemorySwapMax=0" in horizon and "MemorySwapMax=0" in maintenance
     assert "io.max" not in (horizon + maintenance)
-    from game_control.interim_maintenance_control import maintenance_argv
+    from game_control.maintenance_process import maintenance_argv
     wrapped = maintenance_argv(["/usr/bin/tar", "--create"], slice_name="maintenance.slice", schedulers=("none",))
     assert wrapped[:6] == ["/usr/bin/systemd-run", "--wait", "--pipe", "--quiet", "--service-type=exec", "--slice=maintenance.slice"]
     assert "--" in wrapped and wrapped[-2:] == ["/usr/bin/tar", "--create"]
@@ -835,7 +835,7 @@ def test_installer_applies_runtime_sources_verifier_and_safe_stale_cleanup(tmp_p
     assert apply.returncode == 0, apply.stderr
 
     for relative in (
-        "src/game_control/interim_maintenance_control.py",
+        "src/game_control/maintenance_process.py",
         "src/game_control/introspection.py",
         "src/game_control/telemetry_db.py",
         "scripts/verify-deployed.py",

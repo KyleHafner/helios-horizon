@@ -25,7 +25,7 @@ import httpx
 
 from .adapters.crafty import parse_version_text
 from .errors import SafeError
-from .interim_maintenance_control import maintenance_argv
+from .maintenance_process import maintenance_argv
 from .protocol import UpdateStatus
 from .protocol import JobAccepted
 from .backups import BackupService

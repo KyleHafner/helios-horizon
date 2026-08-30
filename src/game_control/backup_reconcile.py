@@ -21,7 +21,7 @@ from typing import Any, Iterable
 
 from .backups import B2CommandTransport, RemoteObject, b2_prefix
 from .errors import SafeError
-from .interim_maintenance_control import maintenance_argv, maintenance_popen
+from .maintenance_process import maintenance_argv, maintenance_popen
 
 
 RETAINED_PROFILE_IDS = (

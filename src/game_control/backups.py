@@ -29,7 +29,7 @@ from pathlib import Path, PurePosixPath
 from typing import Any, Callable, Iterable, Mapping, Protocol
 
 from .errors import SafeError
-from .interim_maintenance_control import maintenance_argv, maintenance_popen
+from .maintenance_process import maintenance_argv, maintenance_popen
 from .models import BackupDestination, ProfileId
 from .protocol import BackupPage, BackupSummary, JobAccepted
 

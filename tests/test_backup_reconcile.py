@@ -65,7 +65,7 @@ def test_zstd_manifest_fallback_reads_only_cap_plus_one(tmp_path, monkeypatch):
             observed["timeout"] = timeout
             return -9
 
-    monkeypatch.setattr("game_control.interim_maintenance_control.active_block_schedulers", lambda: ("none",))
+    monkeypatch.setattr("game_control.maintenance_process.active_block_schedulers", lambda: ("none",))
 
     def popen(argv, *args, **kwargs):
         observed["commands"].append(argv)

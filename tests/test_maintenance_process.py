@@ -1,9 +1,14 @@
+import importlib.util
 from pathlib import Path
 import subprocess
 
 import pytest
 
-from game_control import interim_maintenance_control as control
+from game_control import maintenance_process as control
+
+
+def test_old_interim_module_has_no_compatibility_alias() -> None:
+    assert importlib.util.find_spec("game_control.interim_maintenance_control") is None
 
 
 def test_scheduler_probe_reports_active_bracketed_name(tmp_path: Path):
