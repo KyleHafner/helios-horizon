@@ -32,7 +32,6 @@ def _load_deployment_manifest():
 
 _DEPLOYMENT_MANIFEST = _load_deployment_manifest()
 _STATIC_SPECS = _DEPLOYMENT_MANIFEST.files
-_FILES_BY_TARGET = {spec.target: spec for spec in _STATIC_SPECS}
 ACTIVE_PROFILE_IDS = tuple(profile.id for profile in _DEPLOYMENT_MANIFEST.profiles)
 PROFILE_FILES = tuple(PACKAGE_ROOT / profile.profile_source for profile in _DEPLOYMENT_MANIFEST.profiles)
 RUNNER_FILES = tuple(PACKAGE_ROOT / profile.runner_source for profile in _DEPLOYMENT_MANIFEST.profiles)
@@ -52,7 +51,7 @@ RUNTIME_VERIFIER = PACKAGE_ROOT / "scripts/verify-deployed.py"
 RUNTIME_SUPPORT_FILES = tuple((PACKAGE_ROOT / spec.source, spec.source, spec.mode) for spec in _DEPLOYMENT_MANIFEST.runtime_support)
 RUNTIME_MANIFEST_PATH = _DEPLOYMENT_MANIFEST.runtime_manifest.target
 RUNTIME_MANIFEST_VERSION = _DEPLOYMENT_MANIFEST.runtime_manifest.version
-HELPER_FILES = {spec.target.removeprefix("/usr/local/libexec/"): (PACKAGE_ROOT / spec.source, spec.mode) for spec in _STATIC_SPECS if spec.target.startswith("/usr/local/libexec/")}
+GENERATED_ENTRY_POINT = _DEPLOYMENT_MANIFEST.generated_entry_point
 SUNLIT_LIBRARIES_LINK = _DEPLOYMENT_MANIFEST.symlinks[0].target
 SUNLIT_LIBRARIES_TARGET = _DEPLOYMENT_MANIFEST.symlinks[0].link_target
 FIXED_B2_SECRET_PATH = next(secret.target for secret in _DEPLOYMENT_MANIFEST.secrets if secret.name == "b2")
@@ -623,6 +622,31 @@ class Installer:
         self._chown(destination, "root", "root")
         os.chmod(destination, 0o600)
 
+    def _verify_generated_entry_point(self) -> None:
+        """Verify pip created the declared console script in the live venv."""
+        spec = GENERATED_ENTRY_POINT
+        destination = self.target(spec.target)
+        try:
+            info = destination.lstat()
+        except FileNotFoundError as exc:
+            raise RuntimeError(f"generated entry point is absent: {destination}") from exc
+        except OSError as exc:
+            raise RuntimeError(f"generated entry point cannot be inspected: {destination}") from exc
+        if stat.S_ISLNK(info.st_mode) or not stat.S_ISREG(info.st_mode):
+            raise RuntimeError(f"generated entry point is not a regular file: {destination}")
+        if info.st_nlink != 1:
+            raise RuntimeError(f"generated entry point has unexpected link count: {destination}")
+        if info.st_uid != 0 or info.st_gid != 0:
+            raise RuntimeError(f"generated entry point ownership drift: {destination}")
+        if stat.S_IMODE(info.st_mode) != spec.mode:
+            raise RuntimeError(f"generated entry point mode drift: {destination}")
+        try:
+            contents = destination.read_text(encoding="utf-8")
+        except (OSError, UnicodeError) as exc:
+            raise RuntimeError(f"generated entry point is unreadable: {destination}") from exc
+        if spec.module not in contents:
+            raise RuntimeError(f"generated entry point target drift: {destination}")
+
     def _create_link(self, destination: Path, target: str) -> None:
         self._validate_existing_chain(destination.parent, "link parent")
         self._validate_link_destination(destination, target)
@@ -744,6 +768,7 @@ class Installer:
                 )
             finally:
                 os.umask(previous_umask)
+            self._verify_generated_entry_point()
         if not self.skip_systemd_verify:
             units = [
                 str(path)

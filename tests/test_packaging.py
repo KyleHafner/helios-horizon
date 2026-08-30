@@ -638,11 +638,11 @@ def test_installer_manifest_is_explicitly_three_profile_and_legacy_free() -> Non
     assert expected[Path("/tmp/etc/nftables.conf")][0] == NFTABLES
     assert Path("/tmp/usr/local/libexec/game-sunlit-stop") in expected
     assert Path("/tmp/usr/local/libexec/game-sunlit-prepare") in expected
-    assert Path("/tmp/usr/local/libexec/horizon-capability-issue") in expected
+    assert Path("/tmp/usr/local/libexec/horizon-capability-issue") not in expected
     assert Path("/tmp/etc/game-control/lazymc/server.properties") in expected
     assert Path("/tmp/usr/local/libexec/horizon-alert-notify") in expected
     assert Path("/tmp/usr/local/libexec/horizon-bore-liveness") in expected
-    assert Path("/tmp/usr/local/libexec/horizon-state-migrate") in expected
+    assert Path("/tmp/usr/local/libexec/horizon-state-migrate") not in expected
     assert {
         path.name: expected[Path(f"/tmp/opt/game-control/web/{path.name}")]
         for path in WEB_FILES
@@ -957,15 +957,14 @@ def test_installed_installer_is_self_contained_for_check_and_idempotent_reapply(
     assert second.returncode == 0, second.stderr + second.stdout
 
 
-def test_phase2_readonly_harnesses_are_packaged_and_executable(tmp_path: Path) -> None:
+def test_wave5_retired_acceptance_helpers_are_excluded_from_fresh_projection(tmp_path: Path) -> None:
     from ops.install import Installer
     installer = Installer(tmp_path / "root", skip_systemd_verify=True)
     installer.apply()
     for name in ("horizon-phase2-threshold", "horizon-phase2-collect",
                  "horizon-phase2-browser-evidence", "horizon-phase2-live-acceptance"):
         destination = tmp_path / "root/usr/local/libexec" / name
-        assert destination.is_file(), name
-        assert stat.S_IMODE(destination.stat().st_mode) == 0o755
+        assert not destination.exists(), name
 
 
 def test_libexec_directory_is_searchable_by_game_service_users(tmp_path: Path) -> None:
@@ -979,14 +978,13 @@ def test_libexec_directory_is_searchable_by_game_service_users(tmp_path: Path) -
     assert stat.S_IMODE(libexec.stat().st_mode) == 0o755
 
 
-def test_phase1_phase4_operator_helpers_are_packaged_with_expected_modes(tmp_path: Path) -> None:
+def test_wave5_retired_operator_helpers_are_excluded_from_fresh_projection(tmp_path: Path) -> None:
     from ops.install import Installer
     installer = Installer(tmp_path / "root", skip_systemd_verify=True)
     installer.apply()
     for name in ("horizon-jvm-args", "horizon-telemetry-migrate"):
         destination = tmp_path / "root/usr/local/libexec" / name
-        assert destination.is_file(), name
-        assert stat.S_IMODE(destination.stat().st_mode) == 0o755
+        assert not destination.exists(), name
 
 
 def test_runtime_manifest_fails_closed_for_changed_stale_and_unsafe_paths(tmp_path: Path) -> None:

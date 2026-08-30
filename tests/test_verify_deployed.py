@@ -544,21 +544,15 @@ def test_static_verifier_accepts_complete_vm_target_root(tmp_path, capsys):
     }
 
 
-@pytest.mark.parametrize(
-    ("relative", "marker"),
-    (
-        ("usr/local/libexec/horizon-phase2-browser-evidence", "phase2.1.browser.v2"),
-        ("usr/local/libexec/horizon-phase2-live-acceptance", "def _order_contract"),
-    ),
-)
-def test_static_verifier_rejects_phase2_harness_contract_drift(tmp_path, capsys, relative, marker):
+def test_static_verifier_rejects_undeclared_phase2_helper(tmp_path, capsys):
     root = _staged_root(tmp_path)
-    path = root / relative
-    path.write_text(path.read_text(encoding="utf-8").replace(marker, "contract-drift", 1), encoding="utf-8")
+    path = root / "usr/local/libexec/horizon-phase2-collect"
+    path.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+    path.chmod(0o755)
     assert VERIFY.main(["--root", str(root), "--static"]) == 1
     payload = json.loads(capsys.readouterr().out)
     checks = {item["id"]: item for item in payload["checks"]}
-    assert checks["target.platform_controls"]["ok"] is False
+    assert checks["target.libexec.manifest"]["ok"] is False
 
 
 def test_static_verifier_rejects_retired_manifest_artifact(tmp_path, capsys):

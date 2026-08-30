@@ -82,7 +82,7 @@ def test_systemd_timer_and_installer_are_wired() -> None:
     for name in (
         "horizon-sunlit-auto-update",
         "horizon-sunlit-update-rpc",
-        "horizon-sunlit-manifest",
-        "horizon-sunlit-stage",
     ):
         assert name in installed_names
+    assert "horizon-sunlit-manifest" not in installed_names
+    assert "horizon-sunlit-stage" not in installed_names

@@ -656,7 +656,6 @@ def _check_target_package(checks: Checks) -> None:
         "ops/journald/horizon.conf": (0o644, ("Storage=persistent", "SystemMaxUse=1G", "MaxRetentionSec=14day")),
         "ops/journald/horizon-private-measurement.conf": (0o644, ("RateLimitIntervalSec=0", "RateLimitBurst=0")),
         "ops/bin/game-sunlit-prepare": (0o755, ("MUTABLE_ROOT", "TARGET")),
-        "ops/bin/horizon-capability-issue": (0o755, ("lazymc-waker", "helios-mcp-observer", "helios-mcp-waker")),
         "ops/bin/horizon-lazymc-wake": (0o755, ("run_wake_hook",)),
         "ops/bin/game-sunlit-rcon-prepare": (0o755, ("CREDENTIALS_DIRECTORY", "rcon.password")),
         "ops/bin/game-sunlit-stop": (0o755, ("STOP_MARKERS",)),
@@ -669,21 +668,6 @@ def _check_target_package(checks: Checks) -> None:
                 "FAILURE_WINDOW_SECONDS",
                 "_local_client_sessions_present",
             ),
-        ),
-        "ops/bin/horizon-journal-evidence": (0o755, ("horizon_journal",)),
-        "ops/bin/horizon-journal-finalize": (0o755, ("finalize",)),
-        "ops/bin/horizon_journal.py": (0o644, ("RateLimitBurst", "two distinct complete boots")),
-        "ops/bin/horizon-state-migrate": (0o755, ("RETAINED_PROFILES", "BEGIN EXCLUSIVE")),
-        "ops/bin/horizon-jvm-args": (0o755, ("managed Sunlit JVM argfile", "load_accepted_campaign")),
-        "ops/bin/horizon-memory-drill": (0o755, ("horizon-memory-drill.v1", "MemorySwapMax", "OOMPolicy")),
-        "ops/bin/horizon-telemetry-migrate": (0o755, ("telemetry DB importer", "MigrationError")),
-        "ops/bin/horizon-phase2-threshold": (0o755, ("SKIP_PUSH", "INCONCLUSIVE")),
-        "ops/bin/horizon-phase2-collect": (0o755, ("api/v1/status", "readOnly")),
-        "scripts/phase2-browser-evidence.py": (
-            0o755, ("phase2.1.browser.v2", "horizon:status-applied", "resume_authoritative_status_requests")
-        ),
-        "ops/bin/horizon-phase2-live-acceptance": (
-            0o755, ("phase2.live.fixture.v1", "written to stdout only", "def _order_contract")
         ),
         "web/app.js": (0o644, ("const PROFILE_FALLBACK",)),
         "web/commands.js": (0o644, ("window.HORIZON_COMMANDS",)),

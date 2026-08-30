@@ -211,6 +211,26 @@ class RuntimeManifestSpec:
 
 
 @dataclass(frozen=True, slots=True)
+class GeneratedEntryPointSpec:
+    name: str
+    target: str
+    module: str
+    mode: int = 0o755
+    owner: str = "root"
+    group: str = "root"
+
+    def __post_init__(self) -> None:
+        if not self.name or "/" in self.name or "\\" in self.name:
+            raise ValueError("invalid generated entry-point name")
+        _target(self.target, "generated entry-point target")
+        if not self.module or ":" not in self.module or any(char.isspace() for char in self.module):
+            raise ValueError("invalid generated entry-point module")
+        _mode(self.mode)
+        if not self.owner or not self.group:
+            raise ValueError("generated entry-point owner/group must be non-empty")
+
+
+@dataclass(frozen=True, slots=True)
 class RelayModeSpec:
     name: str
     expectations: tuple[tuple[str, bool], ...]
@@ -235,6 +255,7 @@ class DeploymentManifest:
     secrets: tuple[SecretSpec, ...]
     databases: tuple[DatabaseSpec, ...]
     runtime_manifest: RuntimeManifestSpec
+    generated_entry_point: GeneratedEntryPointSpec
     relay_modes: tuple[RelayModeSpec, ...]
     runtime_sources: tuple[str, ...]
     runtime_support: tuple[FileSpec, ...]
@@ -365,6 +386,19 @@ def _file(source: str, target: str, mode: int = 0o644, category: str = "static")
     return FileSpec(source, target, mode, category=category)
 
 
+FIXED_LIBEXEC_NAMES = (
+    "game-slot-run", "game-console-stop", "game-console-command",
+    "game-sunlit-prepare", "game-sunlit-rcon-prepare", "game-sunlit-stop",
+    "horizon-alert-notify", "horizon-bore-liveness", "horizon-lazymc-wake",
+    "horizon-sunlit-auto-update", "horizon-sunlit-update-rpc",
+)
+ABSENT_LIBEXEC_NAMES = (
+    "horizon-sunlit-manifest", "horizon-sunlit-stage", "horizon-sunlit-promote",
+    "horizon_journal.py", "horizon-state-migrate", "horizon-telemetry-migrate",
+    "horizon-memory-drill", "horizon-phase2-threshold", "horizon-phase2-collect",
+    "horizon-phase2-browser-evidence", "horizon-phase2-live-acceptance",
+)
+
 _FILES = (
     *tuple(_file(p.profile_source, f"/etc/game-control/profiles.d/{p.id}.toml") for p in _PROFILES),
     *tuple(_file(p.runner_source, f"/etc/game-control/runner.d/{p.id}.json") for p in _PROFILES),
@@ -378,13 +412,7 @@ _FILES = (
     _file("ops/systemd/minecraft-sunlit-cobblemon.service.d/gc-telemetry.conf", "/etc/systemd/system/minecraft-sunlit-cobblemon.service.d/gc-telemetry.conf"),
     *tuple(_file(f"ops/systemd/{name}", f"/etc/systemd/system/{name}") for name in ("games.slice", "horizon.slice", "maintenance.slice")),
     _file("ops/tmpfiles/game-control.conf", "/usr/lib/tmpfiles.d/game-control.conf"),
-    *tuple(_file("scripts/phase2-browser-evidence.py" if name == "horizon-phase2-browser-evidence" else f"ops/bin/{name}", f"/usr/local/libexec/{name}", 0o644 if name == "horizon_journal.py" else 0o755) for name in (
-        "game-slot-run", "game-console-stop", "game-console-command", "game-sunlit-prepare", "game-sunlit-rcon-prepare", "game-sunlit-stop",
-        "horizon-capability-issue", "horizon-alert-notify", "horizon-backup-reconcile", "horizon-sunlit-promote", "horizon-sunlit-manifest",
-        "horizon-sunlit-stage", "horizon-sunlit-auto-update", "horizon-sunlit-update-rpc", "horizon-bore-liveness", "horizon-lazymc-wake",
-        "horizon-journal-evidence", "horizon-journal-finalize", "horizon_journal.py", "horizon-session-revoke-all", "horizon-state-migrate",
-        "horizon-telemetry-migrate", "horizon-jvm-args", "horizon-memory-drill", "horizon-phase2-threshold", "horizon-phase2-collect",
-        "horizon-phase2-browser-evidence", "horizon-phase2-live-acceptance")),
+    *tuple(_file(f"ops/bin/{name}", f"/usr/local/libexec/{name}", 0o755) for name in FIXED_LIBEXEC_NAMES),
     _file("config/game-control.toml", "/etc/game-control/game-control.toml", 0o600),
     _file("ops/lazymc/lazymc.toml", "/etc/game-control/lazymc/lazymc.toml"),
     _file("ops/lazymc/server.properties", "/etc/game-control/lazymc/server.properties"),
@@ -418,7 +446,7 @@ _DIRECTORIES = (
 
 _RUNTIME_SOURCES = tuple(
     "src/" + name for name in (
-        "game_control/__init__.py", "game_control/adapters/__init__.py", "game_control/adapters/base.py", "game_control/adapters/crafty.py", "game_control/adapters/systemd.py", "game_control/runtime/__init__.py", "game_control/runtime/alerts.py", "game_control/runtime/protocols.py", "game_control/runtime/telemetry.py", "game_control/alert_policy.py", "game_control/api.py", "game_control/auth.py", "game_control/backup_reconcile.py", "game_control/backups.py", "game_control/benchmark_safety.py", "game_control/benchmarks.py", "game_control/capability.py", "game_control/capability_evidence.py", "game_control/controller.py", "game_control/db_telemetry.py", "game_control/driver_preflight.py", "game_control/errors.py", "game_control/gc_telemetry.py", "game_control/health.py", "game_control/history_queries.py", "game_control/idle_stop.py", "game_control/interim_maintenance_control.py", "game_control/introspection.py", "game_control/lazymc.py", "game_control/log_follower.py", "game_control/logs.py", "game_control/managed_tuning.py", "game_control/memory_drill.py", "game_control/metrics.py", "game_control/models.py", "game_control/modpack_update.py", "game_control/notifications.py", "game_control/perf.py", "game_control/phase2_collector.py", "game_control/phase2_threshold.py", "game_control/players.py", "game_control/profile.py", "game_control/profile_config.py", "game_control/protocol.py", "game_control/push.py", "game_control/rcon.py", "game_control/rcon_telemetry.py", "game_control/redaction.py", "game_control/root_state.py", "game_control/schedule.py", "game_control/schedule_config.py", "game_control/service_container.py", "game_control/service_wiring.py", "game_control/session_store.py", "game_control/sessions.py", "game_control/slot.py", "game_control/slotd_main.py", "game_control/state_db.py", "game_control/stats_queries.py", "game_control/status.py", "game_control/telemetry_db.py", "game_control/telemetry_migration.py", "game_control/telemetry_sampler.py", "game_control/tick_telemetry.py", "game_control/tps.py", "game_control/updates.py", "game_control/web_db.py", "game_control/web_main.py", "game_control/worlds.py"))
+        "game_control/__init__.py", "game_control/adapters/__init__.py", "game_control/adapters/base.py", "game_control/adapters/crafty.py", "game_control/adapters/systemd.py", "game_control/runtime/__init__.py", "game_control/runtime/alerts.py", "game_control/runtime/protocols.py", "game_control/runtime/telemetry.py", "game_control/alert_policy.py", "game_control/api.py", "game_control/auth.py", "game_control/_fixed_helper.py", "game_control/backup_command.py", "game_control/backup_reconcile.py", "game_control/backups.py", "game_control/benchmark_safety.py", "game_control/benchmarks.py", "game_control/capability.py", "game_control/capability_evidence.py", "game_control/capability_issue.py", "game_control/cli.py", "game_control/controller.py", "game_control/db_telemetry.py", "game_control/deployment_verify.py", "game_control/driver_preflight.py", "game_control/errors.py", "game_control/gc_telemetry.py", "game_control/health.py", "game_control/history_queries.py", "game_control/idle_stop.py", "game_control/interim_maintenance_control.py", "game_control/introspection.py", "game_control/journal_evidence.py", "game_control/jvm_args.py", "game_control/lazymc.py", "game_control/log_follower.py", "game_control/logs.py", "game_control/managed_tuning.py", "game_control/memory_drill.py", "game_control/metrics.py", "game_control/models.py", "game_control/modpack_update.py", "game_control/notifications.py", "game_control/perf.py", "game_control/phase2_collector.py", "game_control/phase2_threshold.py", "game_control/players.py", "game_control/profile.py", "game_control/profile_config.py", "game_control/protocol.py", "game_control/push.py", "game_control/rcon.py", "game_control/rcon_telemetry.py", "game_control/redaction.py", "game_control/root_state.py", "game_control/schedule.py", "game_control/schedule_config.py", "game_control/service_container.py", "game_control/service_wiring.py", "game_control/session_revoke.py", "game_control/session_store.py", "game_control/sessions.py", "game_control/slot.py", "game_control/slotd_main.py", "game_control/state_db.py", "game_control/stats_queries.py", "game_control/status.py", "game_control/sunlit_manifest.py", "game_control/sunlit_promote.py", "game_control/sunlit_stage.py", "game_control/sunlit_update.py", "game_control/telemetry_db.py", "game_control/telemetry_migration.py", "game_control/telemetry_sampler.py", "game_control/tick_telemetry.py", "game_control/tps.py", "game_control/updates.py", "game_control/web_db.py", "game_control/web_main.py", "game_control/worlds.py"))
 
 _DIRECTORY_SPECS = tuple(
     replace(
@@ -439,6 +467,7 @@ _MANIFEST = DeploymentManifest(
     (SecretSpec("b2", "/etc/game-control/secrets.d/horizon-b2-rclone.conf"), SecretSpec("rcon", "/etc/game-control/secrets.d/minecraft-rcon-password")),
     (DatabaseSpec("state", "/var/lib/game-control/state.db"), DatabaseSpec("web", "/var/lib/game-control-web/web.db")),
     RuntimeManifestSpec("/opt/game-control/.horizon-runtime-manifest", "1"),
+    GeneratedEntryPointSpec("horizon", "/opt/game-control/.venv/bin/horizon", "game_control.cli:main"),
     (RelayModeSpec("private", (("bore-minecraft-fenced.service", False), ("horizon-terraria-relay.service", False))), RelayModeSpec("production", (("bore-minecraft-fenced.service", True), ("horizon-terraria-relay.service", False)))),
     _RUNTIME_SOURCES,
     (FileSpec("pyproject.toml", "/opt/game-control/pyproject.toml", 0o644, category="runtime"), FileSpec("ops/install.py", "/opt/game-control/ops/install.py", 0o755, category="runtime")),
