@@ -13,6 +13,7 @@ from .protocols import (
     TelemetryDatabaseWriter,
     TelemetrySampler,
 )
+from .alerts import AlertRuntime
 from .telemetry import (
     DEFAULT_HOST_METRICS,
     ExporterBinding,
@@ -26,6 +27,7 @@ from .telemetry import (
 
 __all__ = [
     "AlertObservation",
+    "AlertRuntime",
     "AlertSink",
     "DEFAULT_HOST_METRICS",
     "ExporterBinding",

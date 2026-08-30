@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import json
 import sqlite3
+import asyncio
+import threading
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -109,6 +111,104 @@ def test_send_uses_fixed_payload_and_timeout_without_leaking_secret(tmp_path: Pa
     assert seen[0].content == b'{"content":"server started"}'
     assert webhook not in str(service.last_error or "")
     assert webhook not in service.redactor.redact(f"failed {webhook}")
+
+
+def test_falsey_injected_http_client_is_borrowed_and_close_is_idempotent(tmp_path: Path):
+    profile = _profile(tmp_path)
+
+    class FalseyClient:
+        def __init__(self):
+            self.closed = 0
+
+        def __bool__(self):
+            return False
+
+        def close(self):
+            self.closed += 1
+
+    client = FalseyClient()
+    service = NotificationService({profile.id.value: profile}, http_client=client)
+    assert service.http_client is client
+    assert service._owns_http_client is False
+    service.close()
+    service.close()
+    assert client.closed == 0
+
+
+def test_default_http_client_is_owned_and_close_is_idempotent(monkeypatch, tmp_path: Path):
+    profile = _profile(tmp_path)
+
+    class Client:
+        def __init__(self, **_kwargs):
+            self.closed = 0
+
+        def close(self):
+            self.closed += 1
+
+    client = Client()
+    monkeypatch.setattr(httpx, "Client", lambda **_kwargs: client)
+    service = NotificationService({profile.id.value: profile})
+    assert service._owns_http_client is True
+    service.close()
+    service.close()
+    assert client.closed == 1
+
+
+@pytest.mark.asyncio
+async def test_send_async_shield_drains_successful_post_before_reraising_cancel(tmp_path: Path):
+    profile = _profile(tmp_path)
+    secrets = tmp_path / "secrets"
+    secrets.mkdir()
+    webhook = "https://discord.example.invalid/cancellation-success"
+    (secrets / "discord").write_text(webhook)
+    (secrets / "discord").chmod(0o600)
+    started = threading.Event()
+    release = threading.Event()
+
+    class Client:
+        def post(self, _url, **_kwargs):
+            started.set()
+            release.wait(2)
+
+    db = _db()
+    service = NotificationService({profile.id.value: profile}, secret_dir=secrets, database=db, http_client=Client())
+    task = asyncio.create_task(service.send_async(profile.id, NotificationEvent.START, 33, "started"))
+    await asyncio.to_thread(started.wait, 2)
+    task.cancel()
+    await asyncio.sleep(0)
+    assert not task.done()
+    release.set()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    assert db.execute("SELECT count(*) FROM notification_deliveries").fetchone()[0] == 1
+
+
+@pytest.mark.asyncio
+async def test_send_async_cancellation_consumes_failed_post_without_record(tmp_path: Path):
+    profile = _profile(tmp_path)
+    secrets = tmp_path / "secrets"
+    secrets.mkdir()
+    webhook = "https://discord.example.invalid/cancellation-failure"
+    (secrets / "discord").write_text(webhook)
+    (secrets / "discord").chmod(0o600)
+    started = threading.Event()
+    release = threading.Event()
+
+    class Client:
+        def post(self, _url, **_kwargs):
+            started.set()
+            release.wait(2)
+            raise RuntimeError(f"failed {webhook}")
+
+    db = _db()
+    service = NotificationService({profile.id.value: profile}, secret_dir=secrets, database=db, http_client=Client())
+    task = asyncio.create_task(service.send_async(profile.id, NotificationEvent.START, 34, "started"))
+    await asyncio.to_thread(started.wait, 2)
+    task.cancel()
+    release.set()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    assert db.execute("SELECT count(*) FROM notification_deliveries").fetchone()[0] == 0
 
 
 def test_profile_event_and_generation_deduplicate_delivery(tmp_path: Path):

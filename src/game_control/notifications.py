@@ -62,7 +62,14 @@ class NotificationService:
             self.profiles = {_profile_id(item): item for item in profiles}
         self.secret_dir = Path(secret_dir)
         self.database = database
-        self.http_client = http_client or httpx.Client(timeout=TIMEOUT_SECONDS)
+        # ``http_client`` is an explicitly injected, borrowed seam.  Do not
+        # use truthiness here: test doubles and adapters may deliberately be
+        # falsey while still being valid clients.
+        self._owns_http_client = http_client is None
+        self.http_client = (
+            httpx.Client(timeout=TIMEOUT_SECONDS) if http_client is None else http_client
+        )
+        self._http_client_closed = False
         self.timeout_seconds = TIMEOUT_SECONDS
         self.redactor = redactor or Redactor(SecretRegistry())
         self.clock = clock or time.monotonic
@@ -238,12 +245,60 @@ class NotificationService:
                 continue
             if self._already_delivered(profile_key, event_obj.value, int(state_generation), channel):
                 continue
-            await asyncio.to_thread(self._post, channel, secret, message)
+            cancelled, post_error = await self._post_async(channel, secret, message)
+            if post_error is not None:
+                # A caller cancellation wins over a transport exception, but
+                # the worker result has been consumed so it cannot become an
+                # unhandled task warning.
+                if cancelled:
+                    raise asyncio.CancelledError
+                raise post_error
             self._record_delivery(profile_key, event_obj.value, int(state_generation), channel)
             delivered = True
+            if cancelled:
+                # The POST completed successfully while cancellation was
+                # pending.  Record dedup/cooldown state before propagating it.
+                if event_obj is NotificationEvent.LOW_DISK:
+                    self._low_disk_sent[profile_key] = now
+                raise asyncio.CancelledError
         if delivered and event_obj is NotificationEvent.LOW_DISK:
             self._low_disk_sent[profile_key] = now
         return delivered
+
+    async def _post_async(self, channel: str, secret: str, message: str) -> tuple[bool, BaseException | None]:
+        """Run one HTTP POST, draining its worker even when cancelled."""
+
+        worker = asyncio.create_task(asyncio.to_thread(self._post, channel, secret, message))
+        cancelled = False
+        error: BaseException | None = None
+        while True:
+            try:
+                await asyncio.shield(worker)
+                break
+            except asyncio.CancelledError:
+                cancelled = True
+                # A second cancellation must not abandon the accepted POST.
+                continue
+            except BaseException as exc:
+                error = exc
+                break
+        if error is None:
+            try:
+                worker.result()
+            except BaseException as exc:
+                error = exc
+        return cancelled, error
+
+    def close(self) -> None:
+        """Close only a default-owned HTTP client, exactly once."""
+
+        if self._http_client_closed:
+            return
+        if self._owns_http_client:
+            close = getattr(self.http_client, "close", None)
+            if callable(close):
+                close()
+        self._http_client_closed = True
 
     def get_config(self, profile: Any) -> NotificationConfig:
         profile_obj = self._get_profile(profile)
