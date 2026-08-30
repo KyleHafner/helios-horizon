@@ -1652,6 +1652,59 @@ class Controller:
                 await self._record_event(profile.id, "idle_stop", "idle-stop request failed")
                 _LOG.warning("idle-stop failed for %s", profile.id, exc_info=True)
 
+    async def _run_scheduled_backup(self, action: CreateBackup, request_id: UUID) -> JobAccepted:
+        """Run a scheduled backup under the same durable lease as manual work."""
+        profile = self._profile(action.profile_id)
+        service = self._service("backups", "create")
+        if service is None:
+            raise _ControllerFailure(ErrorCode.BACKUP_FAILED, "backup service unavailable")
+        async with self._operation_lease(
+            profile, "scheduled_backup", request_id, actor="system:schedule"
+        ) as (lease, renewal):
+            job_id = await self._transaction(
+                lambda: self._job_intent("system:schedule", "scheduled_backup", profile.id)
+            )
+            try:
+                await self._await_lease(
+                    self._invoke(
+                        service,
+                        action,
+                        "system:schedule",
+                        request_id,
+                        lease_check=lambda: self._lease_owned_sync(lease),
+                    ),
+                    renewal,
+                    drain_on_renewal=True,
+                )
+            except asyncio.CancelledError:
+                await self._transaction(lambda: self._finish(
+                    job_id, "system:schedule", "scheduled_backup", profile.id,
+                    ok=False, code=ErrorCode.INTERNAL_ERROR,
+                    detail="scheduled backup cancelled",
+                ))
+                raise
+            except SafeError as exc:
+                deferred = exc.code == "profile_running"
+                await self._transaction(lambda: self._finish(
+                    job_id, "system:schedule", "scheduled_backup", profile.id,
+                    ok=False,
+                    code=ErrorCode.INVALID_STATE if deferred else ErrorCode.BACKUP_FAILED,
+                    detail="profile_running" if deferred else "backup_failed",
+                    state="deferred" if deferred else "failed",
+                ))
+                raise
+            except Exception:
+                await self._transaction(lambda: self._finish(
+                    job_id, "system:schedule", "scheduled_backup", profile.id,
+                    ok=False, code=ErrorCode.BACKUP_FAILED, detail="backup_failed",
+                ))
+                raise
+            await self._transaction(lambda: self._finish(
+                job_id, "system:schedule", "scheduled_backup", profile.id,
+                ok=True, detail="scheduled backup completed",
+            ))
+            return JobAccepted(job_id=job_id, state="succeeded")
+
     async def _apply_schedules(self, snapshot: StatusSnapshot, request_id: UUID) -> None:
         """Run due backup jobs and config-only switches from the fresh status cycle."""
         if not self._schedule.entries:
@@ -1714,34 +1767,14 @@ class Controller:
             await self._record_event(entry.profile, "scheduled_fire", self._schedule_fire_key(entry, snapshot.observed_at))
             if entry.operation != "backup" or entry.backup_destination is None:
                 continue
-            job_id = await self._transaction(
-                lambda: self._job_intent("system:schedule", "scheduled_backup", entry.profile)
+            action = CreateBackup(
+                kind="create_backup",
+                profile_id=entry.profile,
+                protected=entry.backup_destination is BackupDestination.HORIZON_B2,
+                destination=entry.backup_destination,
             )
             try:
-                service = self._service("backups", "create")
-                if service is None:
-                    raise RuntimeError("backup service unavailable")
-                await self._invoke(
-                    service,
-                    CreateBackup(
-                        kind="create_backup",
-                        profile_id=entry.profile,
-                        protected=entry.backup_destination is BackupDestination.HORIZON_B2,
-                        destination=entry.backup_destination,
-                    ),
-                    "system:schedule",
-                    request_id,
-                )
-                await self._transaction(
-                    lambda: self._finish(
-                        job_id,
-                        "system:schedule",
-                        "scheduled_backup",
-                        entry.profile,
-                        ok=True,
-                        detail="scheduled backup completed",
-                    )
-                )
+                await self._run_scheduled_backup(action, request_id)
                 await self._record_event(entry.profile, "scheduled_backup", "scheduled backup completed")
             except Exception as exc:
                 # A running profile is intentionally reported as deferred; this
@@ -1749,18 +1782,6 @@ class Controller:
                 # attempt is retried at the next scheduled fire.
                 deferred = getattr(exc, "code", None) == "profile_running"
                 message = "scheduled backup deferred" if deferred else "scheduled backup failed"
-                await self._transaction(
-                    lambda: self._finish(
-                        job_id,
-                        "system:schedule",
-                        "scheduled_backup",
-                        entry.profile,
-                        ok=False,
-                        code=ErrorCode.INVALID_STATE if deferred else ErrorCode.BACKUP_FAILED,
-                        detail="profile_running" if deferred else "backup_failed",
-                        state="deferred" if deferred else "failed",
-                    )
-                )
                 await self._record_event(entry.profile, message.replace(" ", "_"), message)
                 if not deferred:
                     notifier = self._service("notifications", "send")

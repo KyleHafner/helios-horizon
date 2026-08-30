@@ -36,6 +36,7 @@ def test_daily_backup_schedule_is_typed_and_does_not_become_a_switch():
 
 def test_horizon_b2_schedule_requests_protected_backup(tmp_path):
     controller = Controller.for_testing(tmp_path)
+    controller.profiles = {ProfileId.MINECRAFT: SimpleNamespace(id=ProfileId.MINECRAFT)}
     controller._schedule = ScheduleBook(parse_schedule([
         {"cron": "* * * * *", "profile": "minecraft", "backup_destination": "horizon-b2"},
     ]))
@@ -66,6 +67,7 @@ def test_schedule_fire_marker_prevents_duplicate_after_controller_restart(tmp_pa
         {"cron": "* * * * *", "profile": "minecraft", "backup_destination": "horizon-b2"},
     ])
     first = Controller.for_testing(tmp_path)
+    first.profiles = {ProfileId.MINECRAFT: SimpleNamespace(id=ProfileId.MINECRAFT)}
     first._schedule = ScheduleBook(entries)
     calls = []
 
@@ -83,7 +85,7 @@ def test_schedule_fire_marker_prevents_duplicate_after_controller_restart(tmp_pa
     asyncio.run(first._apply_schedules(snapshot, uuid4()))
 
     restarted = Controller(
-        profiles={},
+        profiles={ProfileId.MINECRAFT: SimpleNamespace(id=ProfileId.MINECRAFT)},
         state_db=first.state_db,
         operation_lock_factory=lambda: first._operation_lock_factory(),
         schedules=entries,
@@ -113,6 +115,7 @@ def test_duplicate_due_backup_entries_execute_once(tmp_path):
         {"cron": "* * * * *", "profile": "minecraft", "backup_destination": "horizon-b2"},
     ])
     controller = Controller.for_testing(tmp_path)
+    controller.profiles = {ProfileId.MINECRAFT: SimpleNamespace(id=ProfileId.MINECRAFT)}
     controller._schedule = ScheduleBook(entries)
     calls = []
 
@@ -133,6 +136,7 @@ def test_duplicate_due_backup_entries_execute_once(tmp_path):
 
 def test_running_scheduled_backup_is_deferred_durable_and_never_stops(caplog, tmp_path):
     controller = Controller.for_testing(tmp_path)
+    controller.profiles = {ProfileId.MINECRAFT: SimpleNamespace(id=ProfileId.MINECRAFT)}
     controller._schedule = ScheduleBook(parse_schedule([
         {"cron": "* * * * *", "profile": "minecraft", "backup_destination": "horizon-b2"},
     ]))
