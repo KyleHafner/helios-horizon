@@ -12,7 +12,7 @@ import time
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Iterator
+from typing import Callable, Iterator
 
 from .models import ProfileId
 
@@ -61,6 +61,7 @@ class Reservation:
     controller_pid: int
     controller_start_ticks: int
     expires_at: float
+    operation_kind: str = "lifecycle"
 
 
 def _read_json(path: Path) -> dict[str, object] | None:
@@ -81,6 +82,7 @@ def _reservation_from_json(raw: dict[str, object] | None) -> Reservation | None:
         pid = raw["controller_pid"]
         ticks = raw["controller_start_ticks"]
         expires = raw["expires_at"]
+        operation_kind = raw.get("operation_kind", "lifecycle")
         if (
             not isinstance(operation_id, str)
             or not operation_id
@@ -95,6 +97,7 @@ def _reservation_from_json(raw: dict[str, object] | None) -> Reservation | None:
             or ticks < 0
             or not isinstance(expires, (int, float))
             or isinstance(expires, bool)
+            or operation_kind not in {"lifecycle", "update"}
         ):
             return None
         try:
@@ -103,7 +106,7 @@ def _reservation_from_json(raw: dict[str, object] | None) -> Reservation | None:
             return None
         if not math.isfinite(expiry):
             return None
-        return Reservation(profile, operation_id, generation, pid, ticks, expiry)
+        return Reservation(profile, operation_id, generation, pid, ticks, expiry, operation_kind)
     except (KeyError, TypeError, ValueError):
         return None
 
@@ -235,6 +238,7 @@ class ReservationStore:
         state_generation: int = 0,
         controller_pid: int | None = None,
         controller_start_ticks: int | None = None,
+        operation_kind: str = "lifecycle",
     ) -> Reservation:
         if os.geteuid() != 0:
             raise PermissionError("only root may create reservations")
@@ -247,6 +251,8 @@ class ReservationStore:
             raise ValueError("reservation ttl must be at most 30 seconds")
         if not isinstance(state_generation, int) or state_generation < 0:
             raise ValueError("invalid state generation")
+        if operation_kind not in {"lifecycle", "update"}:
+            raise ValueError("invalid operation kind")
         pid = os.getpid() if controller_pid is None else controller_pid
         ticks = self.pid_start_ticks(pid) if controller_start_ticks is None else controller_start_ticks
         if ticks is None:
@@ -259,6 +265,7 @@ class ReservationStore:
                 pid,
                 ticks,
                 self.clock() + ttl,
+                operation_kind,
             )
             _atomic_json(self.reservation_path, {
                 "profile_id": reservation.profile_id.value,
@@ -267,6 +274,7 @@ class ReservationStore:
                 "controller_pid": reservation.controller_pid,
                 "controller_start_ticks": reservation.controller_start_ticks,
                 "expires_at": reservation.expires_at,
+                "operation_kind": reservation.operation_kind,
             })
         return reservation
 
@@ -279,6 +287,9 @@ class ReservationStore:
         state_generation: int = 0,
         controller_pid: int | None = None,
         controller_start_ticks: int | None = None,
+        availability_check: Callable[[], bool] | None = None,
+        operation_kind: str = "lifecycle",
+        generation_provider: Callable[[], int] | None = None,
     ) -> Reservation:
         """Atomically check the live owner and commit a reservation.
 
@@ -297,6 +308,8 @@ class ReservationStore:
             raise ValueError("reservation ttl must be at most 30 seconds")
         if not isinstance(state_generation, int) or state_generation < 0:
             raise ValueError("invalid state generation")
+        if operation_kind not in {"lifecycle", "update"}:
+            raise ValueError("invalid operation kind")
         pid = os.getpid() if controller_pid is None else controller_pid
         ticks = self.pid_start_ticks(pid) if controller_start_ticks is None else controller_start_ticks
         if ticks is None:
@@ -309,9 +322,21 @@ class ReservationStore:
                 and (current.profile_id != profile_id or current.operation_id != operation_id)
             ):
                 raise BlockingIOError("reservation belongs to another profile")
+            # A lifecycle caller can supply its stopped-state predicate here so
+            # the observation and reservation commit share the same exclusive
+            # operation transaction.  This closes the read-then-reserve race
+            # where a start could win between two independent calls.
+            if availability_check is not None and not availability_check():
+                raise BlockingIOError("reservation precondition is not satisfied")
+            if generation_provider is not None:
+                generated = generation_provider()
+                if isinstance(generated, bool) or not isinstance(generated, int) or generated < 0:
+                    raise ValueError("invalid state generation")
+                state_generation = generated
             reservation = Reservation(
                 profile_id, operation_id, state_generation, pid, ticks,
                 self.clock() + ttl,
+                operation_kind,
             )
             _atomic_json(self.reservation_path, {
                 "profile_id": reservation.profile_id.value,
@@ -320,6 +345,7 @@ class ReservationStore:
                 "controller_pid": reservation.controller_pid,
                 "controller_start_ticks": reservation.controller_start_ticks,
                 "expires_at": reservation.expires_at,
+                "operation_kind": reservation.operation_kind,
             })
         return reservation
 
@@ -328,6 +354,8 @@ class ReservationStore:
         profile: str | ProfileId,
         operation_id: str,
         state_generation: int = 0,
+        *,
+        operation_kind: str | None = None,
     ) -> bool:
         profile_id = _profile(profile)
         with operation_transaction(self.operation_path):
@@ -337,16 +365,41 @@ class ReservationStore:
                 or current.profile_id != profile_id
                 or current.operation_id != operation_id
                 or current.state_generation != state_generation
+                or (operation_kind is not None and current.operation_kind != operation_kind)
             ):
                 return False
             self.reservation_path.unlink(missing_ok=True)
             return True
+
+    def release_if_owned_locked(
+        self,
+        profile: str | ProfileId,
+        operation_id: str,
+        state_generation: int = 0,
+        *,
+        operation_kind: str | None = None,
+    ) -> bool:
+        """Release an exact reservation while operation.lock is held."""
+        profile_id = _profile(profile)
+        current = _reservation_from_json(_read_json(self.reservation_path))
+        if (
+            current is None
+            or current.profile_id != profile_id
+            or current.operation_id != operation_id
+            or current.state_generation != state_generation
+            or (operation_kind is not None and current.operation_kind != operation_kind)
+        ):
+            return False
+        self.reservation_path.unlink(missing_ok=True)
+        return True
 
     def owns_live(
         self,
         profile: str | ProfileId,
         operation_id: str,
         state_generation: int = 0,
+        *,
+        operation_kind: str | None = None,
     ) -> bool:
         """Atomically verify exact ownership, expiry, and controller liveness."""
         profile_id = _profile(profile)
@@ -357,8 +410,32 @@ class ReservationStore:
                 and current.profile_id == profile_id
                 and current.operation_id == operation_id
                 and current.state_generation == state_generation
+                and (operation_kind is None or current.operation_kind == operation_kind)
                 and self._live(current)
             )
+
+    def owns_live_locked(
+        self,
+        profile: str | ProfileId,
+        operation_id: str,
+        state_generation: int = 0,
+    ) -> bool:
+        """Verify ownership while the caller already holds operation.lock.
+
+        This deliberately performs no nested flock acquisition. It is for a
+        final check-to-publish critical section that has already acquired an
+        exclusive ``OperationLock``.
+        """
+        profile_id = _profile(profile)
+        current = _reservation_from_json(_read_json(self.reservation_path))
+        return bool(
+            current is not None
+            and current.profile_id == profile_id
+            and current.operation_id == operation_id
+            and current.state_generation == state_generation
+            and current.operation_kind == "update"
+            and self._live(current)
+        )
 
     def transfer_if_owned(
         self,
@@ -385,6 +462,7 @@ class ReservationStore:
                 target, target_operation_id, state_generation,
                 current.controller_pid, current.controller_start_ticks,
                 self.clock() + ttl,
+                current.operation_kind,
             )
             _atomic_json(self.reservation_path, {
                 "profile_id": renewed.profile_id.value,
@@ -393,6 +471,7 @@ class ReservationStore:
                 "controller_pid": renewed.controller_pid,
                 "controller_start_ticks": renewed.controller_start_ticks,
                 "expires_at": renewed.expires_at,
+                "operation_kind": renewed.operation_kind,
             })
             return renewed
 
@@ -403,6 +482,7 @@ class ReservationStore:
         ttl: float,
         *,
         state_generation: int = 0,
+        operation_kind: str | None = None,
     ) -> Reservation:
         """Extend only the lease this operation currently owns."""
         profile_id = _profile(profile)
@@ -413,6 +493,7 @@ class ReservationStore:
                 or current.profile_id != profile_id
                 or current.operation_id != operation_id
                 or current.state_generation != state_generation
+                or (operation_kind is not None and current.operation_kind != operation_kind)
                 or not self._live(current)
             ):
                 raise BlockingIOError("reservation ownership changed")
@@ -420,6 +501,7 @@ class ReservationStore:
                 current.profile_id, current.operation_id, current.state_generation,
                 current.controller_pid, current.controller_start_ticks,
                 self.clock() + ttl,
+                current.operation_kind,
             )
             _atomic_json(self.reservation_path, {
                 "profile_id": renewed.profile_id.value,
@@ -428,6 +510,7 @@ class ReservationStore:
                 "controller_pid": renewed.controller_pid,
                 "controller_start_ticks": renewed.controller_start_ticks,
                 "expires_at": renewed.expires_at,
+                "operation_kind": renewed.operation_kind,
             })
             return renewed
 
@@ -441,7 +524,7 @@ class ReservationStore:
         reservation = self.read()
         if reservation is None or not self._live(reservation):
             return None
-        return reservation.profile_id == requested
+        return reservation.profile_id == requested and reservation.operation_kind == "lifecycle"
 
     validate_for_runner = valid_for_runner
 

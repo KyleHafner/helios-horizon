@@ -2,6 +2,9 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+from types import SimpleNamespace
+
+import pytest
 
 from game_control import sunlit_update as MODULE
 
@@ -58,6 +61,73 @@ def test_inactive_gate_defers_before_staging(monkeypatch) -> None:
     assert MODULE.run(check_only=False) == {"state": "deferred", "installed": "v1", "available": "v2"}
 
 
+def test_inactive_systemd_failure_is_bounded(monkeypatch) -> None:
+    def broken_run(*_args, **_kwargs):
+        raise OSError("systemd unavailable")
+
+    monkeypatch.setattr(MODULE.subprocess, "run", broken_run)
+    with pytest.raises(MODULE.UpdateError, match="inactive state"):
+        MODULE._inactive()
+
+
+def test_inactive_database_failure_is_bounded(monkeypatch, tmp_path: Path) -> None:
+    monkeypatch.setattr(MODULE, "SLOT", tmp_path / "slot.json")
+    monkeypatch.setattr(MODULE, "DATABASE", tmp_path / "state.db")
+    monkeypatch.setattr(
+        MODULE.subprocess,
+        "run",
+        lambda *_args, **_kwargs: SimpleNamespace(stdout="inactive\n"),
+    )
+
+    def broken_connect(*_args, **_kwargs):
+        raise MODULE.sqlite3.OperationalError("database unavailable")
+
+    monkeypatch.setattr(MODULE.sqlite3, "connect", broken_connect)
+    with pytest.raises(MODULE.UpdateError, match="inactive state"):
+        MODULE._inactive()
+
+
+def test_space_preflight_accounts_for_compressed_archive_expansion_and_old_releases(
+    monkeypatch, tmp_path: Path,
+) -> None:
+    state = tmp_path / "state"
+    state.mkdir()
+    (state / "world.dat").write_bytes(b"state")
+    releases = tmp_path / "releases"
+    releases.mkdir()
+    (releases / "old.jar").write_bytes(b"old")
+    (releases / "libraries").symlink_to(tmp_path / "shared-libraries", target_is_directory=True)
+    staging = tmp_path / "staging"
+    staging.mkdir()
+    overlay = tmp_path / "overlay.jar"
+    overlay.write_bytes(b"overlay")
+    monkeypatch.setattr(MODULE, "STATE_ROOT", state)
+    monkeypatch.setattr(MODULE, "RELEASE_ROOT", releases)
+    monkeypatch.setattr(MODULE, "STAGING_ROOT", staging)
+    monkeypatch.setattr(MODULE, "OVERLAY", overlay)
+    monkeypatch.setattr(MODULE, "MAX_TOTAL_SIZE", 100)
+    monkeypatch.setattr(MODULE, "SPACE_MARGIN", 10)
+    required = 5 + 3 * 100 + 3 * 5 + 2 * 7 + 10
+    monkeypatch.setattr(MODULE.shutil, "disk_usage", lambda _path: SimpleNamespace(free=required - 1))
+
+    assert not MODULE._space_available({"size": 5})
+    monkeypatch.setattr(MODULE.shutil, "disk_usage", lambda _path: SimpleNamespace(free=required))
+    assert MODULE._space_available({"size": 5})
+
+
+def test_space_preflight_rejects_unproven_archive_size(monkeypatch) -> None:
+    with pytest.raises(MODULE.UpdateError, match="free space"):
+        MODULE._space_available({"size": "unknown"})
+
+
+def test_space_preflight_rejects_unproven_measured_expansion(monkeypatch) -> None:
+    with pytest.raises(MODULE.UpdateError, match="expansion"):
+        MODULE._space_available(
+            {"size": 5},
+            manifest={"archive": {"total_uncompressed_size": "unknown"}},
+        )
+
+
 def test_package_update_has_no_retired_manifest_stage_or_promote_dispatch() -> None:
     source = Path(MODULE.__file__).read_text(encoding="utf-8")
     assert "MANIFEST_HELPER" not in source
@@ -66,6 +136,15 @@ def test_package_update_has_no_retired_manifest_stage_or_promote_dispatch() -> N
     assert "horizon-sunlit-manifest" not in source
     assert "horizon-sunlit-stage" not in source
     assert "horizon-sunlit-promote" not in source
+
+
+def test_retired_sunlit_front_doors_are_not_kept_as_source_authority() -> None:
+    for name in (
+        "horizon-sunlit-manifest",
+        "horizon-sunlit-stage",
+        "horizon-sunlit-promote",
+    ):
+        assert not (ROOT / "ops/bin" / name).exists()
 
 
 def test_stage_uses_package_policy_without_retired_helper_spawn(tmp_path: Path, monkeypatch) -> None:
@@ -90,6 +169,7 @@ def test_stage_uses_package_policy_without_retired_helper_spawn(tmp_path: Path, 
     monkeypatch.setattr(MODULE, "STATE_ROOT", tmp_path / "state")
     monkeypatch.setattr(MODULE, "OVERLAY", overlay)
     monkeypatch.setattr(MODULE, "make_manifest", lambda _args: manifest)
+    monkeypatch.setattr(MODULE, "_space_available", lambda _release, **_kwargs: True)
     monkeypatch.setattr(MODULE, "_download", lambda _release, target: (target.write_bytes(b"archive"), MODULE.hashlib.sha256(b"archive").hexdigest())[1])
     monkeypatch.setattr(MODULE, "_run", lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("retired helper spawned")))
 

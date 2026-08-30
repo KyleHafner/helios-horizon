@@ -233,6 +233,65 @@ def test_same_profile_different_operation_cannot_replace_live_lease(slot_env):
     assert slot_env.store.read().operation_id == "op-1"
 
 
+def test_reservation_precondition_is_checked_inside_operation_transaction(slot_env):
+    observed = []
+
+    def unavailable():
+        observed.append(True)
+        return False
+
+    with pytest.raises(BlockingIOError, match="precondition"):
+        slot_env.store.reserve_if_available(
+            "minecraft", "op-1", ttl=10, availability_check=unavailable,
+        )
+    assert observed == [True]
+    assert slot_env.store.read() is None
+
+
+def test_reservation_generation_provider_is_bound_at_commit(slot_env):
+    generation = []
+    reservation = slot_env.store.reserve_if_available(
+        "minecraft", "update-generation", ttl=10,
+        availability_check=lambda: True,
+        generation_provider=lambda: 17,
+        operation_kind="update",
+    )
+    generation.append(reservation.state_generation)
+    assert generation == [17]
+    assert slot_env.store.owns_live(
+        "minecraft", "update-generation", 17, operation_kind="update",
+    )
+    assert not slot_env.store.owns_live(
+        "minecraft", "update-generation", 16, operation_kind="update",
+    )
+
+
+def test_update_reservation_is_not_runner_authorization(slot_env):
+    reservation = slot_env.store.reserve_if_available(
+        "minecraft", "update-1", ttl=10, operation_kind="update",
+    )
+    assert reservation.operation_kind == "update"
+    with slot_module.operation_transaction(slot_env.operation_path):
+        assert slot_env.store.owns_live_locked("minecraft", "update-1")
+    assert slot_env.store.valid_for_runner("minecraft") is False
+
+
+def test_expected_operation_kind_prevents_same_id_lifecycle_confusion(slot_env):
+    slot_env.store.reserve("minecraft", "same-id", ttl=10, state_generation=4)
+    assert not slot_env.store.owns_live(
+        "minecraft", "same-id", 4, operation_kind="update",
+    )
+    with pytest.raises(BlockingIOError):
+        slot_env.store.renew_if_owned(
+            "minecraft", "same-id", 10,
+            state_generation=4, operation_kind="update",
+        )
+    assert not slot_env.store.release_if_owned(
+        "minecraft", "same-id", 4, operation_kind="update",
+    )
+    assert slot_env.store.read().operation_kind == "lifecycle"
+
+
 def test_release_if_owned_does_not_delete_replacement(slot_env):
     slot_env.store.reserve("minecraft", "op-1", ttl=10, state_generation=1)
     assert slot_env.store.release_if_owned("minecraft", "op-2", 1) is False

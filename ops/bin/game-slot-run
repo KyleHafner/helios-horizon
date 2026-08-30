@@ -350,6 +350,7 @@ def _reservation_status(path: Path, profile: str) -> bool | None:
         pid = raw["controller_pid"]
         ticks = raw["controller_start_ticks"]
         expires = raw["expires_at"]
+        operation_kind = raw.get("operation_kind", "lifecycle")
         if (
             not isinstance(operation_id, str)
             or not operation_id
@@ -364,6 +365,7 @@ def _reservation_status(path: Path, profile: str) -> bool | None:
             or ticks < 0
             or not isinstance(expires, (int, float))
             or isinstance(expires, bool)
+            or operation_kind not in {"lifecycle", "update"}
         ):
             return None
         try:
@@ -377,7 +379,9 @@ def _reservation_status(path: Path, profile: str) -> bool | None:
             return None
     except (KeyError, TypeError, ValueError):
         return None
-    return reserved_profile == profile
+    # An updater reservation fences every lifecycle start, including a direct
+    # systemd invocation. A matching profile alone is not authorization.
+    return reserved_profile == profile and operation_kind == "lifecycle"
 
 
 def _reservation_required() -> bool:

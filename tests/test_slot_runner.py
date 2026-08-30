@@ -774,6 +774,21 @@ def test_runner_ignores_invalid_or_far_future_reservation(tmp_path: Path, reserv
     assert result.returncode == 0
 
 
+def test_runner_rejects_update_reservation_even_for_matching_profile(tmp_path: Path):
+    runner = runpy.run_path(str(RUNNER), run_name="game-slot-run")
+    reservation_path = tmp_path / "reservation.json"
+    reservation_path.write_text(json.dumps({
+        "profile_id": "minecraft-sunlit-cobblemon",
+        "operation_id": "sunlit-update-op",
+        "state_generation": 0,
+        "controller_pid": os.getpid(),
+        "controller_start_ticks": _start_ticks(os.getpid()),
+        "expires_at": time.time() + 10,
+        "operation_kind": "update",
+    }))
+    assert runner["_reservation_status"](reservation_path, "minecraft-sunlit-cobblemon") is False
+
+
 def test_direct_start_waits_for_controller_reservation_commit(tmp_path: Path):
     operation = tmp_path / "operation.lock"
     slot = tmp_path / "slot.lock"

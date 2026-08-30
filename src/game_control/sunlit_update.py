@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+from contextlib import contextmanager
 import fcntl
 import hashlib
 import json
@@ -12,6 +13,7 @@ import shutil
 import sqlite3
 import stat
 import subprocess
+import threading
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -19,7 +21,8 @@ import uuid
 from pathlib import Path
 
 from .sunlit_manifest import ManifestError, atomic_write, make_manifest
-from .modpack_update import AssemblyError
+from .modpack_update import AssemblyError, MAX_TOTAL_SIZE
+from .slot import OperationLock, ReservationStore
 from .sunlit_promote import PromotionError, promote_candidate
 from .sunlit_stage import StageError, stage
 
@@ -28,6 +31,7 @@ PROJECT_ID = "1495800"
 API_ROOT = f"https://www.curseforge.com/api/v1/mods/{PROJECT_ID}"
 STAGING_ROOT = Path("/srv/game-servers/.horizon-update-staging")
 STATE_ROOT = Path("/srv/game-servers/minecraft-sunlit-cobblemon-state")
+RELEASE_ROOT = Path("/opt/game-servers/minecraft-sunlit-cobblemon/releases")
 ACTIVE_LINK = Path("/srv/game-servers/minecraft-sunlit-cobblemon-current")
 SLOT = Path("/run/game-slot/slot.json")
 DATABASE = Path("/var/lib/game-control/state.db")
@@ -41,6 +45,11 @@ VERSION_RE = re.compile(r"^SERVER-PACK-Society-Sunlit-Cobblemon-([A-Za-z0-9][A-Z
 MAX_JSON = 4 * 1024 * 1024
 MAX_ARCHIVE = 2 * 1024 * 1024 * 1024
 SPACE_MARGIN = 2 * 1024 * 1024 * 1024
+MAX_OVERLAY_SIZE = 256 * 1024 * 1024
+OPERATION_LOCK = Path("/run/game-control/operation.lock")
+RESERVATION_FILE = Path("/run/game-control/reservation.json")
+RESERVATION_TTL = 30.0
+RESERVATION_RENEW_INTERVAL = 10.0
 
 
 class UpdateError(ValueError):
@@ -142,45 +151,249 @@ def _load_json(path: Path, maximum: int = MAX_JSON) -> dict:
 
 def _installed_version() -> str | None:
     record = STATE_ROOT / ".horizon/release.json"
-    if not record.exists():
-        return None
-    value = _load_json(record, 64 * 1024).get("version")
-    return value if isinstance(value, str) else None
+    try:
+        if not record.exists():
+            return None
+        value = _load_json(record, 64 * 1024).get("version")
+        return value if isinstance(value, str) else None
+    except UpdateError:
+        raise
+    except OSError as exc:
+        raise UpdateError("installed Sunlit version cannot be verified") from exc
 
 
 def _inactive() -> bool:
-    state = subprocess.run(
-        ["/usr/bin/systemctl", "is-active", "minecraft-sunlit-cobblemon.service"],
-        check=False, capture_output=True, text=True,
-    ).stdout.strip()
-    if state != "inactive" or SLOT.exists() or SLOT.is_symlink():
-        return False
-    with sqlite3.connect(f"file:{DATABASE}?mode=ro", uri=True, timeout=2) as db:
-        db.execute("PRAGMA query_only=ON")
-        active_session = db.execute(
-            "SELECT 1 FROM player_sessions WHERE profile_id=? AND ended_at IS NULL LIMIT 1", (PROFILE,)
-        ).fetchone()
-        active_job = db.execute(
-            "SELECT 1 FROM jobs WHERE profile_id=? AND state IN ('accepted','running') LIMIT 1", (PROFILE,)
-        ).fetchone()
-    return active_session is None and active_job is None
+    """Prove that no lifecycle owner or service is active.
+
+    This function is also used as the reservation precondition.  It must not
+    leak implementation errors into the systemd timer: unreadable service,
+    slot, or state-database observations are bounded updater failures.
+    """
+    try:
+        result = subprocess.run(
+            ["/usr/bin/systemctl", "is-active", "minecraft-sunlit-cobblemon.service"],
+            check=False, capture_output=True, text=True,
+        )
+        state = result.stdout.strip()
+        try:
+            slot_claimed = SLOT.lstat()
+        except FileNotFoundError:
+            slot_claimed = None
+        if state != "inactive" or slot_claimed is not None:
+            return False
+        with sqlite3.connect(f"file:{DATABASE}?mode=ro", uri=True, timeout=2) as db:
+            db.execute("PRAGMA query_only=ON")
+            active_session = db.execute(
+                "SELECT 1 FROM player_sessions WHERE profile_id=? AND ended_at IS NULL LIMIT 1", (PROFILE,)
+            ).fetchone()
+            active_job = db.execute(
+                "SELECT 1 FROM jobs WHERE profile_id=? AND state IN ('accepted','running') LIMIT 1", (PROFILE,)
+            ).fetchone()
+        return active_session is None and active_job is None
+    except (OSError, sqlite3.Error, AttributeError, TypeError) as exc:
+        raise UpdateError("Sunlit inactive state cannot be verified") from exc
 
 
-def _space_available(release: dict) -> bool:
-    state_bytes = 0
-    if STATE_ROOT.is_dir() and not STATE_ROOT.is_symlink():
-        for root, dirs, files in os.walk(STATE_ROOT, followlinks=False):
-            dirs[:] = [name for name in dirs if not (Path(root) / name).is_symlink()]
-            for name in files:
-                path = Path(root) / name
-                if path.is_symlink():
-                    continue
-                try:
-                    state_bytes += path.stat(follow_symlinks=False).st_size
-                except OSError as exc:
-                    raise UpdateError("persistent state size cannot be proven") from exc
-    required = state_bytes + 2 * int(release["size"]) + SPACE_MARGIN
-    return shutil.disk_usage(STAGING_ROOT).free >= required
+def _state_generation() -> int:
+    """Read the root generation through the same query-only state boundary."""
+    try:
+        with sqlite3.connect(f"file:{DATABASE}?mode=ro", uri=True, timeout=2) as db:
+            db.execute("PRAGMA query_only=ON")
+            row = db.execute("PRAGMA application_id").fetchone()
+        value = row[0] if row is not None and len(row) == 1 else None
+        if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+            raise ValueError("malformed root generation")
+        return value
+    except (OSError, sqlite3.Error, TypeError, ValueError, IndexError) as exc:
+        raise UpdateError("Sunlit root generation cannot be verified") from exc
+
+
+def _tree_bytes(path: Path, *, skip_symlinks: bool = False) -> int:
+    """Return regular-file bytes without following links or hiding races."""
+    try:
+        info = path.lstat()
+    except FileNotFoundError:
+        return 0
+    except OSError as exc:
+        raise UpdateError("persistent state size cannot be proven") from exc
+    if stat.S_ISLNK(info.st_mode):
+        if skip_symlinks:
+            return 0
+        raise UpdateError("persistent state root is a symlink")
+    if stat.S_ISREG(info.st_mode):
+        return info.st_size
+    if not stat.S_ISDIR(info.st_mode):
+        raise UpdateError("persistent state contains an unsafe member")
+    total = 0
+    try:
+        entries = list(os.scandir(path))
+    except OSError as exc:
+        raise UpdateError("persistent state size cannot be proven") from exc
+    for entry in entries:
+        total += _tree_bytes(Path(entry.path), skip_symlinks=skip_symlinks)
+    return total
+
+
+class _UpdateLease:
+    """Keep the shared lifecycle reservation alive for long updater stages."""
+
+    def __init__(self, store: ReservationStore, operation_id: str, state_generation: int = 0):
+        self.store = store
+        self.operation_id = operation_id
+        self.state_generation = state_generation
+        self._stop = threading.Event()
+        self._lost = threading.Event()
+        self._thread: threading.Thread | None = None
+        self._released = False
+
+    def start(self) -> None:
+        self._thread = threading.Thread(target=self._renew, name="horizon-sunlit-update-lease", daemon=True)
+        self._thread.start()
+
+    def _renew(self) -> None:
+        while not self._stop.wait(RESERVATION_RENEW_INTERVAL):
+            try:
+                self.store.renew_if_owned(
+                    PROFILE, self.operation_id, RESERVATION_TTL,
+                    state_generation=self.state_generation,
+                    operation_kind="update",
+                )
+            except BaseException:
+                self._lost.set()
+                return
+
+    def assert_owned(self) -> None:
+        if self._lost.is_set():
+            raise UpdateError("Sunlit update reservation was lost")
+        try:
+            owned = self.store.owns_live(
+                PROFILE, self.operation_id, self.state_generation, operation_kind="update",
+            )
+        except (OSError, ValueError, PermissionError, BlockingIOError) as exc:
+            raise UpdateError("Sunlit update reservation cannot be verified") from exc
+        if not owned:
+            self._lost.set()
+            raise UpdateError("Sunlit update reservation was lost")
+
+    def assert_owned_locked(self) -> None:
+        if self._lost.is_set():
+            raise UpdateError("Sunlit update reservation was lost")
+        try:
+            owned = self.store.owns_live_locked(PROFILE, self.operation_id, self.state_generation)
+        except (OSError, ValueError, PermissionError) as exc:
+            raise UpdateError("Sunlit update reservation cannot be verified") from exc
+        if not owned:
+            self._lost.set()
+            raise UpdateError("Sunlit update reservation was lost")
+
+    @contextmanager
+    def publication_guard(self, action):
+        """Fence one bounded promotion rename with operation.lock ownership."""
+        action_value = getattr(action, "value", action)
+        if action_value not in {
+            "state", "release", "version_state", "metadata", "active_link",
+            "rollback_state", "rollback_release", "rollback_version_state",
+            "rollback_metadata", "rollback_active_link",
+        }:
+            raise UpdateError("Sunlit publication action is not approved")
+        try:
+            with OperationLock(OPERATION_LOCK):
+                self.assert_owned_locked()
+                if not _inactive():
+                    raise UpdateError("Sunlit became active before publication")
+                yield
+        except UpdateError:
+            raise
+        except (OSError, ValueError) as exc:
+            raise UpdateError("Sunlit publication lock is unavailable") from exc
+
+    def close(self) -> None:
+        self.pause()
+        if self._released:
+            return
+        try:
+            released = self.store.release_if_owned(
+                PROFILE, self.operation_id, self.state_generation, operation_kind="update",
+            )
+        except (OSError, ValueError, PermissionError, BlockingIOError) as exc:
+            raise UpdateError("Sunlit update reservation could not be released") from exc
+        if not released and not self._lost.is_set():
+            raise UpdateError("Sunlit update reservation ownership changed")
+
+    def release_locked(self) -> None:
+        if self._released:
+            return
+        try:
+            released = self.store.release_if_owned_locked(
+                PROFILE, self.operation_id, self.state_generation,
+                operation_kind="update",
+            )
+        except (OSError, ValueError, PermissionError) as exc:
+            raise UpdateError("Sunlit update reservation could not be released") from exc
+        if not released:
+            raise UpdateError("Sunlit update reservation ownership changed")
+        self._released = True
+
+    def pause(self) -> None:
+        """Stop renewals before taking the final exclusive operation lock."""
+        self._stop.set()
+        if self._thread is not None:
+            self._thread.join(timeout=5.0)
+            if self._thread.is_alive():
+                self._lost.set()
+                raise UpdateError("Sunlit update lease renewal did not stop")
+            self._thread = None
+
+
+def _space_available(release: dict, *, manifest: dict | None = None) -> bool:
+    try:
+        archive_size = release["size"]
+        if isinstance(archive_size, bool) or not isinstance(archive_size, int) or archive_size <= 0:
+            raise ValueError("invalid archive size")
+        state_bytes = _tree_bytes(STATE_ROOT)
+        if manifest is None:
+            expanded_size = MAX_TOTAL_SIZE
+        else:
+            archive = manifest.get("archive")
+            expanded_size = archive.get("total_uncompressed_size") if isinstance(archive, dict) else None
+            if (
+                isinstance(expanded_size, bool)
+                or not isinstance(expanded_size, int)
+                or not 0 < expanded_size <= MAX_TOTAL_SIZE
+            ):
+                raise UpdateError("archive expansion bound is unavailable")
+        overlay_info = OVERLAY.lstat()
+        if (
+            not stat.S_ISREG(overlay_info.st_mode)
+            or overlay_info.st_nlink != 1
+            or overlay_info.st_uid != 0
+            or overlay_info.st_mode & 0o022
+            or overlay_info.st_size > MAX_OVERLAY_SIZE
+        ):
+            raise UpdateError("Sunlit overlay size cannot be proven")
+        try:
+            release_root_info = RELEASE_ROOT.lstat()
+        except FileNotFoundError:
+            release_root_info = None
+        if release_root_info is not None and stat.S_ISLNK(release_root_info.st_mode):
+            raise UpdateError("release root is a symlink")
+        # Existing releases/staging already consume disk_usage.free and are
+        # therefore inspected for safety but not charged a second time.
+        _tree_bytes(RELEASE_ROOT, skip_symlinks=True)
+        _tree_bytes(STAGING_ROOT, skip_symlinks=True)
+        # During assembly the compressed archive, expanded vendor tree, and
+        # expanded runtime coexist. Reserve the declared worst-case archive
+        # expansion rather than the attacker-controlled compressed size alone.
+        # A compressed archive, expanded vendor tree, expanded runtime,
+        # versioned persistent copies, and two overlay copies coexist. The
+        # active release and existing staging remain in disk_usage.free's
+        # occupied baseline and are intentionally not double-counted.
+        required = archive_size + 3 * expanded_size + 3 * state_bytes + 2 * overlay_info.st_size + SPACE_MARGIN
+        return shutil.disk_usage(STAGING_ROOT).free >= required
+    except UpdateError:
+        raise
+    except (OSError, TypeError, ValueError) as exc:
+        raise UpdateError("free space for Sunlit update cannot be proven") from exc
 
 
 def _run(argv: list[str], *, timeout: int) -> subprocess.CompletedProcess[str]:
@@ -280,6 +493,8 @@ def _stage(release: dict) -> tuple[Path, dict]:
                 atomic_write(manifest_path, (json.dumps(manifest, sort_keys=True, indent=2) + "\n").encode())
             except (ManifestError, OSError) as exc:
                 raise UpdateError("manifest generation failed") from exc
+        if not _space_available(release, manifest=manifest):
+            raise UpdateError("insufficient free space for the measured Sunlit archive")
         candidate_path = root / "candidate/candidate.json"
         if candidate_path.exists() or candidate_path.is_symlink():
             candidate = _load_json(candidate_path, 64 * 1024)
@@ -314,16 +529,19 @@ def _stage(release: dict) -> tuple[Path, dict]:
 
 def _request_backup(root: Path) -> str:
     request_file = root / "backup-request-id"
-    if request_file.exists():
-        request_id = request_file.read_text(encoding="ascii").strip()
-        uuid.UUID(request_id)
-    else:
-        request_id = str(uuid.uuid4())
-        fd = os.open(request_file, os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0), 0o600)
-        with os.fdopen(fd, "w", encoding="ascii") as stream:
-            stream.write(request_id + "\n")
-            stream.flush()
-            os.fsync(stream.fileno())
+    try:
+        if request_file.exists():
+            request_id = request_file.read_text(encoding="ascii").strip()
+            uuid.UUID(request_id)
+        else:
+            request_id = str(uuid.uuid4())
+            fd = os.open(request_file, os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0), 0o600)
+            with os.fdopen(fd, "w", encoding="ascii") as stream:
+                stream.write(request_id + "\n")
+                stream.flush()
+                os.fsync(stream.fileno())
+    except (OSError, UnicodeError, ValueError) as exc:
+        raise UpdateError("backup request state is unavailable") from exc
     result = _run([
         "/usr/sbin/runuser", "-u", "gamecontrol", "--", "/usr/bin/env", "PYTHONPATH=/opt/game-control/src",
         str(PYTHON), str(RPC_HELPER), "backup", "--request-id", request_id,
@@ -332,27 +550,61 @@ def _request_backup(root: Path) -> str:
         backup_id = json.loads(result.stdout)["job_id"]
     except (KeyError, TypeError, json.JSONDecodeError) as exc:
         raise UpdateError("backup response is malformed") from exc
-    with sqlite3.connect(f"file:{DATABASE}?mode=ro", uri=True, timeout=2) as db:
-        db.execute("PRAGMA query_only=ON")
-        row = db.execute(
-            "SELECT b.verified,b.protected,p.upload_state,p.remote_verified,p.comparison_state "
-            "FROM backups b JOIN backup_protections p ON p.backup_id=b.id "
-            "WHERE b.id=? AND b.profile_id=? AND p.profile_id=? AND p.destination_id='horizon-b2' AND p.backup_class='application'",
-            (backup_id, PROFILE, PROFILE),
-        ).fetchone()
+    try:
+        with sqlite3.connect(f"file:{DATABASE}?mode=ro", uri=True, timeout=2) as db:
+            db.execute("PRAGMA query_only=ON")
+            row = db.execute(
+                "SELECT b.verified,b.protected,p.upload_state,p.remote_verified,p.comparison_state "
+                "FROM backups b JOIN backup_protections p ON p.backup_id=b.id "
+                "WHERE b.id=? AND b.profile_id=? AND p.profile_id=? AND p.destination_id='horizon-b2' AND p.backup_class='application'",
+                (backup_id, PROFILE, PROFILE),
+            ).fetchone()
+    except sqlite3.Error as exc:
+        raise UpdateError("backup protection state is unavailable") from exc
     if row != (1, 1, "succeeded", 1, "verified"):
         raise UpdateError("pre-update backup is not fully protected")
     return str(backup_id)
 
 
 def _record(prior: str | None, new: str) -> None:
-    with sqlite3.connect(DATABASE, timeout=5) as db:
-        db.execute(
-            "INSERT INTO updates(id,profile_id,created_at,strategy,prior_version,new_version,state) "
-            "VALUES(?,?,strftime('%Y-%m-%dT%H:%M:%fZ','now'),'curated_modpack',?,?,?)",
-            (uuid.uuid4().hex, PROFILE, prior, new, "succeeded"),
+    try:
+        with sqlite3.connect(DATABASE, timeout=5) as db:
+            db.execute(
+                "INSERT INTO updates(id,profile_id,created_at,strategy,prior_version,new_version,state) "
+                "VALUES(?,?,strftime('%Y-%m-%dT%H:%M:%fZ','now'),'curated_modpack',?,?,?)",
+                (uuid.uuid4().hex, PROFILE, prior, new, "succeeded"),
+            )
+            db.commit()
+    except sqlite3.Error as exc:
+        raise UpdateError("update history state is unavailable") from exc
+
+
+def _reserve_update() -> _UpdateLease | None:
+    """Atomically reserve the profile only while its stopped state is proven."""
+    operation_id = f"sunlit-update-{uuid.uuid4().hex}"
+    try:
+        store = ReservationStore(
+            operation_path=OPERATION_LOCK,
+            reservation_path=RESERVATION_FILE,
         )
-        db.commit()
+        reservation = store.reserve_if_available(
+            PROFILE,
+            operation_id,
+            RESERVATION_TTL,
+            state_generation=0,
+            availability_check=_inactive,
+            operation_kind="update",
+            generation_provider=_state_generation,
+        )
+    except BlockingIOError:
+        return None
+    except UpdateError:
+        raise
+    except (OSError, ValueError, PermissionError, sqlite3.Error) as exc:
+        raise UpdateError("Sunlit update reservation is unavailable") from exc
+    lease = _UpdateLease(store, operation_id, reservation.state_generation)
+    lease.start()
+    return lease
 
 
 def run(*, check_only: bool) -> dict:
@@ -366,28 +618,50 @@ def run(*, check_only: bool) -> dict:
         raise UpdateError("automatic update requires root")
     if not _inactive():
         return {"state": "deferred", "installed": installed, "available": release["version"]}
-    if not _space_available(release):
-        raise UpdateError("insufficient free space for a staged update and rollback margin")
-    root, manifest = _stage(release)
-    if not _inactive():
-        return {"state": "staged", "installed": installed, "available": release["version"]}
-    backup_id = _request_backup(root)
-    if not _inactive():
-        return {"state": "staged", "installed": installed, "available": release["version"]}
+    lease = _reserve_update()
+    if lease is None:
+        return {"state": "deferred", "installed": installed, "available": release["version"]}
+    primary_error: BaseException | None = None
     try:
-        promotion = promote_candidate(
-            version=release["version"],
-            manifest=root / "manifest.json",
-            candidate_root=root / "candidate",
-            manifest_sha256=manifest["manifest_sha256"],
-        )
-    except (AssemblyError, OSError, PromotionError, KeyError, TypeError, ValueError) as exc:
-        raise UpdateError("candidate promotion failed") from exc
-    if promotion.get("active") is not True or promotion.get("version") != release["version"]:
-        raise UpdateError("promotion result is not exact")
-    _record(installed, release["version"])
-    (root / "server-pack.zip").unlink(missing_ok=True)
-    return {"state": "promoted", "installed": release["version"], "available": None, "backup_id": backup_id}
+        lease.assert_owned()
+        if not _space_available(release):
+            raise UpdateError("insufficient free space for a staged update and rollback margin")
+        try:
+            root, manifest = _stage(release)
+        except UpdateError:
+            raise
+        except (AssemblyError, OSError, KeyError, TypeError, ValueError) as exc:
+            raise UpdateError("candidate staging failed") from exc
+        lease.assert_owned()
+        backup_id = _request_backup(root)
+        lease.assert_owned()
+        try:
+            promotion = promote_candidate(
+                version=release["version"],
+                manifest=root / "manifest.json",
+                candidate_root=root / "candidate",
+                manifest_sha256=manifest["manifest_sha256"],
+                publication_guard=lease.publication_guard,
+            )
+        except UpdateError:
+            raise
+        except (AssemblyError, OSError, PromotionError, KeyError, TypeError, ValueError) as exc:
+            raise UpdateError("candidate promotion failed") from exc
+        lease.assert_owned()
+        with lease.publication_guard("metadata"):
+            _record(installed, release["version"])
+            lease.release_locked()
+        (root / "server-pack.zip").unlink(missing_ok=True)
+        return {"state": "promoted", "installed": release["version"], "available": None, "backup_id": backup_id}
+    except BaseException as exc:
+        primary_error = exc
+        raise
+    finally:
+        try:
+            lease.close()
+        except BaseException:
+            if primary_error is None:
+                raise
 
 
 def main(argv: list[str] | None = None) -> int:
