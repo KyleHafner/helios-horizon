@@ -53,9 +53,13 @@ class RootActiveJobsReader:
             return RootStateRead.unavailable("root jobs are unreadable")
         if row is None:
             return RootStateRead(True, None)
-        if not isinstance(row[0], str) or not row[0]:
+        try:
+            if len(row) != 1 or not isinstance(row[0], str) or not row[0]:
+                return RootStateRead.unavailable("root job state is malformed")
+            operation = row[0]
+        except Exception:
             return RootStateRead.unavailable("root job state is malformed")
-        return RootStateRead(True, row[0])
+        return RootStateRead(True, operation)
 
     def any_active(self) -> RootStateRead[bool]:
         connection = _connection(self.database)
@@ -87,11 +91,16 @@ class RootGenerationReader:
             return RootStateRead.unavailable("root state is unavailable")
         try:
             row = connection.execute("PRAGMA application_id").fetchone()
-            value = row[0] if row else 0
+        except Exception:
+            return RootStateRead.unavailable("root generation is unreadable")
+        try:
+            if row is None or len(row) != 1:
+                return RootStateRead.unavailable("root generation is malformed")
+            value = row[0]
             if isinstance(value, bool) or not isinstance(value, int) or value < 0:
                 return RootStateRead.unavailable("root generation is malformed")
         except Exception:
-            return RootStateRead.unavailable("root generation is unreadable")
+            return RootStateRead.unavailable("root generation is malformed")
         return RootStateRead(True, value)
 
     def __call__(self) -> int:

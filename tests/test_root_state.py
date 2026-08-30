@@ -35,6 +35,19 @@ def test_active_jobs_reader_returns_typed_root_results():
     assert reader("minecraft") == "start"
 
 
+def test_active_jobs_reader_rejects_malformed_rows():
+    for row in ((), ("start", "extra"), object()):
+        connection = SimpleNamespace(
+            execute=lambda *_args: SimpleNamespace(fetchone=lambda: row)
+        )
+
+        result = RootActiveJobsReader(connection).read("minecraft")
+
+        assert result.available is False
+        assert result.value is None
+        assert result.reason == "root job state is malformed"
+
+
 def test_root_readers_fail_closed_when_root_connection_is_unavailable():
     jobs = RootActiveJobsReader(object())
     generation = RootGenerationReader(object())
@@ -54,3 +67,16 @@ def test_generation_reader_is_read_only_projection():
     assert result.available is True
     assert result.value == 17
     assert reader() == 17
+
+
+def test_generation_reader_rejects_missing_or_malformed_rows():
+    for row in (None, (), (17, 18), ("17",), (True,)):
+        connection = SimpleNamespace(
+            execute=lambda *_args: SimpleNamespace(fetchone=lambda: row)
+        )
+
+        result = RootGenerationReader(connection).read()
+
+        assert result.available is False
+        assert result.value is None
+        assert result.reason == "root generation is malformed"
