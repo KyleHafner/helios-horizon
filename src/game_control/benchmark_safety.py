@@ -7,8 +7,10 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 import json
 import math
+import sqlite3
 import shutil
 import time
+from numbers import Real
 from typing import Any, Callable, Mapping, Literal
 import urllib.parse
 import urllib.request
@@ -133,7 +135,19 @@ class BenchmarkPreflight:
             *(self._call(self.storage_usage, path) for path in self.storage_paths),
             return_exceptions=True,
         )
-        ok = all(not isinstance(result, BaseException) and result.free >= 5 * 1024**3 for result in results)
+        def has_acceptable_free_space(result: Any) -> bool:
+            try:
+                free = result.free
+                return (
+                    isinstance(free, Real)
+                    and not isinstance(free, bool)
+                    and math.isfinite(free)
+                    and free >= 5 * 1024**3
+                )
+            except BaseException:
+                return False
+
+        ok = all(not isinstance(result, BaseException) and has_acceptable_free_space(result) for result in results)
         return EvidenceItem(
             "storage_acceptable", ok, "available" if ok else "unavailable",
             "root storage", observed_at, "" if ok else "storage free space is unavailable or below threshold",
@@ -162,7 +176,7 @@ class BenchmarkPreflight:
             ).fetchone()
             active = connection.execute("SELECT 1 FROM player_sessions WHERE ended_at IS NULL LIMIT 1").fetchone() is None
             quiet = latest is None or datetime.fromisoformat(latest[0].replace("Z", "+00:00")).timestamp() <= observed_at.timestamp() - 900
-        except (AttributeError, IndexError, TypeError, ValueError, OSError):
+        except (AttributeError, IndexError, TypeError, ValueError, OSError, sqlite3.Error):
             reason = "session state is unreadable"
             return (
                 EvidenceItem("quiet_period", False, "unavailable", "root session state", observed_at, reason),
