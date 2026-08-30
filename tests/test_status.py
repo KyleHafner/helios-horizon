@@ -8,6 +8,7 @@ import time
 import pytest
 
 from game_control.models import ObservedState
+from game_control.capability_evidence import WakeSafetyEvidence
 from game_control.status import StatusService, derive_state
 
 
@@ -553,6 +554,34 @@ async def test_benchmark_eligibility_forces_fresh_projection_instead_of_cached_s
 
     assert calls == 2
     assert evidence["no_conflicting_jobs"] is False
+
+
+@pytest.mark.asyncio
+async def test_benchmark_eligibility_rejects_bool_wake_evidence():
+    sessions = sqlite3.connect(":memory:")
+    sessions.execute("CREATE TABLE player_sessions (ended_at TEXT)")
+    service = StatusService(
+        [SimpleNamespace(id="minecraft")],
+        session_store=SimpleNamespace(connection=sessions),
+        capability_evidence=lambda: True,
+        ups_health=lambda: True,
+        storage_paths=("/",),
+    )
+
+    rejected = await service.benchmark_eligibility(
+        maintenance_window=True,
+        rollback_safe=True,
+        public_wake_policy="safe",
+    )
+    assert rejected["no_wake_session"] is False
+
+    service.capability_evidence = lambda: WakeSafetyEvidence(True, True)
+    accepted = await service.benchmark_eligibility(
+        maintenance_window=True,
+        rollback_safe=True,
+        public_wake_policy="safe",
+    )
+    assert accepted["no_wake_session"] is True
 
 
 @pytest.mark.asyncio

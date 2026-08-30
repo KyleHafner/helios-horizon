@@ -67,6 +67,7 @@ from .protocol import (
     UpdateStatus,
 )
 from .redaction import Redactor, SecretRegistry
+from .root_state import RootActiveJobsReader, RootGenerationReader
 from .status import StatusService
 from .updates import UpdateService
 from .worlds import WorldService
@@ -157,22 +158,6 @@ def _prometheus_ups_provider(config: Mapping[str, Any] | None) -> Callable[[], b
         except (OSError, ValueError, TypeError, KeyError, json.JSONDecodeError):
             return False
     return check
-
-
-class _ActiveJobs:
-    def __init__(self, database: Any):
-        self.database = database
-
-    def __call__(self, profile_id: Any) -> str | None:
-        connection = _connection(self.database)
-        if connection is None:
-            return None
-        row = connection.execute(
-            "SELECT operation FROM jobs WHERE profile_id=? AND state IN ('accepted','running') "
-            "ORDER BY created_at DESC LIMIT 1",
-            (_key(profile_id),),
-        ).fetchone()
-        return row[0] if row else None
 
 
 class _StatusFacade:
@@ -1077,17 +1062,6 @@ def _error_code(value: Any) -> ErrorCode | None:
         return None
 
 
-def _generation(database: Any) -> int:
-    connection = _connection(database)
-    if connection is None:
-        return 0
-    try:
-        row = connection.execute("PRAGMA application_id").fetchone()
-        return max(0, int(row[0])) if row else 0
-    except Exception:
-        return 0
-
-
 class _StatsFacade:
     """Read-only bridge across lifecycle and disposable telemetry databases."""
 
@@ -1233,6 +1207,8 @@ def _build_service_seams_impl(
     player_tracker = PlayerTracker()
     connection = _connection(state_db)
     session_store = SessionStore(connection) if connection is not None else None
+    root_jobs = RootActiveJobsReader(state_db)
+    root_generation = RootGenerationReader(state_db)
     stats = stats_config if isinstance(stats_config, Mapping) else {}
     tick_profile_id = next(
         (
@@ -1287,14 +1263,14 @@ def _build_service_seams_impl(
         profile_items,
         adapters=adapter_map,
         slot_observer=slot_inspector.observe,
-        active_jobs=_ActiveJobs(state_db),
+        active_jobs=root_jobs,
         health_checker=health,
         metrics=sampler,
         player_tracker=player_tracker,
         session_store=session_store,
-        generation=lambda: _generation(state_db),
+        generation=root_generation,
         telemetry_db=telemetry_db,
-        capability_evidence=RootWakeSafetyEvidence(state_db, reservation_store),
+        capability_evidence=RootWakeSafetyEvidence(root_jobs, reservation_store),
         ups_health=_prometheus_ups_provider(stats.get("benchmark_ups")),
         storage_paths=("/srv/game-servers", "/var/lib/game-control"),
     )

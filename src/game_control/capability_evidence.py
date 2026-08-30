@@ -8,6 +8,8 @@ from pathlib import Path
 import stat
 from typing import Any
 
+from .root_state import RootActiveJobsReader
+
 
 @dataclass(frozen=True)
 class WakeSafetyEvidence:
@@ -28,18 +30,18 @@ class RootWakeSafetyEvidence:
     """
 
     def __init__(self, database: Any, reservation_store: Any):
-        self.database = database
+        self.active_jobs = (
+            database if isinstance(database, RootActiveJobsReader)
+            else RootActiveJobsReader(database)
+        )
         self.reservation_store = reservation_store
 
     def __call__(self) -> WakeSafetyEvidence:
         try:
-            connection = getattr(self.database, "connection", self.database)
-            if not hasattr(connection, "execute"):
-                return WakeSafetyEvidence(False, False, "root state is unavailable")
-            active = connection.execute(
-                "SELECT 1 FROM jobs WHERE state IN ('accepted','running') LIMIT 1"
-            ).fetchone()
-            if active is not None:
+            active = self.active_jobs.any_active()
+            if not active.available:
+                return WakeSafetyEvidence(False, False, active.reason or "root state is unavailable")
+            if active.value:
                 return WakeSafetyEvidence(True, False, "root operation is active")
 
             path = getattr(self.reservation_store, "reservation_path", None)
