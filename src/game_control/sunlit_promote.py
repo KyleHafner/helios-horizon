@@ -561,60 +561,46 @@ def _already_promoted(context: PromotionContext, document: dict, sunlit_owner: t
 
 
 def _resume_published_release(context: PromotionContext, runtime: Path, document: dict, sunlit_owner: tuple[int, int]) -> dict | None:
-    # Fresh-install retry after release publication but before state
-    # publication.  The release is already immutable and the candidate state
-    # remains the only source of the pending persistent tree.
-    if (
-        context.release.is_dir()
-        and not context.release.is_symlink()
-        and not context.state_root.exists()
-        and not context.state_root.is_symlink()
-        and runtime.is_dir()
-        and not runtime.is_symlink()
-        and (context.candidate / "state").is_dir()
-        and not (context.candidate / "state").is_symlink()
-        and not context.active_link.exists()
-        and not context.active_link.is_symlink()
-    ):
-        _verify_release_ownership(context.release)
-        _bind_candidate_links(runtime, document, context)
-        if _tree_digest(runtime) != _tree_digest(context.release):
-            raise PromotionError("published release does not match the reviewed candidate")
-        state = context.candidate / "state"
-        _prepare_state_ownership(state)
-        _guarded_replace(
-            context,
-            PublicationAction.STATE,
-            state,
-            context.state_root,
-            context.state_root.parent,
-        )
-        _guarded_activate(
-            context,
-            PublicationAction.ACTIVE_LINK,
-            context.release,
-            expected_prior=None,
-        )
-        shutil.rmtree(runtime)
-        _fsync_dir(context.candidate)
-        return _publish_report(context, document)
+    # A release with no active link is a fresh-install publication checkpoint.
+    # Exactly one state source must exist: the prepared candidate before STATE,
+    # or the fixed production tree after STATE.  Every other combination is an
+    # ambiguous/colliding partial and fails closed.
     if not (
         context.release.is_dir()
         and not context.release.is_symlink()
-        and context.state_root.is_dir()
-        and not context.state_root.is_symlink()
         and runtime.is_dir()
         and not runtime.is_symlink()
-        and not (context.candidate / "state").exists()
         and not context.active_link.exists()
         and not context.active_link.is_symlink()
     ):
         return None
-    _trusted_directory(context.state_root, owners=(sunlit_owner,))
+    candidate_state = context.candidate / "state"
+    candidate_present = candidate_state.exists() or candidate_state.is_symlink()
+    production_present = context.state_root.exists() or context.state_root.is_symlink()
+    if candidate_present and production_present:
+        raise PromotionError("candidate and production state collide")
     _verify_release_ownership(context.release)
     _bind_candidate_links(runtime, document, context)
     if _tree_digest(runtime) != _tree_digest(context.release):
         raise PromotionError("published release does not match the reviewed candidate")
+    if candidate_present:
+        _verify_fresh_state_tree(context, candidate_state, document, sunlit_owner)
+        _guarded_replace(
+            context,
+            PublicationAction.STATE,
+            candidate_state,
+            context.state_root,
+            context.state_root.parent,
+        )
+        _verify_fresh_state_tree(
+            context, context.state_root, document, sunlit_owner,
+        )
+    elif production_present:
+        _verify_fresh_state_tree(
+            context, context.state_root, document, sunlit_owner,
+        )
+    else:
+        raise PromotionError("fresh publication state is unavailable")
     _guarded_activate(
         context,
         PublicationAction.ACTIVE_LINK,
@@ -686,6 +672,60 @@ def _expected_version_state_members(document: dict) -> set[str]:
     return names
 
 
+def _verify_version_state_tree(
+    version_state: Path,
+    versions_root: Path,
+    document: dict,
+    sunlit_owner: tuple[int, int],
+) -> Path:
+    """Prove a version-state tree remains a direct child of its fixed root."""
+    if version_state.parent != versions_root:
+        raise PromotionError("version state escaped its fixed root")
+    try:
+        versions_resolved = versions_root.resolve(strict=True)
+        version_state_resolved = version_state.resolve(strict=True)
+        root_info = version_state.lstat()
+    except OSError as exc:
+        raise PromotionError("version state is unavailable") from exc
+    if (
+        version_state_resolved.parent != versions_resolved
+        or stat.S_ISLNK(root_info.st_mode)
+        or not stat.S_ISDIR(root_info.st_mode)
+        or (root_info.st_uid, root_info.st_gid) != sunlit_owner
+        or stat.S_IMODE(root_info.st_mode) != 0o750
+    ):
+        raise PromotionError("version state is unsafe")
+    expected_top = _expected_version_state_members(document)
+    try:
+        actual_top = {entry.name for entry in os.scandir(version_state)}
+    except OSError as exc:
+        raise PromotionError("version state is unavailable") from exc
+    if actual_top != expected_top:
+        raise PromotionError("version state member set is not exact")
+    pending = [version_state / name for name in sorted(expected_top)]
+    while pending:
+        current = pending.pop()
+        try:
+            info = current.lstat()
+        except OSError as exc:
+            raise PromotionError("version state is unavailable") from exc
+        if stat.S_ISLNK(info.st_mode) or (info.st_uid, info.st_gid) != sunlit_owner:
+            raise PromotionError("version state is unsafe")
+        if stat.S_ISDIR(info.st_mode):
+            if stat.S_IMODE(info.st_mode) != 0o750:
+                raise PromotionError("version state is unsafe")
+            try:
+                pending.extend(Path(entry.path) for entry in os.scandir(current))
+            except OSError as exc:
+                raise PromotionError("version state is unavailable") from exc
+        elif stat.S_ISREG(info.st_mode):
+            if info.st_nlink != 1 or stat.S_IMODE(info.st_mode) != 0o640:
+                raise PromotionError("version state is unsafe")
+        else:
+            raise PromotionError("version state is unsafe")
+    return version_state
+
+
 def _verify_production_version_state(
     context: PromotionContext,
     document: dict,
@@ -693,52 +733,130 @@ def _verify_production_version_state(
 ) -> Path:
     """Prove an already-moved version state before selecting its release."""
     versions_root = context.state_root / ".versions"
-    production = versions_root / context.version
-    if production.parent != versions_root:
-        raise PromotionError("production version state escaped its fixed root")
+    return _verify_version_state_tree(
+        versions_root / context.version, versions_root, document, sunlit_owner,
+    )
+
+
+def _verify_fresh_state_tree(
+    context: PromotionContext,
+    state: Path,
+    document: dict,
+    sunlit_owner: tuple[int, int],
+) -> None:
+    """Prove a fully prepared fresh state tree before moving or activating it."""
+    fixed_parent = (
+        context.candidate if state == context.candidate / "state"
+        else context.state_root.parent if state == context.state_root
+        else None
+    )
+    if fixed_parent is None or state.parent != fixed_parent:
+        raise PromotionError("fresh state escaped its fixed root")
     try:
-        versions_resolved = versions_root.resolve(strict=True)
-        production_resolved = production.resolve(strict=True)
-        root_info = production.lstat()
+        parent_resolved = fixed_parent.resolve(strict=True)
+        state_resolved = state.resolve(strict=True)
+        state_info = state.lstat()
     except OSError as exc:
-        raise PromotionError("production version state is unavailable") from exc
+        raise PromotionError("fresh state is unavailable") from exc
     if (
-        production_resolved.parent != versions_resolved
-        or stat.S_ISLNK(root_info.st_mode)
-        or not stat.S_ISDIR(root_info.st_mode)
-        or (root_info.st_uid, root_info.st_gid) != sunlit_owner
-        or stat.S_IMODE(root_info.st_mode) != 0o750
+        state_resolved.parent != parent_resolved
+        or stat.S_ISLNK(state_info.st_mode)
+        or not stat.S_ISDIR(state_info.st_mode)
+        or (state_info.st_uid, state_info.st_gid) != sunlit_owner
+        or stat.S_IMODE(state_info.st_mode) != 0o750
     ):
-        raise PromotionError("production version state is unsafe")
-    expected_top = _expected_version_state_members(document)
+        raise PromotionError("fresh state is unsafe")
     try:
-        actual_top = {entry.name for entry in os.scandir(production)}
+        policy = document["runtime_policy"]
+        persistent_dirs = list(policy["persistent_dirs"])
+        persistent_files = list(policy["persistent_files"])
+        stable_names = persistent_dirs + persistent_files
+        required_names = list(policy["required_paths"])
+    except (KeyError, TypeError, ValueError) as exc:
+        raise PromotionError("promotion runtime policy is malformed") from exc
+    if (
+        any(
+            not isinstance(name, str)
+            or not name
+            or "/" in name
+            or name in {".", "..", ".versions", ".horizon"}
+            for name in stable_names + required_names
+        )
+        or len(stable_names) != len(set(stable_names))
+        or len(required_names) != len(set(required_names))
+        or not set(required_names).issubset(stable_names)
+    ):
+        raise PromotionError("promotion runtime policy is unsafe")
+    required_top = set(required_names) | {".versions", ".horizon"}
+    allowed_top = set(stable_names) | {".versions", ".horizon"}
+    try:
+        actual_top = {entry.name for entry in os.scandir(state)}
     except OSError as exc:
-        raise PromotionError("production version state is unavailable") from exc
-    if actual_top != expected_top:
-        raise PromotionError("production version state member set is not exact")
-    pending = [production / name for name in sorted(expected_top)]
+        raise PromotionError("fresh state is unavailable") from exc
+    if not required_top.issubset(actual_top) or not actual_top.issubset(allowed_top):
+        raise PromotionError("fresh state member set is not exact")
+    for name in persistent_dirs:
+        path = state / name
+        if (path.exists() or path.is_symlink()) and (path.is_symlink() or not path.is_dir()):
+            raise PromotionError("fresh persistent directory is unsafe")
+    for name in persistent_files:
+        path = state / name
+        if (path.exists() or path.is_symlink()) and (path.is_symlink() or not path.is_file()):
+            raise PromotionError("fresh persistent file is unsafe")
+    pending = [state / name for name in sorted(actual_top)]
     while pending:
         current = pending.pop()
         try:
             info = current.lstat()
         except OSError as exc:
-            raise PromotionError("production version state is unavailable") from exc
+            raise PromotionError("fresh state is unavailable") from exc
         if stat.S_ISLNK(info.st_mode) or (info.st_uid, info.st_gid) != sunlit_owner:
-            raise PromotionError("production version state is unsafe")
+            raise PromotionError("fresh state is unsafe")
         if stat.S_ISDIR(info.st_mode):
             if stat.S_IMODE(info.st_mode) != 0o750:
-                raise PromotionError("production version state is unsafe")
+                raise PromotionError("fresh state is unsafe")
             try:
                 pending.extend(Path(entry.path) for entry in os.scandir(current))
             except OSError as exc:
-                raise PromotionError("production version state is unavailable") from exc
+                raise PromotionError("fresh state is unavailable") from exc
         elif stat.S_ISREG(info.st_mode):
             if info.st_nlink != 1 or stat.S_IMODE(info.st_mode) != 0o640:
-                raise PromotionError("production version state is unsafe")
+                raise PromotionError("fresh state is unsafe")
         else:
-            raise PromotionError("production version state is unsafe")
-    return production
+            raise PromotionError("fresh state is unsafe")
+    versions_root = state / ".versions"
+    try:
+        version_members = {entry.name for entry in os.scandir(versions_root)}
+    except OSError as exc:
+        raise PromotionError("fresh state is unavailable") from exc
+    if version_members != {context.version}:
+        raise PromotionError("fresh version state member set is not exact")
+    _verify_version_state_tree(
+        versions_root / context.version, versions_root, document, sunlit_owner,
+    )
+    metadata = state / ".horizon"
+    try:
+        metadata_members = {entry.name for entry in os.scandir(metadata)}
+    except OSError as exc:
+        raise PromotionError("fresh state metadata is unavailable") from exc
+    if metadata_members != {"manifest.json", "release.json"}:
+        raise PromotionError("fresh state metadata member set is not exact")
+    manifest_record = _regular_json(
+        metadata / "manifest.json", maximum=8 * 1024 * 1024,
+        owners=(sunlit_owner,),
+    )
+    release_record = _regular_json(
+        metadata / "release.json", maximum=64 * 1024,
+        owners=(sunlit_owner,),
+    )
+    expected_release = {
+        "profile_id": "minecraft-sunlit-cobblemon",
+        "version": context.version,
+        "manifest_sha256": document["manifest_sha256"],
+        "archive_sha256": document["artifact"]["archive"]["sha256"],
+    }
+    if manifest_record != document or release_record != expected_release:
+        raise PromotionError("fresh state metadata identity mismatch")
 
 
 def _metadata_backup(context: PromotionContext, sunlit_owner: tuple[int, int]) -> dict[str, tuple[bytes, int, int, int] | None]:
@@ -1036,7 +1154,6 @@ def _promote(context: PromotionContext) -> dict:
     runtime = context.candidate / "runtime"
     state = context.candidate / "state"
     _trusted_directory(runtime)
-    _trusted_directory(state, owners=((0, 0), sunlit_owner))
     resumed = _resume_published_release(context, runtime, document, sunlit_owner)
     if resumed is not None:
         return resumed
@@ -1045,6 +1162,7 @@ def _promote(context: PromotionContext) -> dict:
     )
     if resumed is not None:
         return resumed
+    _trusted_directory(state, owners=((0, 0), sunlit_owner))
     if context.state_root.exists() and context.active_link.is_symlink():
         return _promote_upgrade(context, runtime, state, document, sunlit_owner)
     if any(path.exists() or path.is_symlink() for path in (context.release, context.state_root, context.active_link)):
@@ -1086,6 +1204,9 @@ def _promote(context: PromotionContext) -> dict:
             context.state_root.parent,
         )
         state_moved = True
+        _verify_fresh_state_tree(
+            context, context.state_root, document, sunlit_owner,
+        )
         _guarded_activate(
             context,
             PublicationAction.ACTIVE_LINK,

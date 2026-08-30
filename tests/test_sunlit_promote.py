@@ -59,6 +59,7 @@ def test_promotes_exact_inactive_candidate_into_fixed_layout(tmp_path: Path, mon
         "runtime_policy": {
             "persistent_dirs": ["world"],
             "persistent_files": ["ops.json"],
+            "required_paths": ["world", "ops.json"],
             "mutable_vendor_dirs": ["config"],
             "empty_mutable_dirs": ["logs"],
             "fixed_symlinks": {"libraries": str(libraries)},
@@ -321,6 +322,7 @@ def test_guard_refusal_preserves_resumable_forward_state(
     monkeypatch.setattr(MODULE, "_write_metadata", lambda *_args, **_kwargs: None)
     monkeypatch.setattr(MODULE, "_prepare_state_ownership", lambda *_args: None)
     monkeypatch.setattr(MODULE, "_verify_release_ownership", lambda *_args: None)
+    monkeypatch.setattr(MODULE, "_verify_fresh_state_tree", lambda *_args: None)
     monkeypatch.setattr(MODULE, "_fsync_tree", lambda *_args: (_ for _ in ()).throw(
         AssertionError("fsync-tree must be stubbed before publication")
     ) if guard_depth else None)
@@ -402,6 +404,7 @@ def test_upgrades_existing_release_without_replacing_stable_state(
         "runtime_policy": {
             "persistent_dirs": ["world"],
             "persistent_files": ["ops.json"],
+            "required_paths": ["world", "ops.json"],
             "mutable_vendor_dirs": ["config"],
             "empty_mutable_dirs": ["logs"],
             "fixed_symlinks": {"libraries": str(libraries)},
@@ -529,7 +532,7 @@ def test_upgrade_resume_rejects_unverified_production_version_state(
     document = {
         "manifest_sha256": "a" * 64,
         "runtime_policy": {
-            "persistent_dirs": [], "persistent_files": [],
+            "persistent_dirs": [], "persistent_files": [], "required_paths": [],
             "mutable_vendor_dirs": ["config"], "empty_mutable_dirs": ["logs"],
             "fixed_symlinks": {},
         },
@@ -587,7 +590,7 @@ def test_upgrade_resume_revalidates_version_state_after_publication(
     document = {
         "manifest_sha256": "a" * 64,
         "runtime_policy": {
-            "persistent_dirs": [], "persistent_files": [],
+            "persistent_dirs": [], "persistent_files": [], "required_paths": [],
             "mutable_vendor_dirs": ["config"], "empty_mutable_dirs": ["logs"],
             "fixed_symlinks": {},
         },
@@ -639,7 +642,7 @@ def test_upgrade_resume_rejects_external_version_state_after_activation(tmp_path
     document = {
         "manifest_sha256": "a" * 64,
         "runtime_policy": {
-            "persistent_dirs": [], "persistent_files": [],
+            "persistent_dirs": [], "persistent_files": [], "required_paths": [],
             "mutable_vendor_dirs": ["config"], "empty_mutable_dirs": ["logs"],
             "fixed_symlinks": {},
         },
