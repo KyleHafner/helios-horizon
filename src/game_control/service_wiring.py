@@ -1116,14 +1116,11 @@ def _build_service_seams_impl(
         profiles=profile_map,
         slot_inspector=slot_inspector,
     )
-    approved_telemetry_path = (
-        Path(telemetry_db.path) if telemetry_db is not None and getattr(telemetry_db, "path", None) is not None else None
-    )
     history_queries = HistoryQueryService(
         state_db,
         telemetry_db,
         approved_state_path=_AUDIT_STATE_DB_PATH,
-        approved_telemetry_path=approved_telemetry_path,
+        approved_telemetry_path=Path(_AUDIT_STATE_DB_PATH).with_name("telemetry.db"),
     )
     return ServiceSeams(
         status=_StatusFacade(status_service),

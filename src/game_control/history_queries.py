@@ -87,6 +87,7 @@ class HistoryQueryService:
         self._closing = False
         self._executor_closed = False
         self._close_task: asyncio.Task[None] | None = None
+        self._first_close_error: BaseException | None = None
 
     @staticmethod
     def _safe_error(exc: BaseException) -> SafeError:
@@ -387,12 +388,27 @@ class HistoryQueryService:
             )
             self._executor_closed = True
 
+    def _remember_close_error(self, task: asyncio.Task[None]) -> None:
+        try:
+            error = task.exception()
+        except BaseException:
+            return
+        if error is not None and self._first_close_error is None:
+            self._first_close_error = error
+
     async def aclose(self) -> None:
         with self._state_lock:
             self._closing = True
             task = self._close_task
-            if task is None or (task.done() and task.exception() is not None):
+            retry = task is None
+            if task is not None and task.done():
+                try:
+                    retry = task.exception() is not None
+                except BaseException:
+                    retry = True
+            if retry:
                 task = asyncio.create_task(self._close_impl())
+                task.add_done_callback(self._remember_close_error)
                 self._close_task = task
         cancelled = False
         error: BaseException | None = None
@@ -423,10 +439,17 @@ class HistoryQueryService:
                 except BaseException as exc:
                     error = exc
                     break
+        if error is None and task.done():
+            try:
+                task.result()
+            except BaseException as exc:
+                error = exc
+        if error is not None and self._first_close_error is None:
+            self._first_close_error = error
         if cancelled:
             raise asyncio.CancelledError
-        if error is not None:
-            raise error
+        if self._first_close_error is not None:
+            raise self._first_close_error
 
     async def close(self) -> None:
         await self.aclose()

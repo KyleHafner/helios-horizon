@@ -12,6 +12,7 @@ import pytest
 from game_control.errors import SafeError
 from game_control.history_queries import HistoryQueryService
 from game_control.models import ProfileId
+import game_control.service_wiring as wiring
 from game_control.protocol import (
     GetStatsHeatmap,
     GetStatsSummary,
@@ -111,6 +112,40 @@ async def test_wrong_path_fails_closed_before_any_worker_open(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_seam_builder_uses_canonical_telemetry_approval(tmp_path, monkeypatch):
+    state_path = tmp_path / "state.db"
+    wrong_telemetry_path = tmp_path / "unapproved-telemetry.db"
+    monkeypatch.setattr(wiring, "_AUDIT_STATE_DB_PATH", state_path)
+    monkeypatch.setattr(wiring, "BenchmarkService", lambda *args, **kwargs: SimpleNamespace())
+    monkeypatch.setattr(
+        HistoryQueryService,
+        "_open_readonly",
+        staticmethod(lambda _path: pytest.fail("unapproved telemetry opened")),
+    )
+    state = SimpleNamespace(
+        path=state_path,
+        connection=sqlite3.connect(":memory:"),
+    )
+    telemetry = SimpleNamespace(
+        path=wrong_telemetry_path,
+        connection=sqlite3.connect(":memory:"),
+    )
+    seams = wiring._build_service_seams_impl(
+        (), {}, state, SimpleNamespace(observe=lambda: SimpleNamespace(owner=None, inconsistent=False)),
+        telemetry_db=telemetry,
+    )
+    history = seams.stats.history
+    assert history.approved_telemetry_path == state_path.with_name("telemetry.db")
+    with pytest.raises(SafeError) as raised:
+        await history.tps(
+            GetStatsTps(kind="get_stats_tps", profile_id=ProfileId.MINECRAFT),
+            now="2026-08-29T00:00:00Z",
+        )
+    assert raised.value.code == "state_unavailable"
+    state.connection.close()
+    telemetry.connection.close()
+
+@pytest.mark.asyncio
 async def test_all_four_stats_operations_share_one_owner(monkeypatch):
     connection = sqlite3.connect(":memory:")
     service = HistoryQueryService(connection)
@@ -159,6 +194,53 @@ async def test_owned_executor_is_bounded_and_borrowed_executor_survives_close(tm
     await service.aclose()
     assert borrowed.submit(lambda: 1).result() == 1
     borrowed.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_close_retains_first_error_across_retry_failures_and_success():
+    service = HistoryQueryService(sqlite3.connect(":memory:"))
+    real_shutdown = service._executor.shutdown
+    calls = 0
+
+    def shutdown(*args, **kwargs):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            raise RuntimeError("first shutdown failure")
+        if calls == 2:
+            raise RuntimeError("second shutdown failure")
+        return real_shutdown(*args, **kwargs)
+
+    service._executor.shutdown = shutdown
+    for _ in range(2):
+        with pytest.raises(RuntimeError, match="first shutdown failure"):
+            await service.aclose()
+    with pytest.raises(RuntimeError, match="first shutdown failure"):
+        await service.aclose()
+    assert calls == 3
+
+
+@pytest.mark.asyncio
+async def test_cancelled_close_preserves_first_shutdown_error():
+    service = HistoryQueryService(sqlite3.connect(":memory:"))
+    started = threading.Event()
+    release = threading.Event()
+
+    def shutdown(*_args, **_kwargs):
+        started.set()
+        release.wait(2)
+        raise RuntimeError("first shutdown failure")
+
+    service._executor.shutdown = shutdown
+    close = asyncio.create_task(service.aclose())
+    await asyncio.to_thread(started.wait, 2)
+    close.cancel()
+    close.cancel()
+    release.set()
+    with pytest.raises(asyncio.CancelledError):
+        await close
+    with pytest.raises(RuntimeError, match="first shutdown failure"):
+        await service.aclose()
 
 
 @pytest.mark.asyncio
