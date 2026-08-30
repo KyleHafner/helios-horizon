@@ -176,7 +176,10 @@ async def test_benchmark_is_accepted_as_background_job_and_blocks_profile_start(
         async def prove_idle(self, _profile_id):
             return None
 
-        def prepare(self, _action, _job_id):
+        def preflight(self, _action, _job_id):
+            return {"version": 2, "preflight": {}}
+
+        def prepare_frozen(self, _action, _job_id, _provenance):
             return None
 
         async def run(self, _action, _job_id):

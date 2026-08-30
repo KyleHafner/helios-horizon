@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import os
 from pathlib import Path
+import stat
 from typing import Any
 
 
@@ -44,13 +46,21 @@ class RootWakeSafetyEvidence:
             if path is None:
                 return WakeSafetyEvidence(False, False, "root reservation is unavailable")
             reservation_path = Path(path)
+            try:
+                info = os.lstat(reservation_path)
+            except FileNotFoundError:
+                return WakeSafetyEvidence(True, True)
+            except OSError:
+                return WakeSafetyEvidence(False, False, "root reservation is unreadable")
+            if not stat.S_ISREG(info.st_mode) or stat.S_ISLNK(info.st_mode):
+                return WakeSafetyEvidence(False, False, "root reservation is unsafe")
             if reservation_path.exists():
                 reader = getattr(self.reservation_store, "read", None)
                 reservation = reader() if callable(reader) else None
                 if reservation is None:
                     return WakeSafetyEvidence(False, False, "root reservation is malformed")
                 return WakeSafetyEvidence(True, False, "root reservation is present")
-            return WakeSafetyEvidence(True, True)
+            return WakeSafetyEvidence(False, False, "root reservation is unreadable")
         except Exception:
             return WakeSafetyEvidence(False, False, "root wake evidence is unavailable")
 

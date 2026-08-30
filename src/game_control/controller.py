@@ -2038,10 +2038,11 @@ class Controller:
         profile = self._profile(action.profile_id)
         self._require_operation(profile, OperationName.BENCHMARK, actor)
         prove_idle = self._service("benchmarks", "prove_idle")
-        prepare = self._service("benchmarks", "prepare")
+        preflight = self._service("benchmarks", "preflight")
+        prepare_frozen = self._service("benchmarks", "prepare_frozen")
         run = self._service("benchmarks", "run")
         fail = self._service("benchmarks", "fail")
-        if None in {prove_idle, prepare, run, fail}:
+        if None in {prove_idle, preflight, prepare_frozen, run, fail}:
             raise _ControllerFailure(ErrorCode.BENCHMARK_FAILED, "benchmark service unavailable")
         lease, renewal_task = await self._operation_lease_acquire(profile, "benchmark", request_id, actor=actor)
         try:
@@ -2056,34 +2057,43 @@ class Controller:
             await self._operation_lease_release(lease, renewal_task)
             raise
 
-        def accept() -> str:
-            active = self._db().execute(
-                "SELECT operation FROM jobs WHERE state IN ('accepted','running') LIMIT 1"
-            ).fetchone()
-            if active is not None:
-                raise _ControllerFailure(ErrorCode.INVALID_STATE, "another game operation is active", retryable=True)
-            job_id = self._job_intent(actor, "benchmark", profile.id)
-            try:
-                prepare(action, job_id)
-            except Exception:
-                self._finish(
-                    job_id,
-                    actor,
-                    "benchmark",
-                    profile.id,
-                    ok=False,
-                    code=ErrorCode.BENCHMARK_FAILED,
-                    detail="benchmark request validation failed",
-                )
-                raise
-            return job_id
-
-        try:
-            job_id = await self._transaction(accept)
-        except SafeError as exc:
+        active = self._db().execute(
+            "SELECT operation FROM jobs WHERE state IN ('accepted','running') LIMIT 1"
+        ).fetchone()
+        if active is not None:
             await self._operation_lease_release(lease, renewal_task)
-            raise _ControllerFailure(ErrorCode.INVALID_REQUEST, exc.message) from exc
+            raise _ControllerFailure(ErrorCode.INVALID_STATE, "another game operation is active", retryable=True)
+        job_id = await self._transaction(lambda: self._job_intent(actor, "benchmark", profile.id))
+        try:
+            frozen = await self._await_lease(
+                asyncio.to_thread(preflight, action, job_id),
+                renewal_task,
+                drain_on_renewal=True,
+            )
+            if not isinstance(frozen, Mapping):
+                raise SafeError("benchmark_failed", "benchmark preflight provenance is unavailable")
+            await self._transaction(
+                lambda: prepare_frozen(action, job_id, frozen)
+            )
+        except SafeError as exc:
+            await self._transaction(lambda: self._finish(
+                job_id, actor, "benchmark", profile.id, ok=False,
+                code=ErrorCode.BENCHMARK_FAILED, detail="benchmark request validation failed",
+            ))
+            await self._operation_lease_release(lease, renewal_task)
+            raise _ControllerFailure(ErrorCode.BENCHMARK_FAILED, exc.message) from exc
+        except asyncio.CancelledError:
+            await self._transaction(lambda: self._finish(
+                job_id, actor, "benchmark", profile.id, ok=False,
+                code=ErrorCode.INTERNAL_ERROR, detail="benchmark preparation cancelled",
+            ))
+            await self._operation_lease_release(lease, renewal_task)
+            raise
         except Exception:
+            await self._transaction(lambda: self._finish(
+                job_id, actor, "benchmark", profile.id, ok=False,
+                code=ErrorCode.BENCHMARK_FAILED, detail="benchmark request validation failed",
+            ))
             await self._operation_lease_release(lease, renewal_task)
             raise
         task = asyncio.create_task(
@@ -2224,18 +2234,19 @@ class Controller:
         profile = self._profile(action.profile_id)
         async with self._operation_lease(profile, "set_profile_config", request_id, actor=actor) as (_lease, renewal):
             status_service = getattr(self.services, "status", None)
-            if status_service is not None:
-                snapshot = await self._authoritative_status_snapshot(actor, request_id)
-                current = next((item for item in snapshot.profiles if item.profile_id == profile.id), None)
-                if current is None:
-                    raise _ControllerFailure(
-                        ErrorCode.HEALTH_FAILED,
-                        "profile status is unavailable",
-                        retryable=True,
-                    )
-                state = getattr(getattr(current, "state", None), "value", getattr(current, "state", None))
-                if state in {"starting", "stopping"}:
-                    raise _ControllerFailure(ErrorCode.INVALID_STATE, "profile config cannot change while the profile is transitioning")
+            if status_service is None:
+                raise _ControllerFailure(ErrorCode.HEALTH_FAILED, "status is unavailable", retryable=True)
+            snapshot = await self._authoritative_status_snapshot(actor, request_id)
+            current = next((item for item in snapshot.profiles if item.profile_id == profile.id), None)
+            if current is None:
+                raise _ControllerFailure(
+                    ErrorCode.HEALTH_FAILED,
+                    "profile status is unavailable",
+                    retryable=True,
+                )
+            state = getattr(getattr(current, "state", None), "value", getattr(current, "state", None))
+            if state in {"starting", "stopping"}:
+                raise _ControllerFailure(ErrorCode.INVALID_STATE, "profile config cannot change while the profile is transitioning")
             try:
                 result = await self._await_lease(
                     asyncio.to_thread(

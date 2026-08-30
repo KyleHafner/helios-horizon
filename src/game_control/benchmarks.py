@@ -463,18 +463,20 @@ class BenchmarkService:
         if bool(getattr(observed, "running", False)):
             raise SafeError("invalid_state", "profile must be stopped before benchmarking")
 
-    def prepare(self, action: Any, job_id: str) -> None:
+    def _validate_action(self, action: Any) -> BenchmarkPlan:
         plan = self._plan(action.profile_id)
         allowed = {preset.id for preset in plan.presets}
         if action.baseline_preset not in allowed or action.candidate_preset not in allowed:
             raise SafeError("invalid_request", "benchmark preset is not configured")
         if action.baseline_preset == action.candidate_preset:
             raise SafeError("invalid_request", "baseline and candidate presets must differ")
-        connection = _connection(self.database)
-        self._require_schema(connection)
-        preflight: dict[str, Any] | None = None
+        return plan
+
+    def preflight(self, action: Any, job_id: str) -> dict[str, Any]:
+        """Run bounded external validation and return frozen provenance."""
+        plan = self._validate_action(action)
         preflight = self._run_preflight(plan, job_id)
-        provenance = {
+        provenance: dict[str, Any] = {
             "version": 2,
             "driverSha256": _sha256(plan.driver),
             "configSha256": _sha256(plan.config),
@@ -483,9 +485,27 @@ class BenchmarkService:
                 for preset in plan.presets
                 if preset.id in {action.baseline_preset, action.candidate_preset}
             },
+            "preflight": preflight,
         }
-        if preflight is not None:
-            provenance["preflight"] = preflight
+        return json.loads(json.dumps(provenance, separators=(",", ":"), sort_keys=True))
+
+    def prepare_frozen(self, action: Any, job_id: str, provenance: Mapping[str, Any]) -> None:
+        """Persist already-frozen provenance without external work."""
+        self._validate_action(action)
+        connection = _connection(self.database)
+        self._require_schema(connection)
+        try:
+            frozen = json.loads(json.dumps(provenance, separators=(",", ":"), sort_keys=True))
+        except (TypeError, ValueError, json.JSONDecodeError) as exc:
+            raise SafeError("benchmark_failed", "benchmark preflight provenance is invalid") from exc
+        required = ("version", "driverSha256", "configSha256", "presetDigests", "preflight")
+        if (
+            not isinstance(frozen, dict)
+            or any(key not in frozen for key in required)
+            or frozen.get("version") != 2
+            or not isinstance(frozen.get("preflight"), dict)
+        ):
+            raise SafeError("benchmark_failed", "benchmark preflight provenance is incomplete")
         connection.execute(
             "INSERT INTO benchmark_runs(id,profile_id,baseline_preset,candidate_preset,state,created_at,provenance_json,planned_pairs,completed_pairs,failure_category) "
             "VALUES (?,?,?,?,?,?,?,?,?,?)",
@@ -496,7 +516,7 @@ class BenchmarkService:
                 action.candidate_preset,
                 "running",
                 _iso(self.clock()),
-                json.dumps(provenance, separators=(",", ":"), sort_keys=True),
+                json.dumps(frozen, separators=(",", ":"), sort_keys=True),
                 "2",
                 "0",
                 "none",
@@ -505,6 +525,10 @@ class BenchmarkService:
         connection.commit()
         connection.execute("UPDATE benchmark_runs SET stage='prepared',progress=0 WHERE id=?", (job_id,))
         connection.commit()
+
+    def prepare(self, action: Any, job_id: str) -> None:
+        """Compatibility entry point; preflight runs before persistence."""
+        self.prepare_frozen(action, job_id, self.preflight(action, job_id))
 
     def _execute(
         self, action: Any, job_id: str
