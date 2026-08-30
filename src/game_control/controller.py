@@ -331,7 +331,85 @@ class Controller:
         self._maintenance_lock = asyncio.Lock()
         self.initializing = True
         self._background_tasks: set[asyncio.Task[Any]] = set()
+        self._background_close_task: asyncio.Task[None] | None = None
+        self._background_closed = False
         self._readiness = ReadinessCoordinator()
+
+    @staticmethod
+    def _consume_background_task(task: asyncio.Task[Any]) -> None:
+        """Observe terminal workers without releasing their close handles."""
+
+        try:
+            task.result()
+        except asyncio.CancelledError:
+            return
+        except BaseException:
+            # The close ledger observes the same task again.  Consuming here
+            # prevents an unexpected worker exit from becoming an event-loop
+            # warning while retaining the handle for deterministic draining.
+            _LOG.error("controller background worker failed", exc_info=True)
+
+    @staticmethod
+    def _consume_background_close_task(task: asyncio.Task[Any]) -> None:
+        try:
+            task.exception()
+        except BaseException:
+            return
+
+    async def _close_background_tasks(self) -> None:
+        workers = tuple(self._background_tasks)
+        for worker in workers:
+            if not worker.done():
+                worker.cancel()
+        if not workers:
+            return
+        results = await asyncio.gather(*workers, return_exceptions=True)
+        for result in results:
+            if isinstance(result, BaseException) and not isinstance(result, asyncio.CancelledError):
+                raise result
+
+    async def aclose(self) -> None:
+        """Cancel and drain every accepted worker exactly once.
+
+        Worker finally blocks own reservation release, so the close operation
+        waits for those blocks before returning.  The internal close task is
+        shielded from caller cancellation and therefore remains retryable and
+        warning-free.
+        """
+
+        self._background_closed = True
+        task = self._background_close_task
+        task_succeeded = False
+        if task is not None and task.done() and not task.cancelled():
+            try:
+                task_succeeded = task.exception() is None
+            except BaseException:
+                task_succeeded = False
+        if task is None or (task.done() and not task_succeeded):
+            task = asyncio.create_task(self._close_background_tasks(), name="horizon-controller-close")
+            task.add_done_callback(self._consume_background_close_task)
+            self._background_close_task = task
+        elif task_succeeded:
+            return
+        cancelled = False
+        while True:
+            try:
+                await asyncio.shield(task)
+                break
+            except asyncio.CancelledError:
+                cancelled = True
+                if task.done():
+                    break
+                continue
+        error: BaseException | None = None
+        try:
+            task.result()
+        except BaseException as exc:
+            error = exc
+        if cancelled:
+            raise asyncio.CancelledError
+        if error is not None:
+            raise error
 
     def _record_lifecycle_latency(self, metric: str, profile_id: Any, started: float, *, success: bool, result: str | None = None) -> None:
         """Best-effort bounded terminal lifecycle sample; never alter control flow."""
@@ -2092,12 +2170,15 @@ class Controller:
             ))
             await self._operation_lease_release(lease, renewal_task)
             raise
+        if self._background_closed:
+            await self._operation_lease_release(lease, renewal_task)
+            raise _ControllerFailure(ErrorCode.INVALID_STATE, "controller is closed")
         task = asyncio.create_task(
             self._benchmark_worker(action, actor, request_id, job_id, run, fail, lease, renewal_task),
             name=f"benchmark-{job_id}",
         )
         self._background_tasks.add(task)
-        task.add_done_callback(self._background_tasks.discard)
+        task.add_done_callback(self._consume_background_task)
         return JobAccepted(job_id=job_id, state="accepted")
 
     async def _operation_lease_acquire(self, profile: Profile, operation: str, request_id: UUID, *, actor: str):

@@ -5,6 +5,7 @@ import hashlib
 import os
 import sqlite3
 import tarfile
+import threading
 import zipfile
 from pathlib import Path
 from types import SimpleNamespace
@@ -24,6 +25,54 @@ from game_control.models import (
     UpdateSpec,
 )
 from game_control.updates import UpdateService
+
+
+class _FalseyClient:
+    def __init__(self):
+        self.closed = 0
+
+    def __bool__(self):
+        return False
+
+    def close(self):
+        self.closed += 1
+
+
+@pytest.mark.asyncio
+async def test_falsey_injected_client_is_borrowed_and_remains_open(tmp_path: Path):
+    client = _FalseyClient()
+    service = UpdateService({}, http_client=client)
+    assert service.http_client is client
+    await service.aclose()
+    await service.aclose()
+    assert client.closed == 0
+
+
+@pytest.mark.asyncio
+async def test_default_client_is_closed_once_and_close_cancellation_is_safe():
+    service = UpdateService({})
+    calls = 0
+    started = threading.Event()
+    release = threading.Event()
+
+    def close():
+        nonlocal calls
+        started.set()
+        release.wait(2)
+        calls += 1
+
+    service.http_client.close = close
+    closing = asyncio.create_task(service.aclose())
+    assert await asyncio.to_thread(started.wait, 1)
+    closing.cancel()
+    closing.cancel()
+    await asyncio.sleep(0)
+    assert not closing.done()
+    release.set()
+    with pytest.raises(asyncio.CancelledError):
+        await closing
+    await service.aclose()
+    assert calls == 1
 
 
 def _profile(

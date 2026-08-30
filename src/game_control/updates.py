@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import hmac
+import inspect
 import os
 import re
 import shutil
@@ -95,9 +97,59 @@ class UpdateService:
         self.verify_release = verify_release
         self.stopped_check = stopped_check
         self.running_check = running_check
-        self.http_client = http_client or httpx.Client(timeout=10.0)
+        # Injected clients are borrowed even when a test double deliberately
+        # implements falsey truthiness.  Only the default client is owned.
+        self._owns_http_client = http_client is None
+        self.http_client = httpx.Client(timeout=10.0) if http_client is None else http_client
+        self._http_client_closed = False
+        self._close_task: asyncio.Task[None] | None = None
         self.clock = clock or time.time
         self.lease_check = lease_check
+
+    async def _close_impl(self) -> None:
+        if self._http_client_closed or not self._owns_http_client:
+            return
+        close = getattr(self.http_client, "aclose", None)
+        if callable(close):
+            result = close()
+            if inspect.isawaitable(result):
+                await result
+        else:
+            close = getattr(self.http_client, "close", None)
+            if callable(close):
+                result = await asyncio.to_thread(close)
+                if inspect.isawaitable(result):
+                    await result
+        self._http_client_closed = True
+
+    async def aclose(self) -> None:
+        """Close the default HTTP client once, preserving cancellation."""
+
+        task = self._close_task
+        if task is None or task.done():
+            task = asyncio.create_task(self._close_impl(), name="horizon-update-close")
+            self._close_task = task
+        cancelled = False
+        while True:
+            try:
+                await asyncio.shield(task)
+                break
+            except asyncio.CancelledError:
+                cancelled = True
+                if task.done():
+                    break
+                continue
+        # Consume an ordinary close failure even when the caller was
+        # cancelled, so no task exception becomes unretrieved.
+        error: BaseException | None = None
+        try:
+            task.result()
+        except BaseException as exc:
+            error = exc
+        if cancelled or isinstance(error, asyncio.CancelledError):
+            raise asyncio.CancelledError
+        if error is not None:
+            raise error
 
     def _assert_lease(self) -> None:
         if self.lease_check is not None and not self.lease_check():

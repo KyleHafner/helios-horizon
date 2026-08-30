@@ -2278,3 +2278,27 @@ async def test_reconcile_startup_marks_jobs_and_reconciles_slot_observation(tmp_
     assert controller._db().execute(
         "SELECT state,error_code FROM benchmark_runs WHERE id='bench-pending'"
     ).fetchone() == ("failed", "controller_restarted")
+
+
+@pytest.mark.asyncio
+async def test_aclose_cancels_retained_workers_and_waits_for_worker_cleanup(tmp_path):
+    controller = Controller.for_testing(tmp_path)
+    cleanup = asyncio.Event()
+
+    async def worker():
+        try:
+            await asyncio.Event().wait()
+        finally:
+            cleanup.set()
+
+    task = asyncio.create_task(worker())
+    controller._background_tasks.add(task)
+    task.add_done_callback(controller._consume_background_task)
+    closing = asyncio.create_task(controller.aclose())
+    await asyncio.sleep(0)
+    closing.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await closing
+    assert cleanup.is_set()
+    assert task.done()
+    await controller.aclose()
