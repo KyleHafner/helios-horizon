@@ -292,6 +292,70 @@ def test_expected_operation_kind_prevents_same_id_lifecycle_confusion(slot_env):
     assert slot_env.store.read().operation_kind == "lifecycle"
 
 
+def test_update_lease_ownership_binds_pid_and_start_ticks(slot_env):
+    ticks = {111: 700, 222: 800}
+    store = ReservationStore(
+        slot_env.operation_path,
+        slot_env.reservation_path,
+        pid_start_ticks=lambda pid: ticks.get(pid),
+    )
+    reservation = store.reserve(
+        "minecraft", "same-id", ttl=10, state_generation=3,
+        controller_pid=111, controller_start_ticks=700, operation_kind="update",
+    )
+    assert store.owns_live(
+        "minecraft", "same-id", 3, operation_kind="update",
+        controller_pid=111, controller_start_ticks=700,
+    )
+    assert not store.owns_live(
+        "minecraft", "same-id", 3, operation_kind="update",
+        controller_pid=222, controller_start_ticks=800,
+    )
+    with pytest.raises(BlockingIOError):
+        store.renew_if_owned(
+            "minecraft", "same-id", 10, state_generation=3,
+            operation_kind="update", controller_pid=222, controller_start_ticks=800,
+        )
+    assert not store.release_if_owned(
+        "minecraft", "same-id", 3, operation_kind="update",
+        controller_pid=222, controller_start_ticks=800,
+    )
+    assert store.read() == reservation
+
+
+def test_admission_rejects_malformed_reservation_instead_of_overwriting(slot_env):
+    slot_env.reservation_path.write_text("{not-json", encoding="ascii")
+    with pytest.raises(ValueError, match="reservation state is malformed"):
+        slot_env.store.reserve_if_available("minecraft", "new", ttl=10)
+    assert slot_env.reservation_path.read_text(encoding="ascii") == "{not-json"
+
+
+@pytest.mark.parametrize("shape", ["symlink", "hardlink", "mode"])
+def test_admission_rejects_unsafe_reservation_shape(slot_env, tmp_path: Path, shape: str):
+    payload = json.dumps({"profile_id": "minecraft", "operation_id": "op", "state_generation": 0,
+                          "controller_pid": os.getpid(), "controller_start_ticks": 1,
+                          "expires_at": 4_000_000_000})
+    source = tmp_path / "source.json"
+    source.write_text(payload, encoding="ascii")
+    if shape == "symlink":
+        slot_env.reservation_path.symlink_to(source)
+    elif shape == "hardlink":
+        os.link(source, slot_env.reservation_path)
+    else:
+        slot_env.reservation_path.write_text(payload, encoding="ascii")
+        slot_env.reservation_path.chmod(0o666)
+    with pytest.raises(ValueError, match="reservation state is (unsafe|malformed)"):
+        slot_env.store.reserve_if_available("minecraft", "new", ttl=10)
+
+
+def test_admission_does_not_take_over_live_same_operation_id(slot_env):
+    slot_env.store.reserve("minecraft", "same-id", ttl=10, operation_kind="update")
+    with pytest.raises(BlockingIOError, match="already live"):
+        slot_env.store.reserve_if_available(
+            "minecraft", "same-id", ttl=10, operation_kind="update",
+        )
+
+
 def test_release_if_owned_does_not_delete_replacement(slot_env):
     slot_env.store.reserve("minecraft", "op-1", ttl=10, state_generation=1)
     assert slot_env.store.release_if_owned("minecraft", "op-2", 1) is False

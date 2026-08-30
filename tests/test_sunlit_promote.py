@@ -130,8 +130,8 @@ def test_promotes_exact_inactive_candidate_into_fixed_layout(tmp_path: Path, mon
     assert not (candidate / "state").exists()
     assert MODULE.promote(context) == report
     assert actions == [
-        MODULE.PublicationAction.STATE,
         MODULE.PublicationAction.RELEASE,
+        MODULE.PublicationAction.STATE,
         MODULE.PublicationAction.ACTIVE_LINK,
     ]
 
@@ -251,7 +251,14 @@ def test_promote_without_publication_guard_fails_before_preflight(monkeypatch) -
         MODULE.promote()
 
 
-def test_guard_refusal_rolls_back_only_through_guard_and_keeps_state_stable(tmp_path: Path, monkeypatch) -> None:
+@pytest.mark.parametrize("refused", [
+    MODULE.PublicationAction.RELEASE,
+    MODULE.PublicationAction.STATE,
+    MODULE.PublicationAction.ACTIVE_LINK,
+])
+def test_guard_refusal_preserves_resumable_forward_state(
+    tmp_path: Path, monkeypatch, refused: MODULE.PublicationAction,
+) -> None:
     candidate = tmp_path / "stage/candidate"
     runtime = candidate / "runtime"
     state = candidate / "state"
@@ -265,13 +272,14 @@ def test_guard_refusal_rolls_back_only_through_guard_and_keeps_state_stable(tmp_
     manifest.write_text("{}", encoding="ascii")
     actions: list[MODULE.PublicationAction] = []
     guard_depth = 0
+    refuse = True
 
     @contextmanager
     def guard(action: MODULE.PublicationAction) -> Iterator[None]:
         nonlocal guard_depth
         assert guard_depth == 0
         actions.append(action)
-        if action is MODULE.PublicationAction.ACTIVE_LINK:
+        if refuse and action is refused:
             raise MODULE.PromotionError("reservation changed")
         guard_depth += 1
         try:
@@ -308,7 +316,6 @@ def test_guard_refusal_rolls_back_only_through_guard_and_keeps_state_stable(tmp_
     )
     monkeypatch.setattr(MODULE, "_sunlit_ids", lambda: (os.getuid(), os.getgid()))
     monkeypatch.setattr(MODULE, "_already_promoted", lambda *_args: None)
-    monkeypatch.setattr(MODULE, "_resume_published_release", lambda *_args: None)
     monkeypatch.setattr(MODULE, "_bind_candidate_links", lambda *_args: None)
     monkeypatch.setattr(MODULE, "_normalize_release_permissions", lambda *_args: None)
     monkeypatch.setattr(MODULE, "_write_metadata", lambda *_args, **_kwargs: None)
@@ -321,20 +328,32 @@ def test_guard_refusal_rolls_back_only_through_guard_and_keeps_state_stable(tmp_
     with pytest.raises(MODULE.PromotionError, match="reservation changed"):
         MODULE.promote(context)
 
-    assert actions == [
-        MODULE.PublicationAction.STATE,
+    expected_actions = [
         MODULE.PublicationAction.RELEASE,
+        MODULE.PublicationAction.STATE,
         MODULE.PublicationAction.ACTIVE_LINK,
-        MODULE.PublicationAction.ROLLBACK_RELEASE,
-        MODULE.PublicationAction.ROLLBACK_STATE,
     ]
-    assert not state_root.exists()
-    assert not context.release.exists()
+    assert actions == expected_actions[: expected_actions.index(refused) + 1]
+    # A sticky refusal is a resumable checkpoint, not a claim of success and
+    # not a second attempt through a fence that already denied ownership.
+    assert context.release.exists() is not (refused is MODULE.PublicationAction.RELEASE)
+    assert state_root.exists() is (refused is MODULE.PublicationAction.ACTIVE_LINK)
     assert not active_link.exists() and not active_link.is_symlink()
-    assert (state / "sentinel").read_text(encoding="utf-8") == "unchanged"
+    refuse = False
+    retry = MODULE.promote(context)
+    assert retry["version"] == "v1"
+    assert active_link.is_symlink()
 
 
-def test_upgrades_existing_release_without_replacing_stable_state(tmp_path: Path, monkeypatch) -> None:
+@pytest.mark.parametrize("refused", [
+    MODULE.PublicationAction.RELEASE,
+    MODULE.PublicationAction.VERSION_STATE,
+    MODULE.PublicationAction.ACTIVE_LINK,
+    MODULE.PublicationAction.METADATA,
+])
+def test_upgrades_existing_release_without_replacing_stable_state(
+    tmp_path: Path, monkeypatch, refused: MODULE.PublicationAction,
+) -> None:
     stage = tmp_path / "stage"
     candidate = stage / "candidate"
     runtime = candidate / "runtime"
@@ -413,12 +432,15 @@ def test_upgrades_existing_release_without_replacing_stable_state(tmp_path: Path
     monkeypatch.setitem(globals_, "_sunlit_ids", lambda: (os.getuid(), os.getgid()))
     actions: list[MODULE.PublicationAction] = []
     guard_depth = 0
+    refuse = True
 
     @contextmanager
     def guarded(action: MODULE.PublicationAction) -> Iterator[None]:
         nonlocal guard_depth
         assert guard_depth == 0
         actions.append(action)
+        if refuse and action is refused:
+            raise MODULE.PromotionError("reservation changed")
         guard_depth += 1
         try:
             yield
@@ -440,6 +462,13 @@ def test_upgrades_existing_release_without_replacing_stable_state(tmp_path: Path
     monkeypatch.setattr(MODULE, "_fsync_tree", fsync_tree_outside_guard)
 
     context = replace(MODULE._default_context(), publication_guard=guarded)
+    with pytest.raises(MODULE.PromotionError, match="reservation changed"):
+        MODULE.promote(context)
+    # Before activation, old active + old metadata remain coherent.  After
+    # activation, the retry path repairs metadata and drains candidate state.
+    if refused is not MODULE.PublicationAction.METADATA:
+        assert active.resolve() == old_release.resolve()
+    refuse = False
     report = MODULE.promote(context)
 
     assert report["version"] == "v2"
@@ -452,9 +481,4 @@ def test_upgrades_existing_release_without_replacing_stable_state(tmp_path: Path
     assert not (candidate / "runtime").exists()
     assert not (candidate / "state").exists()
     assert MODULE.promote(context) == report
-    assert actions == [
-        MODULE.PublicationAction.RELEASE,
-        MODULE.PublicationAction.VERSION_STATE,
-        MODULE.PublicationAction.METADATA,
-        MODULE.PublicationAction.ACTIVE_LINK,
-    ]
+    assert active.resolve() == new_release.resolve()

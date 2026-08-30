@@ -1,6 +1,9 @@
 from __future__ import annotations
 
 import json
+import os
+import threading
+import time
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -44,11 +47,34 @@ def test_check_reports_current_without_mutation(tmp_path: Path, monkeypatch) -> 
     state = tmp_path / "state/.horizon"
     state.mkdir(parents=True)
     (state / "release.json").write_text(json.dumps({"version": "v2"}), encoding="utf-8")
+    releases = tmp_path / "releases"
+    releases.mkdir()
+    (releases / "v2").mkdir()
+    active = tmp_path / "active"
+    active.symlink_to(releases / "v2", target_is_directory=True)
     monkeypatch.setattr(MODULE, "STATE_ROOT", tmp_path / "state")
+    monkeypatch.setattr(MODULE, "RELEASE_ROOT", releases)
+    monkeypatch.setattr(MODULE, "ACTIVE_LINK", active)
     monkeypatch.setattr(MODULE, "discover", lambda: {"version": "v2"})
     monkeypatch.setattr(MODULE, "_stage", lambda _release: (_ for _ in ()).throw(AssertionError("must not stage")))
 
     assert MODULE.run(check_only=False) == {"state": "current", "installed": "v2", "available": None}
+
+
+def test_installed_version_requires_active_release_commit(tmp_path: Path, monkeypatch) -> None:
+    state = tmp_path / "state/.horizon"
+    state.mkdir(parents=True)
+    (state / "release.json").write_text(json.dumps({"version": "v2"}), encoding="utf-8")
+    releases = tmp_path / "releases"
+    releases.mkdir()
+    (releases / "v2").mkdir()
+    active = tmp_path / "active"
+    monkeypatch.setattr(MODULE, "STATE_ROOT", tmp_path / "state")
+    monkeypatch.setattr(MODULE, "RELEASE_ROOT", releases)
+    monkeypatch.setattr(MODULE, "ACTIVE_LINK", active)
+    assert MODULE._installed_version() is None
+    active.symlink_to(releases / "v2", target_is_directory=True)
+    assert MODULE._installed_version() == "v2"
 
 
 def test_inactive_gate_defers_before_staging(monkeypatch) -> None:
@@ -118,6 +144,111 @@ def test_space_preflight_accounts_for_compressed_archive_expansion_and_old_relea
 def test_space_preflight_rejects_unproven_archive_size(monkeypatch) -> None:
     with pytest.raises(MODULE.UpdateError, match="free space"):
         MODULE._space_available({"size": "unknown"})
+
+
+def test_space_preflight_rejects_oversized_archive_directly(monkeypatch, tmp_path: Path) -> None:
+    overlay = tmp_path / "overlay.jar"
+    overlay.write_bytes(b"overlay")
+    staging = tmp_path / "staging"
+    staging.mkdir()
+    monkeypatch.setattr(MODULE, "STATE_ROOT", tmp_path / "state")
+    monkeypatch.setattr(MODULE, "RELEASE_ROOT", tmp_path / "releases")
+    monkeypatch.setattr(MODULE, "STAGING_ROOT", staging)
+    monkeypatch.setattr(MODULE, "OVERLAY", overlay)
+    with pytest.raises(MODULE.UpdateError, match="free space"):
+        MODULE._space_available({"size": MODULE.MAX_ARCHIVE + 1})
+
+
+def test_staged_operation_id_is_durable_and_rejects_populated_legacy_root(tmp_path: Path, monkeypatch) -> None:
+    staging = tmp_path / "staging"
+    monkeypatch.setattr(MODULE, "STAGING_ROOT", staging)
+    release = {"version": "v2"}
+    root = MODULE._staging_root(release)
+    first = MODULE._staged_operation_id(root)
+    assert MODULE._staged_operation_id(root) == first
+    assert str(MODULE.uuid.UUID(first)) == first
+    (root / "update-operation-id").write_text("not-a-uuid\n", encoding="ascii")
+    (root / "update-operation-id").chmod(0o600)
+    with pytest.raises(MODULE.UpdateError, match="identity is malformed"):
+        MODULE._staged_operation_id(root)
+    (root / "update-operation-id").unlink()
+    (root / "candidate").mkdir()
+    with pytest.raises(MODULE.UpdateError, match="identity is missing"):
+        MODULE._staged_operation_id(root)
+
+
+@pytest.mark.parametrize("unsafe", ["symlink", "fifo"])
+def test_space_preflight_rejects_unsafe_state_members(tmp_path: Path, monkeypatch, unsafe: str) -> None:
+    state = tmp_path / "state"
+    state.mkdir()
+    if unsafe == "symlink":
+        (state / "world").symlink_to(tmp_path / "outside")
+    else:
+        os.mkfifo(state / "world")
+    overlay = tmp_path / "overlay.jar"
+    overlay.write_bytes(b"overlay")
+    staging = tmp_path / "staging"
+    staging.mkdir()
+    monkeypatch.setattr(MODULE, "STATE_ROOT", state)
+    monkeypatch.setattr(MODULE, "RELEASE_ROOT", tmp_path / "releases")
+    monkeypatch.setattr(MODULE, "STAGING_ROOT", staging)
+    monkeypatch.setattr(MODULE, "OVERLAY", overlay)
+    with pytest.raises(MODULE.UpdateError, match="persistent state"):
+        MODULE._space_available({"size": 1})
+
+
+@pytest.mark.parametrize("unsafe", ["symlink", "fifo", "writable"])
+def test_space_preflight_rejects_unsafe_overlay(tmp_path: Path, monkeypatch, unsafe: str) -> None:
+    state = tmp_path / "state"
+    state.mkdir()
+    staging = tmp_path / "staging"
+    staging.mkdir()
+    overlay = tmp_path / "overlay.jar"
+    if unsafe == "symlink":
+        overlay.symlink_to(tmp_path / "outside.jar")
+    elif unsafe == "fifo":
+        os.mkfifo(overlay)
+    else:
+        overlay.write_bytes(b"overlay")
+        overlay.chmod(0o666)
+    monkeypatch.setattr(MODULE, "STATE_ROOT", state)
+    monkeypatch.setattr(MODULE, "RELEASE_ROOT", tmp_path / "releases")
+    monkeypatch.setattr(MODULE, "STAGING_ROOT", staging)
+    monkeypatch.setattr(MODULE, "OVERLAY", overlay)
+    with pytest.raises(MODULE.UpdateError, match="overlay size"):
+        MODULE._space_available({"size": 1})
+
+
+def test_update_lease_pause_fully_drains_renewal_thread(monkeypatch) -> None:
+    entered = threading.Event()
+    unblock = threading.Event()
+
+    class Store:
+        def renew_if_owned(self, *_args, **_kwargs):
+            entered.set()
+            assert unblock.wait(timeout=2)
+
+    monkeypatch.setattr(MODULE, "RESERVATION_RENEW_INTERVAL", 0)
+    lease = MODULE._UpdateLease(
+        Store(), "operation", 0, controller_pid=os.getpid(),
+        controller_start_ticks=1,
+    )
+    lease.start()
+    assert entered.wait(timeout=2)
+    pause_done = threading.Event()
+
+    def pause() -> None:
+        lease.pause()
+        pause_done.set()
+
+    waiter = threading.Thread(target=pause)
+    waiter.start()
+    time.sleep(0.05)
+    assert not pause_done.is_set()
+    unblock.set()
+    waiter.join(timeout=2)
+    assert pause_done.is_set()
+    assert lease._thread is None
 
 
 def test_space_preflight_rejects_unproven_measured_expansion(monkeypatch) -> None:

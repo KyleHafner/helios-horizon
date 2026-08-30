@@ -36,6 +36,10 @@ class PromotionError(ValueError):
     pass
 
 
+class PublicationRefused(PromotionError):
+    """A publication fence refused or failed after the action was attempted."""
+
+
 class PublicationAction(str, Enum):
     STATE = "state"
     RELEASE = "release"
@@ -209,8 +213,14 @@ def _publication(context: PromotionContext, action: PublicationAction) -> Iterat
     guarded = context.publication_guard(action)
     if not hasattr(guarded, "__enter__") or not hasattr(guarded, "__exit__"):
         raise PromotionError("publication guard is malformed")
-    with guarded:
-        yield
+    try:
+        with guarded:
+            yield
+    except (OSError, ValueError) as exc:
+        # Once an action reaches its guard, cleanup cannot safely assume that
+        # the rename did not happen.  Preserve the durable partial state and
+        # let the next owned invocation resume it.
+        raise PublicationRefused(str(exc) or "publication action was refused") from exc
 
 
 def _guarded_replace(
@@ -496,13 +506,51 @@ def _publish_report(context: PromotionContext, document: dict | None = None) -> 
 
 
 def _already_promoted(context: PromotionContext, document: dict, sunlit_owner: tuple[int, int]) -> dict | None:
-    expected_target = os.path.relpath(context.release, context.active_link.parent)
-    if not context.active_link.is_symlink() or os.readlink(context.active_link) != expected_target:
+    if not context.active_link.is_symlink():
         return None
-    if (context.candidate / "runtime").exists() or (context.candidate / "runtime").is_symlink() or (context.candidate / "state").exists() or (context.candidate / "state").is_symlink():
-        raise PromotionError("active promotion retained candidate payload")
+    try:
+        active_release = (context.active_link.parent / os.readlink(context.active_link)).resolve(strict=True)
+        expected_release = context.release.resolve(strict=True)
+    except OSError:
+        return None
+    if active_release != expected_release or active_release.parent != context.release_root.resolve():
+        return None
     _trusted_directory(context.release)
     _trusted_directory(context.state_root, owners=(sunlit_owner,))
+    runtime = context.candidate / "runtime"
+    state = context.candidate / "state"
+    if runtime.exists() or runtime.is_symlink():
+        _trusted_directory(runtime)
+        _bind_candidate_links(runtime, document, context)
+        if _tree_digest(runtime) != _tree_digest(context.release):
+            raise PromotionError("active promotion retained a mismatched candidate")
+        shutil.rmtree(runtime)
+    if state.exists() or state.is_symlink():
+        _trusted_directory(state, owners=((0, 0), sunlit_owner))
+        _candidate_matches_existing_state(
+            context, state, document, allow_moved_version=True,
+        )
+        shutil.rmtree(state)
+    # Activation is the commit point.  If a crash occurred after activation
+    # but before metadata publication, repair metadata only under its guard.
+    stable_record = context.state_root / ".horizon/release.json"
+    try:
+        current = _regular_json(stable_record, maximum=64 * 1024, owners=((0, 0), sunlit_owner))
+    except (OSError, PromotionError):
+        current = None
+    if (
+        current is None
+        or current.get("profile_id") != "minecraft-sunlit-cobblemon"
+        or current.get("version") != context.version
+        or current.get("manifest_sha256") != document["manifest_sha256"]
+    ):
+        _write_metadata(
+            context.state_root,
+            document,
+            context,
+            publication_action=PublicationAction.METADATA,
+            owner=sunlit_owner,
+        )
     record_path = context.candidate / "promotion.json"
     if not record_path.exists() and not record_path.is_symlink():
         return _publish_report(context, document)
@@ -513,6 +561,43 @@ def _already_promoted(context: PromotionContext, document: dict, sunlit_owner: t
 
 
 def _resume_published_release(context: PromotionContext, runtime: Path, document: dict, sunlit_owner: tuple[int, int]) -> dict | None:
+    # Fresh-install retry after release publication but before state
+    # publication.  The release is already immutable and the candidate state
+    # remains the only source of the pending persistent tree.
+    if (
+        context.release.is_dir()
+        and not context.release.is_symlink()
+        and not context.state_root.exists()
+        and not context.state_root.is_symlink()
+        and runtime.is_dir()
+        and not runtime.is_symlink()
+        and (context.candidate / "state").is_dir()
+        and not (context.candidate / "state").is_symlink()
+        and not context.active_link.exists()
+        and not context.active_link.is_symlink()
+    ):
+        _verify_release_ownership(context.release)
+        _bind_candidate_links(runtime, document, context)
+        if _tree_digest(runtime) != _tree_digest(context.release):
+            raise PromotionError("published release does not match the reviewed candidate")
+        state = context.candidate / "state"
+        _prepare_state_ownership(state)
+        _guarded_replace(
+            context,
+            PublicationAction.STATE,
+            state,
+            context.state_root,
+            context.state_root.parent,
+        )
+        _guarded_activate(
+            context,
+            PublicationAction.ACTIVE_LINK,
+            context.release,
+            expected_prior=None,
+        )
+        shutil.rmtree(runtime)
+        _fsync_dir(context.candidate)
+        return _publish_report(context, document)
     if not (
         context.release.is_dir()
         and not context.release.is_symlink()
@@ -541,7 +626,13 @@ def _resume_published_release(context: PromotionContext, runtime: Path, document
     return _publish_report(context, document)
 
 
-def _candidate_matches_existing_state(context: PromotionContext, state: Path, document: dict) -> Path:
+def _candidate_matches_existing_state(
+    context: PromotionContext,
+    state: Path,
+    document: dict,
+    *,
+    allow_moved_version: bool = False,
+) -> Path | None:
     """Prove the staged copy did not alter stable state; return only new version state."""
     try:
         policy = document["runtime_policy"]
@@ -577,6 +668,8 @@ def _candidate_matches_existing_state(context: PromotionContext, state: Path, do
     if candidate_versions.is_symlink() or not candidate_versions.is_dir():
         raise PromotionError("candidate version state is unsafe")
     members = list(candidate_versions.iterdir())
+    if allow_moved_version and not members:
+        return None
     if len(members) != 1 or members[0].name != context.version or members[0].is_symlink() or not members[0].is_dir():
         raise PromotionError("candidate version state is not exact")
     return members[0]
@@ -626,6 +719,98 @@ def _restore_metadata(context: PromotionContext, backup: dict[str, tuple[bytes, 
             temporary.unlink(missing_ok=True)
 
 
+def _resume_upgrade_publication(
+    context: PromotionContext,
+    runtime: Path,
+    state: Path,
+    document: dict,
+    sunlit_owner: tuple[int, int],
+) -> dict | None:
+    """Resume an upgrade after one of its guarded publications completed."""
+    if not (
+        context.state_root.is_dir()
+        and not context.state_root.is_symlink()
+        and context.active_link.is_symlink()
+        and context.release.is_dir()
+        and not context.release.is_symlink()
+    ):
+        return None
+    _trusted_directory(context.state_root, owners=(sunlit_owner,))
+    _verify_release_ownership(context.release)
+    active_target = os.readlink(context.active_link)
+    active_release = (context.active_link.parent / active_target).resolve(strict=True)
+    if active_release == context.release.resolve(strict=True):
+        # Active link is already committed.  Metadata and candidate cleanup
+        # are resumable post-commit work and remain guarded where stable state
+        # is changed.
+        _write_metadata(
+            context.state_root,
+            document,
+            context,
+            publication_action=PublicationAction.METADATA,
+            owner=sunlit_owner,
+        )
+        if runtime.exists() or runtime.is_symlink():
+            _trusted_directory(runtime)
+            _bind_candidate_links(runtime, document, context)
+            if _tree_digest(runtime) != _tree_digest(context.release):
+                raise PromotionError("active upgrade retained a mismatched candidate")
+            shutil.rmtree(runtime)
+        if state.exists() or state.is_symlink():
+            _trusted_directory(state, owners=((0, 0), sunlit_owner))
+            _candidate_matches_existing_state(
+                context, state, document, allow_moved_version=True,
+            )
+            shutil.rmtree(state)
+        _fsync_dir(context.candidate)
+        return _publish_report(context, document)
+    prior_release = (context.active_link.parent / active_target).resolve()
+    if prior_release.parent != context.release_root.resolve() or not prior_release.is_dir() or prior_release.is_symlink():
+        raise PromotionError("active upgrade target is unsafe")
+    versions_root = context.state_root / ".versions"
+    _trusted_directory(versions_root, owners=(sunlit_owner,))
+    production_version_state = versions_root / context.version
+    if not production_version_state.exists() and not production_version_state.is_symlink():
+        if not state.is_dir() or state.is_symlink():
+            raise PromotionError("upgrade version state is unavailable for resume")
+        version_state = _candidate_matches_existing_state(context, state, document)
+        _prepare_state_ownership(version_state)
+        _guarded_replace(
+            context,
+            PublicationAction.VERSION_STATE,
+            version_state,
+            production_version_state,
+            versions_root,
+        )
+    _guarded_activate(
+        context,
+        PublicationAction.ACTIVE_LINK,
+        context.release,
+        expected_prior=active_target,
+    )
+    _write_metadata(
+        context.state_root,
+        document,
+        context,
+        publication_action=PublicationAction.METADATA,
+        owner=sunlit_owner,
+    )
+    if runtime.exists() or runtime.is_symlink():
+        _trusted_directory(runtime)
+        _bind_candidate_links(runtime, document, context)
+        if _tree_digest(runtime) != _tree_digest(context.release):
+            raise PromotionError("resumed upgrade retained a mismatched candidate")
+        shutil.rmtree(runtime)
+    if state.exists() or state.is_symlink():
+        _trusted_directory(state, owners=((0, 0), sunlit_owner))
+        _candidate_matches_existing_state(
+            context, state, document, allow_moved_version=True,
+        )
+        shutil.rmtree(state)
+    _fsync_dir(context.candidate)
+    return _publish_report(context, document)
+
+
 def _promote_upgrade(context: PromotionContext, runtime: Path, state: Path, document: dict, sunlit_owner: tuple[int, int]) -> dict:
     _trusted_directory(context.state_root, owners=(sunlit_owner,))
     if not context.active_link.is_symlink() or context.release.exists() or context.release.is_symlink():
@@ -653,7 +838,13 @@ def _promote_upgrade(context: PromotionContext, runtime: Path, state: Path, docu
     metadata_attempted = False
     activated = False
     if release_stage.exists() or release_stage.is_symlink():
-        raise PromotionError("release staging path already exists")
+        # A guard refusal before the rename can leave a private copy behind.
+        # It is safe to rebuild that exact fixed-path staging copy because the
+        # canonical release has not yet been published.
+        if context.release.exists() or release_stage.is_symlink():
+            raise PromotionError("release staging path already exists")
+        _trusted_directory(release_stage)
+        shutil.rmtree(release_stage)
     try:
         shutil.copytree(runtime, release_stage, symlinks=True)
         _verify_release_ownership(release_stage)
@@ -675,6 +866,16 @@ def _promote_upgrade(context: PromotionContext, runtime: Path, state: Path, docu
             versions_root,
         )
         version_state_moved = True
+        _guarded_activate(
+            context,
+            PublicationAction.ACTIVE_LINK,
+            context.release,
+            expected_prior=prior_target,
+        )
+        activated = True
+        # Active-link activation is the commit point.  Metadata is repaired
+        # last, so a refused activation leaves the prior release and prior
+        # metadata coherent for lifecycle startup.
         metadata_attempted = True
         _write_metadata(
             context.state_root,
@@ -683,14 +884,13 @@ def _promote_upgrade(context: PromotionContext, runtime: Path, state: Path, docu
             publication_action=PublicationAction.METADATA,
             owner=sunlit_owner,
         )
-        _guarded_activate(
-            context,
-            PublicationAction.ACTIVE_LINK,
-            context.release,
-            expected_prior=prior_target,
-        )
-        activated = True
-    except BaseException:
+    except BaseException as exc:
+        # A sticky ownership refusal is itself a resumable checkpoint.  Do
+        # not attempt rollback through the same refused owner fence; leaving
+        # the forward publication record intact lets the next owned retry
+        # converge without claiming a version that was never activated.
+        if isinstance(exc, PublicationRefused):
+            raise
         if activated and context.active_link.is_symlink():
             _guarded_activate(
                 context,
@@ -752,6 +952,11 @@ def _promote(context: PromotionContext) -> dict:
     resumed = _resume_published_release(context, runtime, document, sunlit_owner)
     if resumed is not None:
         return resumed
+    resumed = _resume_upgrade_publication(
+        context, runtime, state, document, sunlit_owner,
+    )
+    if resumed is not None:
+        return resumed
     if context.state_root.exists() and context.active_link.is_symlink():
         return _promote_upgrade(context, runtime, state, document, sunlit_owner)
     if any(path.exists() or path.is_symlink() for path in (context.release, context.state_root, context.active_link)):
@@ -767,7 +972,10 @@ def _promote(context: PromotionContext) -> dict:
     release_published = False
     release_stage = context.release_root / f".{context.version}.promote.{os.getpid()}"
     if release_stage.exists() or release_stage.is_symlink():
-        raise PromotionError("release staging path already exists")
+        if context.release.exists() or release_stage.is_symlink():
+            raise PromotionError("release staging path already exists")
+        _trusted_directory(release_stage)
+        shutil.rmtree(release_stage)
     try:
         # Build, verify, and durably flush the potentially large release while
         # the caller's short operation-lock publication fence remains free.
@@ -776,27 +984,29 @@ def _promote(context: PromotionContext) -> dict:
         _fsync_tree(release_stage)
         _guarded_replace(
             context,
-            PublicationAction.STATE,
-            state,
-            context.state_root,
-            context.state_root.parent,
-        )
-        state_moved = True
-        _guarded_replace(
-            context,
             PublicationAction.RELEASE,
             release_stage,
             context.release,
             context.release_root,
         )
         release_published = True
+        _guarded_replace(
+            context,
+            PublicationAction.STATE,
+            state,
+            context.state_root,
+            context.state_root.parent,
+        )
+        state_moved = True
         _guarded_activate(
             context,
             PublicationAction.ACTIVE_LINK,
             context.release,
             expected_prior=None,
         )
-    except BaseException:
+    except BaseException as exc:
+        if isinstance(exc, PublicationRefused):
+            raise
         if context.active_link.is_symlink():
             _guarded_unlink_active(context)
         if release_published and context.release.exists():

@@ -155,7 +155,22 @@ def _installed_version() -> str | None:
         if not record.exists():
             return None
         value = _load_json(record, 64 * 1024).get("version")
-        return value if isinstance(value, str) else None
+        if not isinstance(value, str) or not value:
+            return None
+        # Stable metadata is not the commit record.  The active link is the
+        # publication point; never report a version that was only copied into
+        # state before activation completed.
+        if not ACTIVE_LINK.is_symlink():
+            return None
+        release_root = RELEASE_ROOT.resolve()
+        release = release_root / value
+        target = (ACTIVE_LINK.parent / os.readlink(ACTIVE_LINK)).resolve(strict=True)
+        if target != release.resolve() or target.parent != release_root:
+            return None
+        info = release.lstat()
+        if stat.S_ISLNK(info.st_mode) or not stat.S_ISDIR(info.st_mode):
+            return None
+        return value
     except UpdateError:
         raise
     except OSError as exc:
@@ -237,10 +252,20 @@ def _tree_bytes(path: Path, *, skip_symlinks: bool = False) -> int:
 class _UpdateLease:
     """Keep the shared lifecycle reservation alive for long updater stages."""
 
-    def __init__(self, store: ReservationStore, operation_id: str, state_generation: int = 0):
+    def __init__(
+        self,
+        store: ReservationStore,
+        operation_id: str,
+        state_generation: int = 0,
+        *,
+        controller_pid: int,
+        controller_start_ticks: int,
+    ):
         self.store = store
         self.operation_id = operation_id
         self.state_generation = state_generation
+        self.controller_pid = controller_pid
+        self.controller_start_ticks = controller_start_ticks
         self._stop = threading.Event()
         self._lost = threading.Event()
         self._thread: threading.Thread | None = None
@@ -257,6 +282,8 @@ class _UpdateLease:
                     PROFILE, self.operation_id, RESERVATION_TTL,
                     state_generation=self.state_generation,
                     operation_kind="update",
+                    controller_pid=self.controller_pid,
+                    controller_start_ticks=self.controller_start_ticks,
                 )
             except BaseException:
                 self._lost.set()
@@ -268,6 +295,8 @@ class _UpdateLease:
         try:
             owned = self.store.owns_live(
                 PROFILE, self.operation_id, self.state_generation, operation_kind="update",
+                controller_pid=self.controller_pid,
+                controller_start_ticks=self.controller_start_ticks,
             )
         except (OSError, ValueError, PermissionError, BlockingIOError) as exc:
             raise UpdateError("Sunlit update reservation cannot be verified") from exc
@@ -279,7 +308,11 @@ class _UpdateLease:
         if self._lost.is_set():
             raise UpdateError("Sunlit update reservation was lost")
         try:
-            owned = self.store.owns_live_locked(PROFILE, self.operation_id, self.state_generation)
+            owned = self.store.owns_live_locked(
+                PROFILE, self.operation_id, self.state_generation,
+                controller_pid=self.controller_pid,
+                controller_start_ticks=self.controller_start_ticks,
+            )
         except (OSError, ValueError, PermissionError) as exc:
             raise UpdateError("Sunlit update reservation cannot be verified") from exc
         if not owned:
@@ -314,6 +347,8 @@ class _UpdateLease:
         try:
             released = self.store.release_if_owned(
                 PROFILE, self.operation_id, self.state_generation, operation_kind="update",
+                controller_pid=self.controller_pid,
+                controller_start_ticks=self.controller_start_ticks,
             )
         except (OSError, ValueError, PermissionError, BlockingIOError) as exc:
             raise UpdateError("Sunlit update reservation could not be released") from exc
@@ -327,6 +362,8 @@ class _UpdateLease:
             released = self.store.release_if_owned_locked(
                 PROFILE, self.operation_id, self.state_generation,
                 operation_kind="update",
+                controller_pid=self.controller_pid,
+                controller_start_ticks=self.controller_start_ticks,
             )
         except (OSError, ValueError, PermissionError) as exc:
             raise UpdateError("Sunlit update reservation could not be released") from exc
@@ -338,17 +375,21 @@ class _UpdateLease:
         """Stop renewals before taking the final exclusive operation lock."""
         self._stop.set()
         if self._thread is not None:
-            self._thread.join(timeout=5.0)
-            if self._thread.is_alive():
-                self._lost.set()
-                raise UpdateError("Sunlit update lease renewal did not stop")
+            # Renewal must be fully drained before ownership is released.  A
+            # timed join could leave a worker behind that rewrites a lease
+            # after close() has returned.
+            self._thread.join()
             self._thread = None
 
 
 def _space_available(release: dict, *, manifest: dict | None = None) -> bool:
     try:
         archive_size = release["size"]
-        if isinstance(archive_size, bool) or not isinstance(archive_size, int) or archive_size <= 0:
+        if (
+            isinstance(archive_size, bool)
+            or not isinstance(archive_size, int)
+            or not 0 < archive_size <= MAX_ARCHIVE
+        ):
             raise ValueError("invalid archive size")
         state_bytes = _tree_bytes(STATE_ROOT)
         if manifest is None:
@@ -368,7 +409,7 @@ def _space_available(release: dict, *, manifest: dict | None = None) -> bool:
             or overlay_info.st_nlink != 1
             or overlay_info.st_uid != 0
             or overlay_info.st_mode & 0o022
-            or overlay_info.st_size > MAX_OVERLAY_SIZE
+            or not 0 < overlay_info.st_size <= MAX_OVERLAY_SIZE
         ):
             raise UpdateError("Sunlit overlay size cannot be proven")
         try:
@@ -446,14 +487,108 @@ def _download(release: dict, target: Path) -> str:
         raise
 
 
-def _stage(release: dict) -> tuple[Path, dict]:
-    root = STAGING_ROOT / f"sunlit-{release['version']}"
-    if root.exists() or root.is_symlink():
+def _staging_root(release: dict) -> Path:
+    version = release.get("version")
+    if not isinstance(version, str) or not VERSION_RE.fullmatch(
+        f"SERVER-PACK-Society-Sunlit-Cobblemon-{version}.zip"
+    ):
+        raise UpdateError("staging release identity is unsafe")
+    try:
+        root_info = STAGING_ROOT.lstat()
+    except FileNotFoundError:
+        try:
+            STAGING_ROOT.mkdir(parents=True, mode=0o700)
+            root_info = STAGING_ROOT.lstat()
+        except OSError as exc:
+            raise UpdateError("update staging root is unavailable") from exc
+    except OSError as exc:
+        raise UpdateError("update staging root is unavailable") from exc
+    if (
+        stat.S_ISLNK(root_info.st_mode)
+        or not stat.S_ISDIR(root_info.st_mode)
+        or root_info.st_uid != 0
+        or root_info.st_gid != 0
+        or root_info.st_mode & 0o022
+    ):
+        raise UpdateError("update staging root is unsafe")
+    root = STAGING_ROOT / f"sunlit-{version}"
+    try:
         info = root.lstat()
-        if not stat.S_ISDIR(info.st_mode) or info.st_uid != 0 or info.st_gid != 0 or info.st_mode & 0o022:
-            raise UpdateError("existing staging root is unsafe")
-    else:
-        root.mkdir(parents=True, mode=0o700)
+    except FileNotFoundError:
+        try:
+            root.mkdir(mode=0o700)
+            info = root.lstat()
+        except OSError as exc:
+            raise UpdateError("update staging root is unavailable") from exc
+    except OSError as exc:
+        raise UpdateError("update staging root is unavailable") from exc
+    if (
+        stat.S_ISLNK(info.st_mode)
+        or not stat.S_ISDIR(info.st_mode)
+        or info.st_uid != 0
+        or info.st_gid != 0
+        or info.st_mode & 0o022
+    ):
+        raise UpdateError("existing staging root is unsafe")
+    return root
+
+
+def _staged_operation_id(root: Path) -> str:
+    """Load one durable UUID for all retries of a staged release."""
+    path = root / "update-operation-id"
+    try:
+        info = path.lstat()
+    except FileNotFoundError:
+        # A populated pre-Wave-5 staging directory cannot be safely adopted:
+        # creating a new owner would permit a restarted updater to take over
+        # work whose original reservation may still be live.
+        try:
+            populated = any(root.iterdir())
+        except OSError as exc:
+            raise UpdateError("staged update identity is unavailable") from exc
+        if populated:
+            raise UpdateError("staged update identity is missing")
+        operation_id = str(uuid.uuid4())
+        try:
+            fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0), 0o600)
+            with os.fdopen(fd, "w", encoding="ascii") as stream:
+                stream.write(operation_id + "\n")
+                stream.flush()
+                os.fsync(stream.fileno())
+            directory_fd = os.open(root, os.O_RDONLY | os.O_DIRECTORY)
+            try:
+                os.fsync(directory_fd)
+            finally:
+                os.close(directory_fd)
+        except (OSError, UnicodeError) as exc:
+            path.unlink(missing_ok=True)
+            raise UpdateError("staged update identity is unavailable") from exc
+        return operation_id
+    except OSError as exc:
+        raise UpdateError("staged update identity is unavailable") from exc
+    if (
+        stat.S_ISLNK(info.st_mode)
+        or not stat.S_ISREG(info.st_mode)
+        or info.st_nlink != 1
+        or info.st_uid != 0
+        or info.st_gid != 0
+        or stat.S_IMODE(info.st_mode) != 0o600
+        or info.st_size > 128
+    ):
+        raise UpdateError("staged update identity is unsafe")
+    try:
+        value = path.read_text(encoding="ascii").strip()
+        parsed = uuid.UUID(value)
+    except (OSError, UnicodeError, ValueError) as exc:
+        raise UpdateError("staged update identity is malformed") from exc
+    if str(parsed) != value:
+        raise UpdateError("staged update identity is malformed")
+    return value
+
+
+def _stage(release: dict) -> tuple[Path, dict]:
+    root = _staging_root(release)
+    _staged_operation_id(root)
     archive = root / "server-pack.zip"
     manifest_path = root / "manifest.json"
     try:
@@ -579,9 +714,8 @@ def _record(prior: str | None, new: str) -> None:
         raise UpdateError("update history state is unavailable") from exc
 
 
-def _reserve_update() -> _UpdateLease | None:
+def _reserve_update(operation_id: str) -> _UpdateLease | None:
     """Atomically reserve the profile only while its stopped state is proven."""
-    operation_id = f"sunlit-update-{uuid.uuid4().hex}"
     try:
         store = ReservationStore(
             operation_path=OPERATION_LOCK,
@@ -602,7 +736,13 @@ def _reserve_update() -> _UpdateLease | None:
         raise
     except (OSError, ValueError, PermissionError, sqlite3.Error) as exc:
         raise UpdateError("Sunlit update reservation is unavailable") from exc
-    lease = _UpdateLease(store, operation_id, reservation.state_generation)
+    lease = _UpdateLease(
+        store,
+        operation_id,
+        reservation.state_generation,
+        controller_pid=reservation.controller_pid,
+        controller_start_ticks=reservation.controller_start_ticks,
+    )
     lease.start()
     return lease
 
@@ -618,7 +758,13 @@ def run(*, check_only: bool) -> dict:
         raise UpdateError("automatic update requires root")
     if not _inactive():
         return {"state": "deferred", "installed": installed, "available": release["version"]}
-    lease = _reserve_update()
+    # Establish or validate the fixed staging identity before taking the
+    # reservation.  This is metadata-only and lets retries reuse one UUID;
+    # the reservation precondition below still closes a lifecycle race before
+    # any archive or candidate mutation begins.
+    staging_root = _staging_root(release)
+    operation_id = _staged_operation_id(staging_root)
+    lease = _reserve_update(operation_id)
     if lease is None:
         return {"state": "deferred", "installed": installed, "available": release["version"]}
     primary_error: BaseException | None = None

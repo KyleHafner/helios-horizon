@@ -229,6 +229,38 @@ class ReservationStore:
     def read(self) -> Reservation | None:
         return _reservation_from_json(_read_json(self.reservation_path))
 
+    def _read_for_admission(self) -> Reservation | None:
+        """Read the reservation without treating corruption as absence."""
+        try:
+            info = self.reservation_path.lstat()
+        except FileNotFoundError:
+            return None
+        except OSError as exc:
+            raise ValueError("reservation state is unavailable") from exc
+        if (
+            stat.S_ISLNK(info.st_mode)
+            or not stat.S_ISREG(info.st_mode)
+            or info.st_nlink != 1
+            or info.st_uid != 0
+            or stat.S_IMODE(info.st_mode) & 0o022
+            or not stat.S_IMODE(info.st_mode) & 0o400
+            or info.st_size > 64 * 1024
+        ):
+            raise ValueError("reservation state is unsafe")
+        value = _reservation_from_json(_read_json(self.reservation_path))
+        if value is None:
+            raise ValueError("reservation state is malformed")
+        return value
+
+    def _expected_controller(
+        self,
+        controller_pid: int | None,
+        controller_start_ticks: int | None,
+    ) -> tuple[int, int | None]:
+        pid = os.getpid() if controller_pid is None else controller_pid
+        ticks = self.pid_start_ticks(pid) if controller_start_ticks is None else controller_start_ticks
+        return pid, ticks
+
     def reserve(
         self,
         profile: str | ProfileId,
@@ -315,13 +347,13 @@ class ReservationStore:
         if ticks is None:
             raise ValueError("controller process does not exist")
         with operation_transaction(self.operation_path):
-            current = _reservation_from_json(_read_json(self.reservation_path))
-            if (
-                current is not None
-                and self._live(current)
-                and (current.profile_id != profile_id or current.operation_id != operation_id)
-            ):
-                raise BlockingIOError("reservation belongs to another profile")
+            current = self._read_for_admission()
+            if current is not None and self._live(current):
+                # Acquisition never takes over a live lease, even when a
+                # durable operation id is reused.  PID/start-ticks are part
+                # of ownership and a restarted process must wait for stale
+                # reconciliation instead of inheriting the old lease.
+                raise BlockingIOError("reservation is already live")
             # A lifecycle caller can supply its stopped-state predicate here so
             # the observation and reservation commit share the same exclusive
             # operation transaction.  This closes the read-then-reserve race
@@ -356,8 +388,13 @@ class ReservationStore:
         state_generation: int = 0,
         *,
         operation_kind: str | None = None,
+        controller_pid: int | None = None,
+        controller_start_ticks: int | None = None,
     ) -> bool:
         profile_id = _profile(profile)
+        controller_pid, controller_start_ticks = self._expected_controller(
+            controller_pid, controller_start_ticks,
+        )
         with operation_transaction(self.operation_path):
             current = _reservation_from_json(_read_json(self.reservation_path))
             if (
@@ -366,6 +403,8 @@ class ReservationStore:
                 or current.operation_id != operation_id
                 or current.state_generation != state_generation
                 or (operation_kind is not None and current.operation_kind != operation_kind)
+                or (controller_pid is not None and current.controller_pid != controller_pid)
+                or (controller_start_ticks is not None and current.controller_start_ticks != controller_start_ticks)
             ):
                 return False
             self.reservation_path.unlink(missing_ok=True)
@@ -378,9 +417,14 @@ class ReservationStore:
         state_generation: int = 0,
         *,
         operation_kind: str | None = None,
+        controller_pid: int | None = None,
+        controller_start_ticks: int | None = None,
     ) -> bool:
         """Release an exact reservation while operation.lock is held."""
         profile_id = _profile(profile)
+        controller_pid, controller_start_ticks = self._expected_controller(
+            controller_pid, controller_start_ticks,
+        )
         current = _reservation_from_json(_read_json(self.reservation_path))
         if (
             current is None
@@ -388,6 +432,8 @@ class ReservationStore:
             or current.operation_id != operation_id
             or current.state_generation != state_generation
             or (operation_kind is not None and current.operation_kind != operation_kind)
+            or (controller_pid is not None and current.controller_pid != controller_pid)
+            or (controller_start_ticks is not None and current.controller_start_ticks != controller_start_ticks)
         ):
             return False
         self.reservation_path.unlink(missing_ok=True)
@@ -400,9 +446,14 @@ class ReservationStore:
         state_generation: int = 0,
         *,
         operation_kind: str | None = None,
+        controller_pid: int | None = None,
+        controller_start_ticks: int | None = None,
     ) -> bool:
         """Atomically verify exact ownership, expiry, and controller liveness."""
         profile_id = _profile(profile)
+        controller_pid, controller_start_ticks = self._expected_controller(
+            controller_pid, controller_start_ticks,
+        )
         with operation_transaction(self.operation_path):
             current = _reservation_from_json(_read_json(self.reservation_path))
             return bool(
@@ -411,6 +462,8 @@ class ReservationStore:
                 and current.operation_id == operation_id
                 and current.state_generation == state_generation
                 and (operation_kind is None or current.operation_kind == operation_kind)
+                and (controller_pid is None or current.controller_pid == controller_pid)
+                and (controller_start_ticks is None or current.controller_start_ticks == controller_start_ticks)
                 and self._live(current)
             )
 
@@ -419,6 +472,9 @@ class ReservationStore:
         profile: str | ProfileId,
         operation_id: str,
         state_generation: int = 0,
+        *,
+        controller_pid: int | None = None,
+        controller_start_ticks: int | None = None,
     ) -> bool:
         """Verify ownership while the caller already holds operation.lock.
 
@@ -427,6 +483,9 @@ class ReservationStore:
         exclusive ``OperationLock``.
         """
         profile_id = _profile(profile)
+        controller_pid, controller_start_ticks = self._expected_controller(
+            controller_pid, controller_start_ticks,
+        )
         current = _reservation_from_json(_read_json(self.reservation_path))
         return bool(
             current is not None
@@ -434,6 +493,8 @@ class ReservationStore:
             and current.operation_id == operation_id
             and current.state_generation == state_generation
             and current.operation_kind == "update"
+            and (controller_pid is None or current.controller_pid == controller_pid)
+            and (controller_start_ticks is None or current.controller_start_ticks == controller_start_ticks)
             and self._live(current)
         )
 
@@ -445,10 +506,16 @@ class ReservationStore:
         target_profile: str | ProfileId,
         target_operation_id: str,
         ttl: float = 30.0,
+        *,
+        controller_pid: int | None = None,
+        controller_start_ticks: int | None = None,
     ) -> Reservation:
         """Atomically hand a lease to rollback/source ownership."""
         source = _profile(profile)
         target = _profile(target_profile)
+        controller_pid, controller_start_ticks = self._expected_controller(
+            controller_pid, controller_start_ticks,
+        )
         with operation_transaction(self.operation_path):
             current = _reservation_from_json(_read_json(self.reservation_path))
             if (
@@ -456,6 +523,8 @@ class ReservationStore:
                 or current.profile_id != source
                 or current.operation_id != operation_id
                 or current.state_generation != state_generation
+                or (controller_pid is not None and current.controller_pid != controller_pid)
+                or (controller_start_ticks is not None and current.controller_start_ticks != controller_start_ticks)
             ):
                 raise BlockingIOError("reservation ownership changed")
             renewed = Reservation(
@@ -483,9 +552,14 @@ class ReservationStore:
         *,
         state_generation: int = 0,
         operation_kind: str | None = None,
+        controller_pid: int | None = None,
+        controller_start_ticks: int | None = None,
     ) -> Reservation:
         """Extend only the lease this operation currently owns."""
         profile_id = _profile(profile)
+        controller_pid, controller_start_ticks = self._expected_controller(
+            controller_pid, controller_start_ticks,
+        )
         with operation_transaction(self.operation_path):
             current = _reservation_from_json(_read_json(self.reservation_path))
             if (
@@ -494,6 +568,8 @@ class ReservationStore:
                 or current.operation_id != operation_id
                 or current.state_generation != state_generation
                 or (operation_kind is not None and current.operation_kind != operation_kind)
+                or (controller_pid is not None and current.controller_pid != controller_pid)
+                or (controller_start_ticks is not None and current.controller_start_ticks != controller_start_ticks)
                 or not self._live(current)
             ):
                 raise BlockingIOError("reservation ownership changed")
