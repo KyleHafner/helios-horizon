@@ -229,12 +229,16 @@ class DeploymentManifest:
         return tuple(replace(namespace, path=str(_under_root(root, namespace.path))) for namespace in self.namespaces)
 
     def runtime_files_for(self, root: Path = Path("/")) -> tuple[FileSpec, ...]:
+        static_sources = tuple(
+            FileSpec(source=file.source, target=f"/opt/game-control/{file.source}", mode=file.mode, category="runtime")
+            for file in self.files
+        )
         sources = tuple(
-            FileSpec(source=source, target=f"/opt/game-control/{source.removeprefix('src/')}", mode=0o644, category="runtime")
+            FileSpec(source=source, target=f"/opt/game-control/{source}", mode=0o644, category="runtime")
             for source in (*self.runtime_sources, "src/game_control/deployment_manifest.py")
         )
         verifier = FileSpec("scripts/verify-deployed.py", "/opt/game-control/scripts/verify-deployed.py", 0o600, category="runtime")
-        return self._project((*self.files, *sources, *self.runtime_support, verifier), root)
+        return self._project((*static_sources, *sources, *self.runtime_support, verifier), root)
 
     def validate(self, package_root: Path | None = None) -> None:
         """Validate declarations and, when supplied, every source boundary."""

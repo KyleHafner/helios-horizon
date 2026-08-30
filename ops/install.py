@@ -5,115 +5,59 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import importlib.util
 import os
 import secrets
 import shutil
 import stat
 import subprocess
+import sys
 import tempfile
 from pathlib import Path
 
 
 PACKAGE_ROOT = Path(__file__).resolve().parents[1]
-ACTIVE_PROFILE_IDS = (
-    "minecraft-sunlit-cobblemon",
-    "terraria-vanilla",
-    "terraria-tmod",
-)
-PROFILE_FILES = tuple(
-    PACKAGE_ROOT / "config/profiles" / f"{profile_id}.toml"
-    for profile_id in ACTIVE_PROFILE_IDS
-)
-RUNNER_FILES = tuple(
-    PACKAGE_ROOT / "config/runner" / f"{profile_id}.json"
-    for profile_id in ACTIVE_PROFILE_IDS
-)
-WEB_FILES = tuple(
-    PACKAGE_ROOT / "web" / name
-    for name in ("app.js", "commands.js", "index.html", "palette.js", "styles.css")
-)
-UNIT_FILES = tuple(
-    PACKAGE_ROOT / "ops/systemd" / name
-    for name in (
-        "game-control-web.service",
-        "game-slotd.service",
-        "horizon-bore-liveness.service",
-        "horizon-bore-liveness.timer",
-        "horizon-sunlit-auto-update.service",
-        "horizon-sunlit-auto-update.timer",
-        "lazymc-minecraft.service",
-        "bore-minecraft-fenced.service",
-        "horizon-alert-drill@.service",
-        "horizon-alert-notify@.service",
-        "horizon-terraria-relay.service",
-        "minecraft-sunlit-cobblemon.service",
-        "terraria-tmod.service",
-        "terraria-vanilla.service",
-    )
-)
-UNIT_DROPIN_FILES = (
-    PACKAGE_ROOT / "ops/systemd/game-slotd.service.d/io-metrics.conf",
-    PACKAGE_ROOT / "ops/systemd/minecraft-sunlit-cobblemon.service.d/gc-telemetry.conf",
-)
-LAZYMC_CONFIG = PACKAGE_ROOT / "ops/lazymc/lazymc.toml"
-LAZYMC_SERVER_PROPERTIES = PACKAGE_ROOT / "ops/lazymc/server.properties"
-SLICE_FILES = tuple(PACKAGE_ROOT / "ops/systemd" / name for name in ("games.slice", "horizon.slice", "maintenance.slice"))
-TMPFILES = PACKAGE_ROOT / "ops/tmpfiles/game-control.conf"
-ROOT_CONFIG = PACKAGE_ROOT / "config/game-control.toml"
-NFTABLES_POLICY = PACKAGE_ROOT / "ops/nftables/horizon.nft"
-JOURNAL_BASE = PACKAGE_ROOT / "ops/journald/horizon.conf"
-JOURNAL_MEASUREMENT = PACKAGE_ROOT / "ops/journald/horizon-private-measurement.conf"
-RUNTIME_SOURCE_FILES = tuple(sorted((PACKAGE_ROOT / "src/game_control").rglob("*.py")))
-RUNTIME_VERIFIER = PACKAGE_ROOT / "scripts/verify-deployed.py"
-RUNTIME_SUPPORT_FILES = (
-    (PACKAGE_ROOT / "pyproject.toml", "pyproject.toml", 0o644),
-    (PACKAGE_ROOT / "ops/install.py", "ops/install.py", 0o755),
-)
-RUNTIME_MANIFEST_PATH = "/opt/game-control/.horizon-runtime-manifest"
-RUNTIME_MANIFEST_VERSION = "1"
-HELPER_FILES = {
-    "game-slot-run": (PACKAGE_ROOT / "ops/bin/game-slot-run", 0o755),
-    "game-console-stop": (PACKAGE_ROOT / "ops/bin/game-console-stop", 0o755),
-    "game-console-command": (PACKAGE_ROOT / "ops/bin/game-console-command", 0o755),
-    "game-sunlit-prepare": (PACKAGE_ROOT / "ops/bin/game-sunlit-prepare", 0o755),
-    "game-sunlit-rcon-prepare": (PACKAGE_ROOT / "ops/bin/game-sunlit-rcon-prepare", 0o755),
-    "game-sunlit-stop": (PACKAGE_ROOT / "ops/bin/game-sunlit-stop", 0o755),
-    "horizon-capability-issue": (PACKAGE_ROOT / "ops/bin/horizon-capability-issue", 0o755),
-    "horizon-alert-notify": (PACKAGE_ROOT / "ops/bin/horizon-alert-notify", 0o755),
-    "horizon-backup-reconcile": (PACKAGE_ROOT / "ops/bin/horizon-backup-reconcile", 0o755),
-    "horizon-sunlit-promote": (PACKAGE_ROOT / "ops/bin/horizon-sunlit-promote", 0o755),
-    "horizon-sunlit-manifest": (PACKAGE_ROOT / "ops/bin/horizon-sunlit-manifest", 0o755),
-    "horizon-sunlit-stage": (PACKAGE_ROOT / "ops/bin/horizon-sunlit-stage", 0o755),
-    "horizon-sunlit-auto-update": (PACKAGE_ROOT / "ops/bin/horizon-sunlit-auto-update", 0o755),
-    "horizon-sunlit-update-rpc": (PACKAGE_ROOT / "ops/bin/horizon-sunlit-update-rpc", 0o755),
-    "horizon-bore-liveness": (PACKAGE_ROOT / "ops/bin/horizon-bore-liveness", 0o755),
-    "horizon-lazymc-wake": (PACKAGE_ROOT / "ops/bin/horizon-lazymc-wake", 0o755),
-    "horizon-journal-evidence": (PACKAGE_ROOT / "ops/bin/horizon-journal-evidence", 0o755),
-    "horizon-journal-finalize": (PACKAGE_ROOT / "ops/bin/horizon-journal-finalize", 0o755),
-    "horizon_journal.py": (PACKAGE_ROOT / "ops/bin/horizon_journal.py", 0o644),
-    "horizon-session-revoke-all": (PACKAGE_ROOT / "ops/bin/horizon-session-revoke-all", 0o755),
-    "horizon-state-migrate": (PACKAGE_ROOT / "ops/bin/horizon-state-migrate", 0o755),
-    "horizon-telemetry-migrate": (PACKAGE_ROOT / "ops/bin/horizon-telemetry-migrate", 0o755),
-    "horizon-jvm-args": (PACKAGE_ROOT / "ops/bin/horizon-jvm-args", 0o755),
-    "horizon-memory-drill": (PACKAGE_ROOT / "ops/bin/horizon-memory-drill", 0o755),
-    "horizon-phase2-threshold": (PACKAGE_ROOT / "ops/bin/horizon-phase2-threshold", 0o755),
-    "horizon-phase2-collect": (PACKAGE_ROOT / "ops/bin/horizon-phase2-collect", 0o755),
-    "horizon-phase2-browser-evidence": (PACKAGE_ROOT / "scripts/phase2-browser-evidence.py", 0o755),
-    "horizon-phase2-live-acceptance": (PACKAGE_ROOT / "ops/bin/horizon-phase2-live-acceptance", 0o755),
-}
-SUNLIT_LIBRARIES_LINK = "/srv/game-servers/minecraft-sunlit-cobblemon/libraries"
-SUNLIT_LIBRARIES_TARGET = "/opt/game-servers/minecraft-sunlit-cobblemon/libraries"
-FIXED_B2_SECRET_PATH = "/etc/game-control/secrets.d/horizon-b2-rclone.conf"
-FIXED_RCON_SECRET_PATH = "/etc/game-control/secrets.d/minecraft-rcon-password"
 
-LEGACY_TARGETS = (
-    "/etc/game-control/profiles.d/minecraft.toml",
-    "/etc/game-control/profiles.d/pz-rising.toml",
-    "/etc/game-control/runner.d/minecraft.json",
-    "/etc/game-control/runner.d/pz-rising.json",
-    "/etc/systemd/system/pz-rising.service",
-    "/etc/game-control/secrets.d/crafty-token",
-)
+
+def _load_deployment_manifest():
+    path = PACKAGE_ROOT / "src/game_control/deployment_manifest.py"
+    spec = importlib.util.spec_from_file_location("_horizon_deployment_manifest", path)
+    if spec is None or spec.loader is None:
+        raise RuntimeError("deployment manifest is unavailable")
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = module
+    spec.loader.exec_module(module)
+    return module.get_manifest()
+
+
+_DEPLOYMENT_MANIFEST = _load_deployment_manifest()
+_STATIC_SPECS = _DEPLOYMENT_MANIFEST.files
+_FILES_BY_TARGET = {spec.target: spec for spec in _STATIC_SPECS}
+ACTIVE_PROFILE_IDS = tuple(profile.id for profile in _DEPLOYMENT_MANIFEST.profiles)
+PROFILE_FILES = tuple(PACKAGE_ROOT / profile.profile_source for profile in _DEPLOYMENT_MANIFEST.profiles)
+RUNNER_FILES = tuple(PACKAGE_ROOT / profile.runner_source for profile in _DEPLOYMENT_MANIFEST.profiles)
+WEB_FILES = tuple(PACKAGE_ROOT / spec.source for spec in _STATIC_SPECS if spec.target.startswith("/opt/game-control/web/"))
+UNIT_FILES = tuple(PACKAGE_ROOT / spec.source for spec in _STATIC_SPECS if spec.target.startswith("/etc/systemd/system/") and "/" not in spec.target.removeprefix("/etc/systemd/system/" ) and not spec.target.endswith(".slice"))
+UNIT_DROPIN_FILES = tuple(PACKAGE_ROOT / spec.source for spec in _STATIC_SPECS if spec.target.startswith("/etc/systemd/system/") and "/" in spec.target.removeprefix("/etc/systemd/system/"))
+SLICE_FILES = tuple(PACKAGE_ROOT / spec.source for spec in _STATIC_SPECS if spec.target.startswith("/etc/systemd/system/") and spec.target.endswith(".slice"))
+TMPFILES = PACKAGE_ROOT / next(spec.source for spec in _STATIC_SPECS if spec.target == "/usr/lib/tmpfiles.d/game-control.conf")
+ROOT_CONFIG = PACKAGE_ROOT / next(spec.source for spec in _STATIC_SPECS if spec.target == "/etc/game-control/game-control.toml")
+LAZYMC_CONFIG = PACKAGE_ROOT / next(spec.source for spec in _STATIC_SPECS if spec.target == "/etc/game-control/lazymc/lazymc.toml")
+LAZYMC_SERVER_PROPERTIES = PACKAGE_ROOT / next(spec.source for spec in _STATIC_SPECS if spec.target == "/etc/game-control/lazymc/server.properties")
+NFTABLES_POLICY = PACKAGE_ROOT / next(spec.source for spec in _STATIC_SPECS if spec.target == "/etc/nftables.conf")
+JOURNAL_BASE = PACKAGE_ROOT / next(spec.source for spec in _STATIC_SPECS if spec.target == "/etc/systemd/journald@horizon.conf")
+JOURNAL_MEASUREMENT = PACKAGE_ROOT / next(spec.source for spec in _STATIC_SPECS if spec.target == "/usr/local/share/horizon/horizon-private-measurement.conf")
+RUNTIME_SOURCE_FILES = tuple(PACKAGE_ROOT / source for source in (*_DEPLOYMENT_MANIFEST.runtime_sources, "src/game_control/deployment_manifest.py"))
+RUNTIME_VERIFIER = PACKAGE_ROOT / "scripts/verify-deployed.py"
+RUNTIME_SUPPORT_FILES = tuple((PACKAGE_ROOT / spec.source, spec.source, spec.mode) for spec in _DEPLOYMENT_MANIFEST.runtime_support)
+RUNTIME_MANIFEST_PATH = _DEPLOYMENT_MANIFEST.runtime_manifest.target
+RUNTIME_MANIFEST_VERSION = _DEPLOYMENT_MANIFEST.runtime_manifest.version
+HELPER_FILES = {spec.target.removeprefix("/usr/local/libexec/"): (PACKAGE_ROOT / spec.source, spec.mode) for spec in _STATIC_SPECS if spec.target.startswith("/usr/local/libexec/")}
+SUNLIT_LIBRARIES_LINK = _DEPLOYMENT_MANIFEST.symlinks[0].target
+SUNLIT_LIBRARIES_TARGET = _DEPLOYMENT_MANIFEST.symlinks[0].link_target
+FIXED_B2_SECRET_PATH = next(secret.target for secret in _DEPLOYMENT_MANIFEST.secrets if secret.name == "b2")
+FIXED_RCON_SECRET_PATH = next(secret.target for secret in _DEPLOYMENT_MANIFEST.secrets if secret.name == "rcon")
+LEGACY_TARGETS = _DEPLOYMENT_MANIFEST.retired.paths
 
 
 class Installer:
@@ -135,33 +79,10 @@ class Installer:
         return self.root / value.relative_to("/") if value.is_absolute() else self.root / value
 
     def _expected_install_files(self) -> dict[Path, tuple[Path, int]]:
-        files: dict[Path, tuple[Path, int]] = {}
-        for source in PROFILE_FILES:
-            files[self.target(f"/etc/game-control/profiles.d/{source.name}")] = (source, 0o644)
-        for source in RUNNER_FILES:
-            files[self.target(f"/etc/game-control/runner.d/{source.name}")] = (source, 0o644)
-        for source in WEB_FILES:
-            files[self.target(f"/opt/game-control/web/{source.name}")] = (source, 0o644)
-        for source in UNIT_FILES:
-            files[self.target(f"/etc/systemd/system/{source.name}")] = (source, 0o644)
-        for source in UNIT_DROPIN_FILES:
-            relative = source.relative_to(PACKAGE_ROOT / "ops/systemd")
-            files[self.target(f"/etc/systemd/system/{relative}")] = (source, 0o644)
-        for source in SLICE_FILES:
-            files[self.target(f"/etc/systemd/system/{source.name}")] = (source, 0o644)
-        files[self.target("/usr/lib/tmpfiles.d/game-control.conf")] = (TMPFILES, 0o644)
-        for name, (source, mode) in HELPER_FILES.items():
-            files[self.target(f"/usr/local/libexec/{name}")] = (source, mode)
-        files[self.target("/etc/game-control/game-control.toml")] = (ROOT_CONFIG, 0o600)
-        files[self.target("/etc/game-control/lazymc/lazymc.toml")] = (LAZYMC_CONFIG, 0o644)
-        files[self.target("/etc/game-control/lazymc/server.properties")] = (LAZYMC_SERVER_PROPERTIES, 0o644)
-        files[self.target("/etc/nftables.conf")] = (NFTABLES_POLICY, 0o644)
-        files[self.target("/etc/systemd/journald@horizon.conf")] = (JOURNAL_BASE, 0o644)
-        files[self.target("/usr/local/share/horizon/horizon-private-measurement.conf")] = (
-            JOURNAL_MEASUREMENT,
-            0o644,
-        )
-        return files
+        return {
+            Path(spec.target): (spec.source_path(PACKAGE_ROOT), spec.mode)
+            for spec in _DEPLOYMENT_MANIFEST.files_for(self.root)
+        }
 
     def expected_files(self) -> dict[Path, tuple[Path, int]]:
         files = self._expected_install_files()
@@ -173,16 +94,9 @@ class Installer:
         # _expected_install_files(). The installed copy of ops/install.py can
         # therefore resolve its own source paths for --check and idempotent
         # re-apply without consulting the original checkout.
-        source_files = {
-            source: mode for source, mode in self._expected_install_files().values()
-        }
-        source_files.update({source: 0o644 for source in RUNTIME_SOURCE_FILES})
-        for source, relative, mode in RUNTIME_SUPPORT_FILES:
-            source_files[source] = mode
-        source_files[RUNTIME_VERIFIER] = 0o600
         return {
-            self.target(f"/opt/game-control/{source.relative_to(PACKAGE_ROOT).as_posix()}"): (source, mode)
-            for source, mode in source_files.items()
+            Path(spec.target): (spec.source_path(PACKAGE_ROOT), spec.mode)
+            for spec in _DEPLOYMENT_MANIFEST.runtime_files_for(self.root)
         }
 
     def _runtime_manifest(self) -> Path:
@@ -511,63 +425,13 @@ class Installer:
                 raise RuntimeError(f"package source is unreadable: {source}") from exc
 
     def expected_links(self) -> dict[Path, str]:
-        return {self.target(SUNLIT_LIBRARIES_LINK): SUNLIT_LIBRARIES_TARGET}
+        return {spec.target_path(self.root): spec.link_target for spec in _DEPLOYMENT_MANIFEST.symlinks}
 
     def directories(self) -> tuple[tuple[Path, int, str, str], ...]:
-        return (
-            (self.target("/etc/game-control"), 0o755, "root", "root"),
-            (self.target("/etc/game-control/profiles.d"), 0o755, "root", "root"),
-            (self.target("/etc/game-control/runner.d"), 0o755, "root", "root"),
-            (self.target("/etc/game-control/secrets.d"), 0o700, "root", "root"),
-            (self.target("/etc/game-control/arm"), 0o700, "root", "root"),
-            (self.target("/etc/game-control/lazymc"), 0o755, "root", "root"),
-            (self.target("/etc/systemd/journald@horizon.conf.d"), 0o700, "root", "root"),
-            (self.target("/etc/wireguard"), 0o700, "root", "root"),
-            (self.target("/usr/local/share/horizon"), 0o755, "root", "root"),
-            # Game units execute helpers from this directory as unprivileged
-            # service users, so every path component must remain searchable.
-            (self.target("/usr/local/libexec"), 0o755, "root", "root"),
-            (self.target("/opt/game-control/web"), 0o755, "root", "root"),
-            (self.target("/var/lib/game-control"), 0o700, "root", "root"),
-            (self.target("/var/lib/game-control/alerts"), 0o700, "root", "root"),
-            (self.target("/var/lib/game-control/horizon-journal"), 0o700, "root", "root"),
-            (self.target("/var/lib/game-control/migrations"), 0o700, "root", "root"),
-            (self.target("/var/lib/game-control-web"), 0o700, "gamecontrol", "gamecontrol"),
-            (self.target("/run/game-control"), 0o755, "root", "root"),
-            (self.target("/run/game-slot"), 0o770, "root", "gameslot"),
-            (self.target("/opt/game-servers"), 0o755, "root", "root"),
-            (self.target("/srv/game-servers"), 0o755, "root", "root"),
-            (self.target("/opt/game-servers/minecraft-sunlit-cobblemon"), 0o755, "root", "root"),
-            (self.target("/opt/game-servers/minecraft-sunlit-cobblemon/releases"), 0o755, "root", "root"),
-            (self.target("/srv/game-servers/minecraft-sunlit-cobblemon"), 0o750, "svc-sunlit", "svc-sunlit"),
-            (self.target("/opt/game-servers/terraria-vanilla"), 0o755, "root", "root"),
-            (self.target("/opt/game-servers/terraria-tmod"), 0o755, "root", "root"),
-            # RestoreService deliberately remaps every extracted member to the
-            # existing mutable-root owner. Keep that boundary owned by the
-            # fixed game principal so a verified restore remains bootable.
-            (self.target("/srv/game-servers/terraria-vanilla"), 0o750, "terraria-vanilla", "terraria-vanilla"),
-            (self.target("/srv/game-servers/terraria-tmod"), 0o750, "tmodloader", "tmodloader"),
-            *(
-                (self.target(f"/srv/game-servers/{profile}/{subdir}"), 0o750, user, user)
-                for profile, user in (
-                    ("terraria-vanilla", "terraria-vanilla"),
-                    ("terraria-tmod", "tmodloader"),
-                )
-                for subdir in ("config", "worlds", "mods", "logs", "backups")
-            ),
-            (self.target("/srv/game-servers/terraria-vanilla/.local"), 0o700, "terraria-vanilla", "terraria-vanilla"),
-            (self.target("/srv/game-servers/terraria-vanilla/.local/share"), 0o700, "terraria-vanilla", "terraria-vanilla"),
-            (self.target("/srv/game-servers/terraria-vanilla/.local/share/Terraria"), 0o700, "terraria-vanilla", "terraria-vanilla"),
-            (self.target("/srv/game-servers/terraria-tmod/.local"), 0o700, "tmodloader", "tmodloader"),
-            (self.target("/srv/game-servers/terraria-tmod/.local/share"), 0o700, "tmodloader", "tmodloader"),
-            (self.target("/srv/game-servers/terraria-tmod/.local/share/Terraria"), 0o700, "tmodloader", "tmodloader"),
-            (self.target("/srv/game-servers/terraria-tmod/logs/tModLoader-Logs"), 0o750, "tmodloader", "tmodloader"),
-            (self.target("/var/backups/game-servers/minecraft-sunlit-cobblemon"), 0o700, "root", "root"),
-            (self.target("/var/backups/game-servers/terraria-vanilla"), 0o700, "root", "root"),
-            (self.target("/var/backups/game-servers/terraria-tmod"), 0o700, "root", "root"),
-            (self.target("/var/backups/game-servers"), 0o700, "root", "root"),
+        return tuple(
+            (spec.target_path(self.root), spec.mode, spec.owner, spec.group)
+            for spec in _DEPLOYMENT_MANIFEST.directories
         )
-
     def drift(self) -> list[str]:
         problems: list[str] = []
         try:
