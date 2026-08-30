@@ -323,6 +323,67 @@ def test_update_lease_ownership_binds_pid_and_start_ticks(slot_env):
     assert store.read() == reservation
 
 
+@pytest.mark.parametrize("observed_tick", [None, 701])
+def test_all_owner_operations_fail_closed_without_original_start_tick(slot_env, observed_tick):
+    ticks = [700]
+    store = ReservationStore(
+        slot_env.operation_path,
+        slot_env.reservation_path,
+        pid_start_ticks=lambda _pid: ticks[0],
+    )
+    reservation = store.reserve(
+        "minecraft", "strict-owner", ttl=10, state_generation=9,
+        operation_kind="update",
+    )
+    ticks[0] = observed_tick
+
+    if observed_tick is None:
+        with pytest.raises(ValueError, match="identity cannot be proven"):
+            store.owns_live("minecraft", "strict-owner", 9, operation_kind="update")
+        with slot_module.operation_transaction(slot_env.operation_path):
+            with pytest.raises(ValueError, match="identity cannot be proven"):
+                store.owns_live_locked("minecraft", "strict-owner", 9)
+        with pytest.raises(ValueError, match="identity cannot be proven"):
+            store.renew_if_owned(
+                "minecraft", "strict-owner", 10,
+                state_generation=9, operation_kind="update",
+            )
+        with pytest.raises(ValueError, match="identity cannot be proven"):
+            store.release_if_owned(
+                "minecraft", "strict-owner", 9, operation_kind="update",
+            )
+        with slot_module.operation_transaction(slot_env.operation_path):
+            with pytest.raises(ValueError, match="identity cannot be proven"):
+                store.release_if_owned_locked(
+                    "minecraft", "strict-owner", 9, operation_kind="update",
+                )
+        with pytest.raises(ValueError, match="identity cannot be proven"):
+            store.transfer_if_owned(
+                "minecraft", "strict-owner", 9, "pz-rising", "rollback",
+            )
+    else:
+        assert not store.owns_live("minecraft", "strict-owner", 9, operation_kind="update")
+        with slot_module.operation_transaction(slot_env.operation_path):
+            assert not store.owns_live_locked("minecraft", "strict-owner", 9)
+        with pytest.raises(BlockingIOError):
+            store.renew_if_owned(
+                "minecraft", "strict-owner", 10,
+                state_generation=9, operation_kind="update",
+            )
+        assert not store.release_if_owned(
+            "minecraft", "strict-owner", 9, operation_kind="update",
+        )
+        with slot_module.operation_transaction(slot_env.operation_path):
+            assert not store.release_if_owned_locked(
+                "minecraft", "strict-owner", 9, operation_kind="update",
+            )
+        with pytest.raises(BlockingIOError):
+            store.transfer_if_owned(
+                "minecraft", "strict-owner", 9, "pz-rising", "rollback",
+            )
+    assert store.read() == reservation
+
+
 def test_admission_rejects_malformed_reservation_instead_of_overwriting(slot_env):
     slot_env.reservation_path.write_text("{not-json", encoding="ascii")
     with pytest.raises(ValueError, match="reservation state is malformed"):

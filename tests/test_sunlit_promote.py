@@ -482,3 +482,185 @@ def test_upgrades_existing_release_without_replacing_stable_state(
     assert not (candidate / "state").exists()
     assert MODULE.promote(context) == report
     assert active.resolve() == new_release.resolve()
+
+
+@pytest.mark.parametrize("collision", [
+    "root-symlink", "regular-file", "duplicate-source", "unexpected-member", "external-symlink",
+])
+def test_upgrade_resume_rejects_unverified_production_version_state(
+    tmp_path: Path, collision: str,
+) -> None:
+    release_root = tmp_path / "releases"
+    old_release = release_root / "v1"
+    new_release = release_root / "v2"
+    state_root = tmp_path / "state"
+    versions = state_root / ".versions"
+    active = tmp_path / "current"
+    candidate = tmp_path / "candidate"
+    for path in (old_release, new_release, versions, active.parent, candidate):
+        path.mkdir(parents=True, exist_ok=True)
+    active.symlink_to(os.path.relpath(old_release, active.parent), target_is_directory=True)
+    metadata = state_root / ".horizon"
+    metadata.mkdir()
+    _write_json(metadata / "release.json", {"version": "v1"})
+    before = (metadata / "release.json").read_bytes()
+    production = versions / "v2"
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    if collision == "root-symlink":
+        production.symlink_to(outside, target_is_directory=True)
+    elif collision == "regular-file":
+        production.write_bytes(b"collision")
+    else:
+        for path in (production / "config", production / "logs"):
+            path.mkdir(parents=True)
+            path.chmod(0o750)
+        production.chmod(0o750)
+        if collision == "duplicate-source":
+            source = candidate / "state/.versions/v2"
+            (source / "config").mkdir(parents=True)
+            (source / "logs").mkdir()
+        elif collision == "unexpected-member":
+            (production / "unexpected").mkdir()
+            (production / "unexpected").chmod(0o750)
+        else:
+            (production / "config").rmdir()
+            (production / "config").symlink_to(outside, target_is_directory=True)
+    document = {
+        "manifest_sha256": "a" * 64,
+        "runtime_policy": {
+            "persistent_dirs": [], "persistent_files": [],
+            "mutable_vendor_dirs": ["config"], "empty_mutable_dirs": ["logs"],
+            "fixed_symlinks": {},
+        },
+    }
+
+    @contextmanager
+    def allow(_action: MODULE.PublicationAction) -> Iterator[None]:
+        yield
+
+    context = MODULE.PromotionContext(
+        version="v2", manifest_sha256="a" * 64,
+        staging_root=candidate.parent, candidate=candidate,
+        manifest=tmp_path / "manifest.json", release_root=release_root,
+        release=new_release, state_root=state_root, active_link=active,
+        slot=tmp_path / "slot", libraries=tmp_path / "libraries",
+        publication_guard=allow,
+    )
+    with pytest.raises(MODULE.PromotionError, match="version state|collide"):
+        MODULE._resume_upgrade_publication(
+            context, candidate / "runtime", candidate / "state", document,
+            (os.getuid(), os.getgid()),
+        )
+    assert active.resolve() == old_release.resolve()
+    assert (metadata / "release.json").read_bytes() == before
+
+
+def test_upgrade_resume_revalidates_version_state_after_publication(
+    tmp_path: Path, monkeypatch,
+) -> None:
+    release_root = tmp_path / "releases"
+    old_release = release_root / "v1"
+    new_release = release_root / "v2"
+    state_root = tmp_path / "state"
+    versions = state_root / ".versions"
+    active = tmp_path / "current"
+    candidate = tmp_path / "candidate"
+    candidate_state = candidate / "state"
+    for path in (
+        old_release, new_release, versions, candidate_state / ".versions/v2/config",
+        candidate_state / ".versions/v2/logs",
+    ):
+        path.mkdir(parents=True, exist_ok=True)
+    active.symlink_to(os.path.relpath(old_release, active.parent), target_is_directory=True)
+    metadata = state_root / ".horizon"
+    metadata.mkdir()
+    _write_json(metadata / "release.json", {"version": "v1"})
+    before = (metadata / "release.json").read_bytes()
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    monkeypatch.setitem(
+        MODULE._prepare_state_ownership.__globals__,
+        "_sunlit_ids",
+        lambda: (os.getuid(), os.getgid()),
+    )
+    document = {
+        "manifest_sha256": "a" * 64,
+        "runtime_policy": {
+            "persistent_dirs": [], "persistent_files": [],
+            "mutable_vendor_dirs": ["config"], "empty_mutable_dirs": ["logs"],
+            "fixed_symlinks": {},
+        },
+    }
+
+    @contextmanager
+    def inject_after_move(action: MODULE.PublicationAction) -> Iterator[None]:
+        yield
+        if action is MODULE.PublicationAction.VERSION_STATE:
+            config = versions / "v2/config"
+            config.rmdir()
+            config.symlink_to(outside, target_is_directory=True)
+
+    context = MODULE.PromotionContext(
+        version="v2", manifest_sha256="a" * 64,
+        staging_root=candidate.parent, candidate=candidate,
+        manifest=tmp_path / "manifest.json", release_root=release_root,
+        release=new_release, state_root=state_root, active_link=active,
+        slot=tmp_path / "slot", libraries=tmp_path / "libraries",
+        publication_guard=inject_after_move,
+    )
+    with pytest.raises(MODULE.PromotionError, match="version state is unsafe"):
+        MODULE._resume_upgrade_publication(
+            context, candidate / "runtime", candidate_state, document,
+            (os.getuid(), os.getgid()),
+        )
+    assert active.resolve() == old_release.resolve()
+    assert (metadata / "release.json").read_bytes() == before
+
+
+def test_upgrade_resume_rejects_external_version_state_after_activation(tmp_path: Path) -> None:
+    release_root = tmp_path / "releases"
+    release = release_root / "v2"
+    release.mkdir(parents=True)
+    state_root = tmp_path / "state"
+    versions = state_root / ".versions"
+    versions.mkdir(parents=True)
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (versions / "v2").symlink_to(outside, target_is_directory=True)
+    active = tmp_path / "current"
+    active.symlink_to(os.path.relpath(release, active.parent), target_is_directory=True)
+    metadata = state_root / ".horizon"
+    metadata.mkdir()
+    _write_json(metadata / "release.json", {"version": "v1"})
+    before = (metadata / "release.json").read_bytes()
+    candidate = tmp_path / "candidate"
+    candidate.mkdir()
+    document = {
+        "manifest_sha256": "a" * 64,
+        "runtime_policy": {
+            "persistent_dirs": [], "persistent_files": [],
+            "mutable_vendor_dirs": ["config"], "empty_mutable_dirs": ["logs"],
+            "fixed_symlinks": {},
+        },
+    }
+
+    @contextmanager
+    def allow(_action: MODULE.PublicationAction) -> Iterator[None]:
+        yield
+
+    context = MODULE.PromotionContext(
+        version="v2", manifest_sha256="a" * 64,
+        staging_root=candidate.parent, candidate=candidate,
+        manifest=tmp_path / "manifest.json", release_root=release_root,
+        release=release, state_root=state_root, active_link=active,
+        slot=tmp_path / "slot", libraries=tmp_path / "libraries",
+        publication_guard=allow,
+    )
+    with pytest.raises(MODULE.PromotionError, match="version state is unsafe"):
+        MODULE._resume_upgrade_publication(
+            context, candidate / "runtime", candidate / "state", document,
+            (os.getuid(), os.getgid()),
+        )
+    assert active.resolve() == release.resolve()
+    assert (metadata / "release.json").read_bytes() == before

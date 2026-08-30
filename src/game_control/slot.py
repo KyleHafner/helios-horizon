@@ -256,9 +256,18 @@ class ReservationStore:
         self,
         controller_pid: int | None,
         controller_start_ticks: int | None,
-    ) -> tuple[int, int | None]:
+    ) -> tuple[int, int]:
         pid = os.getpid() if controller_pid is None else controller_pid
         ticks = self.pid_start_ticks(pid) if controller_start_ticks is None else controller_start_ticks
+        if (
+            isinstance(pid, bool)
+            or not isinstance(pid, int)
+            or pid <= 0
+            or isinstance(ticks, bool)
+            or not isinstance(ticks, int)
+            or ticks < 0
+        ):
+            raise ValueError("controller identity cannot be proven")
         return pid, ticks
 
     def reserve(
@@ -403,8 +412,8 @@ class ReservationStore:
                 or current.operation_id != operation_id
                 or current.state_generation != state_generation
                 or (operation_kind is not None and current.operation_kind != operation_kind)
-                or (controller_pid is not None and current.controller_pid != controller_pid)
-                or (controller_start_ticks is not None and current.controller_start_ticks != controller_start_ticks)
+                or current.controller_pid != controller_pid
+                or current.controller_start_ticks != controller_start_ticks
             ):
                 return False
             self.reservation_path.unlink(missing_ok=True)
@@ -432,8 +441,8 @@ class ReservationStore:
             or current.operation_id != operation_id
             or current.state_generation != state_generation
             or (operation_kind is not None and current.operation_kind != operation_kind)
-            or (controller_pid is not None and current.controller_pid != controller_pid)
-            or (controller_start_ticks is not None and current.controller_start_ticks != controller_start_ticks)
+            or current.controller_pid != controller_pid
+            or current.controller_start_ticks != controller_start_ticks
         ):
             return False
         self.reservation_path.unlink(missing_ok=True)
@@ -462,8 +471,8 @@ class ReservationStore:
                 and current.operation_id == operation_id
                 and current.state_generation == state_generation
                 and (operation_kind is None or current.operation_kind == operation_kind)
-                and (controller_pid is None or current.controller_pid == controller_pid)
-                and (controller_start_ticks is None or current.controller_start_ticks == controller_start_ticks)
+                and current.controller_pid == controller_pid
+                and current.controller_start_ticks == controller_start_ticks
                 and self._live(current)
             )
 
@@ -493,8 +502,8 @@ class ReservationStore:
             and current.operation_id == operation_id
             and current.state_generation == state_generation
             and current.operation_kind == "update"
-            and (controller_pid is None or current.controller_pid == controller_pid)
-            and (controller_start_ticks is None or current.controller_start_ticks == controller_start_ticks)
+            and current.controller_pid == controller_pid
+            and current.controller_start_ticks == controller_start_ticks
             and self._live(current)
         )
 
@@ -523,8 +532,8 @@ class ReservationStore:
                 or current.profile_id != source
                 or current.operation_id != operation_id
                 or current.state_generation != state_generation
-                or (controller_pid is not None and current.controller_pid != controller_pid)
-                or (controller_start_ticks is not None and current.controller_start_ticks != controller_start_ticks)
+                or current.controller_pid != controller_pid
+                or current.controller_start_ticks != controller_start_ticks
             ):
                 raise BlockingIOError("reservation ownership changed")
             renewed = Reservation(
@@ -568,8 +577,8 @@ class ReservationStore:
                 or current.operation_id != operation_id
                 or current.state_generation != state_generation
                 or (operation_kind is not None and current.operation_kind != operation_kind)
-                or (controller_pid is not None and current.controller_pid != controller_pid)
-                or (controller_start_ticks is not None and current.controller_start_ticks != controller_start_ticks)
+                or current.controller_pid != controller_pid
+                or current.controller_start_ticks != controller_start_ticks
                 or not self._live(current)
             ):
                 raise BlockingIOError("reservation ownership changed")

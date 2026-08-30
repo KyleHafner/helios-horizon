@@ -675,6 +675,72 @@ def _candidate_matches_existing_state(
     return members[0]
 
 
+def _expected_version_state_members(document: dict) -> set[str]:
+    try:
+        policy = document["runtime_policy"]
+        names = set(policy["mutable_vendor_dirs"]) | set(policy["empty_mutable_dirs"])
+    except (KeyError, TypeError, ValueError) as exc:
+        raise PromotionError("promotion runtime policy is malformed") from exc
+    if any(not isinstance(name, str) or not name or "/" in name for name in names):
+        raise PromotionError("promotion runtime policy is unsafe")
+    return names
+
+
+def _verify_production_version_state(
+    context: PromotionContext,
+    document: dict,
+    sunlit_owner: tuple[int, int],
+) -> Path:
+    """Prove an already-moved version state before selecting its release."""
+    versions_root = context.state_root / ".versions"
+    production = versions_root / context.version
+    if production.parent != versions_root:
+        raise PromotionError("production version state escaped its fixed root")
+    try:
+        versions_resolved = versions_root.resolve(strict=True)
+        production_resolved = production.resolve(strict=True)
+        root_info = production.lstat()
+    except OSError as exc:
+        raise PromotionError("production version state is unavailable") from exc
+    if (
+        production_resolved.parent != versions_resolved
+        or stat.S_ISLNK(root_info.st_mode)
+        or not stat.S_ISDIR(root_info.st_mode)
+        or (root_info.st_uid, root_info.st_gid) != sunlit_owner
+        or stat.S_IMODE(root_info.st_mode) != 0o750
+    ):
+        raise PromotionError("production version state is unsafe")
+    expected_top = _expected_version_state_members(document)
+    try:
+        actual_top = {entry.name for entry in os.scandir(production)}
+    except OSError as exc:
+        raise PromotionError("production version state is unavailable") from exc
+    if actual_top != expected_top:
+        raise PromotionError("production version state member set is not exact")
+    pending = [production / name for name in sorted(expected_top)]
+    while pending:
+        current = pending.pop()
+        try:
+            info = current.lstat()
+        except OSError as exc:
+            raise PromotionError("production version state is unavailable") from exc
+        if stat.S_ISLNK(info.st_mode) or (info.st_uid, info.st_gid) != sunlit_owner:
+            raise PromotionError("production version state is unsafe")
+        if stat.S_ISDIR(info.st_mode):
+            if stat.S_IMODE(info.st_mode) != 0o750:
+                raise PromotionError("production version state is unsafe")
+            try:
+                pending.extend(Path(entry.path) for entry in os.scandir(current))
+            except OSError as exc:
+                raise PromotionError("production version state is unavailable") from exc
+        elif stat.S_ISREG(info.st_mode):
+            if info.st_nlink != 1 or stat.S_IMODE(info.st_mode) != 0o640:
+                raise PromotionError("production version state is unsafe")
+        else:
+            raise PromotionError("production version state is unsafe")
+    return production
+
+
 def _metadata_backup(context: PromotionContext, sunlit_owner: tuple[int, int]) -> dict[str, tuple[bytes, int, int, int] | None]:
     metadata = context.state_root / ".horizon"
     if metadata.exists() or metadata.is_symlink():
@@ -739,10 +805,21 @@ def _resume_upgrade_publication(
     _verify_release_ownership(context.release)
     active_target = os.readlink(context.active_link)
     active_release = (context.active_link.parent / active_target).resolve(strict=True)
+    versions_root = context.state_root / ".versions"
+    _trusted_directory(versions_root, owners=(sunlit_owner,))
+    production_version_state = versions_root / context.version
+    candidate_version_state = state / ".versions" / context.version
+    production_present = production_version_state.exists() or production_version_state.is_symlink()
+    candidate_present = candidate_version_state.exists() or candidate_version_state.is_symlink()
     if active_release == context.release.resolve(strict=True):
         # Active link is already committed.  Metadata and candidate cleanup
         # are resumable post-commit work and remain guarded where stable state
         # is changed.
+        if not production_present:
+            raise PromotionError("active upgrade version state is unavailable")
+        if candidate_present:
+            raise PromotionError("candidate and production version state collide")
+        _verify_production_version_state(context, document, sunlit_owner)
         _write_metadata(
             context.state_root,
             document,
@@ -767,13 +844,20 @@ def _resume_upgrade_publication(
     prior_release = (context.active_link.parent / active_target).resolve()
     if prior_release.parent != context.release_root.resolve() or not prior_release.is_dir() or prior_release.is_symlink():
         raise PromotionError("active upgrade target is unsafe")
-    versions_root = context.state_root / ".versions"
-    _trusted_directory(versions_root, owners=(sunlit_owner,))
-    production_version_state = versions_root / context.version
-    if not production_version_state.exists() and not production_version_state.is_symlink():
+    if production_present:
+        if candidate_present:
+            raise PromotionError("candidate and production version state collide")
+        if state.exists() or state.is_symlink():
+            _candidate_matches_existing_state(
+                context, state, document, allow_moved_version=True,
+            )
+        _verify_production_version_state(context, document, sunlit_owner)
+    else:
         if not state.is_dir() or state.is_symlink():
             raise PromotionError("upgrade version state is unavailable for resume")
         version_state = _candidate_matches_existing_state(context, state, document)
+        if version_state is None:
+            raise PromotionError("upgrade version state is unavailable for resume")
         _prepare_state_ownership(version_state)
         _guarded_replace(
             context,
@@ -782,6 +866,7 @@ def _resume_upgrade_publication(
             production_version_state,
             versions_root,
         )
+        _verify_production_version_state(context, document, sunlit_owner)
     _guarded_activate(
         context,
         PublicationAction.ACTIVE_LINK,
@@ -821,6 +906,8 @@ def _promote_upgrade(context: PromotionContext, runtime: Path, state: Path, docu
     if prior_release.parent != release_root or prior_release.is_symlink() or not prior_release.is_dir():
         raise PromotionError("active release target is unsafe")
     version_state = _candidate_matches_existing_state(context, state, document)
+    if version_state is None:
+        raise PromotionError("candidate version state is unavailable")
     versions_root = context.state_root / ".versions"
     _trusted_directory(versions_root, owners=(sunlit_owner,))
     production_version_state = versions_root / context.version
@@ -866,6 +953,7 @@ def _promote_upgrade(context: PromotionContext, runtime: Path, state: Path, docu
             versions_root,
         )
         version_state_moved = True
+        _verify_production_version_state(context, document, sunlit_owner)
         _guarded_activate(
             context,
             PublicationAction.ACTIVE_LINK,
