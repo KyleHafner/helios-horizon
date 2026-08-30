@@ -1,11 +1,11 @@
 {
-  "user": "svc-sunlit",
-  "group": "svc-sunlit",
-  "cwd": "/srv/game-servers/minecraft-sunlit-cobblemon",
+  "user": "example-game",
+  "group": "example-game",
+  "cwd": "/srv/example-minecraft",
   "argv": [
-    "/usr/bin/java",
-    "@/srv/game-servers/minecraft-sunlit-cobblemon/user_jvm_args.txt",
-    "@/opt/game-servers/minecraft-sunlit-cobblemon/libraries/example/unix_args.txt",
+    "/opt/example-minecraft/runtime/bin/java",
+    "@/srv/example-minecraft/user_jvm_args.txt",
+    "@/opt/example-minecraft/releases/example/libraries/unix_args.txt",
     "nogui"
   ],
   "environment": {}

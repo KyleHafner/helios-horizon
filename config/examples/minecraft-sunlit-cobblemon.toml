@@ -15,17 +15,17 @@ operations = ["start", "stop", "restart", "force_stop", "command", "backup", "re
 notification_events = ["start", "stop", "failed_start", "crash", "forced_stop", "slot_conflict", "low_disk", "backup_failure", "update_failure", "idle_stop"]
 
 [process]
-executable = "/usr/bin/java"
-argv_contains = ["@/opt/game-servers/minecraft-sunlit-cobblemon/libraries/example/unix_args.txt"]
+executable = "/opt/example-minecraft/runtime/bin/java"
+argv_contains = ["@/opt/example-minecraft/releases/example/libraries/unix_args.txt"]
 
 [paths]
-data_roots = ["/srv/game-servers/minecraft-sunlit-cobblemon", "/opt/game-servers/minecraft-sunlit-cobblemon"]
-backup_roots = ["/srv/game-servers/minecraft-sunlit-cobblemon"]
-mutable_root = "/srv/game-servers/minecraft-sunlit-cobblemon"
-log_files = ["/srv/game-servers/minecraft-sunlit-cobblemon/logs/latest.log"]
-backup_root = "/var/backups/game-servers/minecraft-sunlit-cobblemon"
-install_root = "/opt/game-servers/minecraft-sunlit-cobblemon"
-version_file = "/opt/game-servers/minecraft-sunlit-cobblemon/libraries/example/unix_args.txt"
+data_roots = ["/srv/example-minecraft", "/opt/example-minecraft"]
+backup_roots = ["/srv/example-minecraft"]
+mutable_root = "/srv/example-minecraft"
+log_files = ["/srv/example-minecraft/logs/latest.log"]
+backup_root = "/var/backups/example-minecraft"
+install_root = "/opt/example-minecraft"
+version_file = "/opt/example-minecraft/releases/example/libraries/unix_args.txt"
 
 [update]
 kind = "manual"

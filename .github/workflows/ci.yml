@@ -24,7 +24,9 @@ jobs:
           python-version: ${{ matrix.python-version }}
           enable-cache: true
       - run: uv sync --frozen --extra test
-      - run: uv run python -m compileall -q src ops tests
+      - run: uv run python -m compileall -q src ops scripts tests tools
+      - name: Check public repository boundary
+        run: uv run python tools/quality/check_public_boundary.py --root .
       - name: Run privilege-boundary unit tests
         run: sudo --preserve-env=UV_PYTHON,UV_CACHE_DIR env "PATH=$PATH" PYTHONDONTWRITEBYTECODE=1 uv run pytest -q --ignore=tests/browser
 

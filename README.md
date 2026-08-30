@@ -2,9 +2,9 @@
 
 [![CI](https://github.com/swagsystems/helios-horizon/actions/workflows/ci.yml/badge.svg)](https://github.com/swagsystems/helios-horizon/actions/workflows/ci.yml)
 
-Helios Horizon (`game-control`) is a single-slot game-server orchestrator for
-the Horizon VM: exactly one game profile owns the active slot at a time. Its operator
-console is [games.heliosorbit.space](https://games.heliosorbit.space). The
+Helios Horizon (`game-control`) is a single-slot game-server orchestrator:
+exactly one reviewed game profile owns the active slot at a time. The operator
+console URL is deployment-specific. The
 [deployment guide](docs/deployment-example.md) and
 [operations guide](docs/operations-example.md) cover deployment and
 live-operation details.

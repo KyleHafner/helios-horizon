@@ -5,9 +5,9 @@ version = "example"
 
 [server]
 address = "127.0.0.1:25566"
-directory = "/etc/game-control/lazymc"
+directory = "/etc/horizon-example/lazymc"
 # LazyMC runs only the fixed Horizon wake/status helper. Horizon owns Java.
-command = "/usr/local/libexec/horizon-lazymc-wake"
+command = "/usr/local/libexec/horizon-example-lazymc-wake"
 freeze_process = false
 wake_on_start = false
 wake_on_crash = false

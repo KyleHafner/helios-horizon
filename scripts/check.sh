@@ -17,5 +17,6 @@ if (( $# == 1 )); then
 fi
 
 uv run pytest "${pytest_args[@]}"
+uv run python tools/quality/check_public_boundary.py --root "$root_dir"
 node --check web/app.js web/palette.js web/commands.js
 git diff --check

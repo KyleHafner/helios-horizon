@@ -1,8 +1,8 @@
 # Documentation-only H1/H2/G11 reference configuration.
 # This file is not consumed by the baseline installer.
-profiles_dir = "/etc/game-control/profiles.d"
-state_db = "/var/lib/game-control/state.db"
-reservation_path = "/run/game-control/reservation.json"
+profiles_dir = "/etc/horizon-example/profiles.d"
+state_db = "/var/lib/horizon-example/state.db"
+reservation_path = "/run/horizon-example/reservation.json"
 boot_profile = "resume-last-active"
 boot_autostart = false
 
@@ -18,9 +18,9 @@ tps_interval_seconds = 30
 [rcon]
 host = "127.0.0.1"
 port = 25575
-password_path = "/run/credentials/horizon-rcon-password"
+password_path = "/run/horizon-example/credentials/rcon-password"
 
 [crafty]
 base_url = "https://127.0.0.1:8443"
-token_path = "/run/credentials/horizon-crafty-token"
+token_path = "/run/horizon-example/credentials/provider-token"
 verify = true

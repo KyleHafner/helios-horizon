@@ -266,6 +266,6 @@ async def test_command_refusal_and_version_explicitly_unavailable():
 
 def test_endpoint_refusal():
     with pytest.raises(ValueError, match="endpoint"):
-        PersistentRconTelemetry("profile", host="10.0.0.1")
+        PersistentRconTelemetry("profile", host="192.0.2.1")
     with pytest.raises(ValueError, match="endpoint"):
         PersistentRconTelemetry("profile", port=25576)
