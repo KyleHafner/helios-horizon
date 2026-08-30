@@ -264,6 +264,64 @@ async def test_scheduled_backup_lease_fences_direct_runner_and_start_without_sid
     ).fetchone() == ("scheduled_backup", "succeeded")
 
 
+@pytest.mark.asyncio
+async def test_scheduled_backup_renewal_loss_drains_worker_and_releases_real_reservation(tmp_path):
+    operation = tmp_path / "operation.lock"
+    operation.touch(mode=0o600)
+    release_observations = []
+    worker_started = asyncio.Event()
+    worker_done = asyncio.Event()
+    worker_release = asyncio.Event()
+    renewal_failed = asyncio.Event()
+
+    class Store(ReservationStore):
+        def release_if_owned(self, *lease):
+            release_observations.append(worker_done.is_set())
+            return super().release_if_owned(*lease)
+
+    store = Store(operation, tmp_path / "reservation.json")
+    controller = Controller.for_testing(tmp_path)
+    controller.reservation_store = store
+    controller._operation_lock_factory = lambda: OperationLock(operation)
+    controller.profiles = {
+        ProfileId.MINECRAFT: SimpleNamespace(id=ProfileId.MINECRAFT),
+    }
+    controller._schedule = ScheduleBook(parse_schedule([
+        {"cron": "* * * * *", "profile": "minecraft", "backup_destination": "local"},
+    ]))
+
+    async def create(_action, lease_check=None):
+        assert lease_check is not None and lease_check()
+        worker_started.set()
+        await worker_release.wait()
+        worker_done.set()
+        return SimpleNamespace(job_id="backup", state="succeeded")
+
+    async def failing_renewal():
+        await renewal_failed.wait()
+        raise RuntimeError("reservation renewal failed")
+
+    controller._lease_renewal = lambda _lease: asyncio.create_task(failing_renewal())
+    controller.services = SimpleNamespace(backups=SimpleNamespace(create=create))
+    snapshot = StatusSnapshot(
+        generation=1,
+        observed_at=datetime(2026, 7, 17, 20, 0, tzinfo=timezone.utc),
+        profiles=(),
+    )
+    scheduled = asyncio.create_task(controller._apply_schedules(snapshot, uuid4()))
+    await asyncio.wait_for(worker_started.wait(), timeout=1)
+    renewal_failed.set()
+    worker_release.set()
+    await asyncio.wait_for(scheduled, timeout=2)
+
+    assert worker_done.is_set()
+    assert release_observations == [True]
+    assert store.read() is None
+    assert controller._db().execute(
+        "SELECT state,detail FROM jobs WHERE operation='scheduled_backup'"
+    ).fetchone() == ("failed", "backup_failed")
+
+
 def test_schedule_rejects_non_boolean_enabled():
     with pytest.raises(ValueError, match="invalid schedule enabled"):
         parse_schedule([{"cron": "* * * * *", "profile": "minecraft", "enabled": "false"}])

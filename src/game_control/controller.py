@@ -14,6 +14,7 @@ import json
 import logging
 import os
 import sqlite3
+import sys
 import time
 from contextlib import asynccontextmanager, nullcontext
 from datetime import datetime, timedelta, timezone
@@ -806,6 +807,44 @@ class Controller:
             except Exception as exc:
                 raise _ControllerFailure(ErrorCode.SLOT_CONFLICT, "slot reservation was lost") from exc
 
+    async def _drain_renewal(self, renewal: asyncio.Task | None) -> BaseException | None:
+        """Stop and drain renewal, returning an unhandled renewal failure."""
+        if renewal is None:
+            return None
+        renewal.cancel()
+        try:
+            await renewal
+            return None
+        except asyncio.CancelledError:
+            return None
+        except BaseException:
+            return sys.exc_info()[1]
+
+    async def _release_lease(self, lease, renewal: asyncio.Task | None) -> None:
+        """Always release a reservation after renewal task termination."""
+        primary_active = sys.exc_info()[0] is not None
+        renewal_error = await self._drain_renewal(renewal)
+        cleanup_error = None
+        if lease is not None:
+            cleanup = asyncio.create_task(self._clear_reservation(lease))
+            try:
+                await asyncio.shield(cleanup)
+            except BaseException:
+                # A caller may itself be cancelling. Drain the shielded
+                # cleanup task before deciding whether its error is primary.
+                try:
+                    await cleanup
+                except BaseException:
+                    cleanup_error = sys.exc_info()[1]
+        if primary_active:
+            if renewal_error is not None or cleanup_error is not None:
+                _LOG.warning("lease cleanup failed while preserving primary error")
+            return
+        if cleanup_error is not None:
+            raise cleanup_error
+        if renewal_error is not None:
+            raise renewal_error
+
     @asynccontextmanager
     async def _operation_lease(self, profile: Profile, operation: str, request_id: UUID, *, actor: str):
         """Hold the durable slot reservation for the complete heavy operation.
@@ -821,12 +860,7 @@ class Controller:
             await self._assert_lease(renewal)
             yield lease, renewal
         finally:
-            renewal.cancel()
-            try:
-                await renewal
-            except asyncio.CancelledError:
-                pass
-            await self._clear_reservation(lease)
+            await self._release_lease(lease, renewal)
 
     async def _await_lease(self, awaitable, renewal_task, *, drain_on_renewal: bool = False):
         if renewal_task is None:
@@ -991,14 +1025,7 @@ class Controller:
             if readiness_ticket is not None:
                 self._readiness.finish(readiness_ticket)
             self._record_lifecycle_latency("wake_duration", profile.id, lifecycle_started, success=lifecycle_success)
-            if renewal_task is not None:
-                renewal_task.cancel()
-                try:
-                    await renewal_task
-                except asyncio.CancelledError:
-                    pass
-            if lease is not None:
-                await self._clear_reservation(lease)
+            await self._release_lease(lease, renewal_task)
 
     async def _fresh_stop_preflight(
         self,
@@ -1070,14 +1097,7 @@ class Controller:
             await self._assert_lease(renewal_task)
             return lease, renewal_task
         except Exception:
-            if renewal_task is not None:
-                renewal_task.cancel()
-                try:
-                    await renewal_task
-                except asyncio.CancelledError:
-                    pass
-            if lease is not None:
-                await self._clear_reservation(lease)
+            await self._release_lease(lease, renewal_task)
             raise
 
     async def _stop_with_fence(
@@ -1121,14 +1141,7 @@ class Controller:
             raise _ControllerFailure(ErrorCode.INTERNAL_ERROR, detail) from exc
         finally:
             self._record_lifecycle_latency("stop_duration", profile.id, lifecycle_started, success=lifecycle_success)
-            if renewal_task is not None:
-                renewal_task.cancel()
-                try:
-                    await renewal_task
-                except asyncio.CancelledError:
-                    pass
-            if lease is not None:
-                await self._clear_reservation(lease)
+            await self._release_lease(lease, renewal_task)
 
     async def _stop(self, action: Stop, actor: str, request_id: UUID) -> JobAccepted:
         profile = self._profile(action.profile_id)
@@ -1471,26 +1484,8 @@ class Controller:
             raise _ControllerFailure(code, detail) from exc
         finally:
             self._record_lifecycle_latency("switch_duration", target, lifecycle_started, success=lifecycle_success)
-            if renewal_task is not None:
-                renewal_task.cancel()
-                try:
-                    await renewal_task
-                except asyncio.CancelledError:
-                    pass
-                except Exception:
-                    _LOG.warning("lease renewal cleanup failed", exc_info=True)
-            if lease is not None:
-                await self._clear_reservation(lease)
-            if rollback_task is not None:
-                rollback_task.cancel()
-                try:
-                    await rollback_task
-                except asyncio.CancelledError:
-                    pass
-                except Exception:
-                    _LOG.warning("rollback lease renewal cleanup failed", exc_info=True)
-            if rollback_lease is not None:
-                await self._clear_reservation(rollback_lease)
+            await self._release_lease(lease, renewal_task)
+            await self._release_lease(rollback_lease, rollback_task)
 
     async def _start_with_free_retry(self, profile: Profile, renewal_task=None) -> None:
         try:
@@ -2111,22 +2106,12 @@ class Controller:
         try:
             await self._assert_lease(renewal)
         except Exception:
-            renewal.cancel()
-            try:
-                await renewal
-            except asyncio.CancelledError:
-                pass
-            await self._clear_reservation(lease)
+            await self._release_lease(lease, renewal)
             raise
         return lease, renewal
 
     async def _operation_lease_release(self, lease, renewal) -> None:
-        renewal.cancel()
-        try:
-            await renewal
-        except asyncio.CancelledError:
-            pass
-        await self._clear_reservation(lease)
+        await self._release_lease(lease, renewal)
 
     async def _cancel_benchmark(self, action: CancelBenchmark, actor: str, request_id: UUID) -> JobAccepted:
         del request_id

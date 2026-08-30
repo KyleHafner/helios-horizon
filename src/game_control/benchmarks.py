@@ -143,13 +143,14 @@ def _validate_preflight_payload(preflight: Any, preset_ids: set[str]) -> None:
         _require_finite_number(threshold, "threshold")
 
     implementation = preflight.get("statisticsImplementation")
+    if not isinstance(implementation, dict):
+        raise SafeError("benchmark_failed", "benchmark preflight statistics implementation is invalid")
     if (
-        not isinstance(implementation, dict)
-        or set(implementation) - {"name", "fixtures", "version"}
+        set(implementation) - {"name", "fixtures", "version"}
         or "name" not in implementation
         or "fixtures" not in implementation
     ):
-        raise SafeError("benchmark preflight statistics implementation is invalid")
+        raise SafeError("benchmark_failed", "benchmark preflight statistics implementation is invalid")
     for key, value in implementation.items():
         _require_bounded_text(value, f"statistics implementation {key}")
 
@@ -195,7 +196,10 @@ def _validate_preflight_payload(preflight: Any, preset_ids: set[str]) -> None:
 
 
 def _validate_frozen_provenance(action: Any, frozen: Any) -> None:
-    required = {"version", "driverSha256", "configSha256", "presetDigests", "preflight"}
+    required = {
+        "version", "driverSha256", "configSha256", "presetDigests",
+        "presetArgvDigests", "preflight",
+    }
     if not isinstance(frozen, dict) or set(frozen) != required or frozen.get("version") != 2:
         raise SafeError("benchmark_failed", "benchmark preflight provenance is incomplete")
     _require_sha256(frozen.get("driverSha256"), "driver")
@@ -207,7 +211,17 @@ def _validate_frozen_provenance(action: Any, frozen: Any) -> None:
     for preset_id, digest in preset_digests.items():
         _require_bounded_text(preset_id, "preset ID", limit=32)
         _require_sha256(digest, f"preset {preset_id}")
-    _validate_preflight_payload(frozen.get("preflight"), preset_ids)
+    argv_digests = frozen.get("presetArgvDigests")
+    if not isinstance(argv_digests, dict) or set(argv_digests) != preset_ids:
+        raise SafeError("benchmark_failed", "benchmark argv provenance does not match the request")
+    for preset_id, digest in argv_digests.items():
+        _require_bounded_text(preset_id, "preset ID", limit=32)
+        _require_sha256(digest, f"preset argv {preset_id}")
+    preflight = frozen.get("preflight")
+    _validate_preflight_payload(preflight, preset_ids)
+    for key in ("driverSha256", "configSha256", "presetDigests", "presetArgvDigests"):
+        if preflight.get(key) != frozen[key]:
+            raise SafeError("benchmark_failed", f"benchmark frozen {key} does not match preflight")
 
 
 def _run_process_group(command: list[str], **kwargs: Any) -> subprocess.CompletedProcess[str]:
@@ -624,6 +638,10 @@ class BenchmarkService:
                 preset.id: _preset_digest(preset)
                 for preset in plan.presets
                 if preset.id in {action.baseline_preset, action.candidate_preset}
+            },
+            "presetArgvDigests": {
+                preset_id: preflight["presetArgvDigests"][preset_id]
+                for preset_id in (action.baseline_preset, action.candidate_preset)
             },
             "preflight": preflight,
         }

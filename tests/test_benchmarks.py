@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import hashlib
 import sqlite3
 import subprocess
 import sys
@@ -10,7 +11,7 @@ from types import SimpleNamespace
 import pytest
 
 from game_control import benchmarks
-from game_control.benchmarks import BenchmarkService, parse_benchmark_plans
+from game_control.benchmarks import BenchmarkPreset, BenchmarkService, _preset_digest, parse_benchmark_plans
 from game_control import state_db
 from game_control.errors import SafeError
 from game_control.models import ProfileId
@@ -48,14 +49,23 @@ def _plan(tmp_path: Path):
     ), reports
 
 
-def _summary(path: Path) -> None:
+def _summary(path: Path, command=None) -> None:
+    driver_sha = "d" * 64
+    config_sha = "c" * 64
+    if command is not None:
+        driver_sha = hashlib.sha256(Path(command[0]).read_bytes()).hexdigest()
+        config_sha = hashlib.sha256(Path(command[2]).read_bytes()).hexdigest()
+    preset_digests = {
+        "current": _preset_digest(BenchmarkPreset(id="current", label="Current production")),
+        "candidate": _preset_digest(BenchmarkPreset(id="candidate", label="Candidate tuning")),
+    }
     path.write_text(
         json.dumps(
             {
                 "schemaVersion": 2,
-                "driverSha256": "d" * 64,
-                "configSha256": "c" * 64,
-                "presetDigests": {"current": "1" * 64, "candidate": "2" * 64},
+                "driverSha256": driver_sha,
+                "configSha256": config_sha,
+                "presetDigests": preset_digests,
                 "presetArgvDigests": {"current": "a" * 64, "candidate": "b" * 64},
                 "statisticsImplementation": {"name": "fixture", "fixtures": "fixture-v1"},
                 "pairPlan": {"minimumCompletePairs": 1, "maximumPairs": 1},
@@ -126,6 +136,7 @@ def _frozen_provenance() -> dict[str, object]:
         "driverSha256": "d" * 64,
         "configSha256": "c" * 64,
         "presetDigests": {"current": "1" * 64, "candidate": "2" * 64},
+        "presetArgvDigests": {"current": "a" * 64, "candidate": "b" * 64},
         "preflight": {
             "schemaVersion": 2,
             "driverSha256": "d" * 64,
@@ -234,7 +245,7 @@ async def test_benchmark_service_runs_only_configured_presets_and_persists_safe_
         captured.append((command, kwargs))
         summary = tmp_path / "reports" / "run-1" / "summary.json"
         summary.parent.mkdir(exist_ok=True)
-        _summary(summary)
+        _summary(summary, command)
         if command[-1] == "--check":
             return subprocess.CompletedProcess(command, 0, stdout=summary.read_text(), stderr="")
         return subprocess.CompletedProcess(command, 0, stdout=f"{summary}\n", stderr="")
@@ -271,6 +282,16 @@ async def test_benchmark_service_runs_only_configured_presets_and_persists_safe_
     lambda value: value["preflight"].update(pairPlan={}),
     lambda value: value["preflight"].update(primaryEndpoints=[{"name": 7}]),
     lambda value: value["preflight"].update(unexpected=True),
+    lambda value: value["preflight"].update(driverSha256="e" * 64),
+    lambda value: value["preflight"].update(configSha256="e" * 64),
+    lambda value: value["preflight"]["presetDigests"].update(current="3" * 64),
+    lambda value: value["preflight"]["presetArgvDigests"].update(current="4" * 64),
+    lambda value: value["preflight"].update(statisticsImplementation=None),
+    lambda value: value["preflight"].update(statisticsImplementation=7),
+    lambda value: value["preflight"].update(statisticsImplementation="scalar"),
+    lambda value: value["preflight"].update(statisticsImplementation={"name": "fixture", "fixtures": "fixture-v1", "extra": "x"}),
+    lambda value: value["preflight"].update(statisticsImplementation={"fixtures": "fixture-v1"}),
+    lambda value: value["preflight"].pop("statisticsImplementation"),
 ])
 def test_prepare_frozen_rejects_malformed_provenance_before_running_row_insert(tmp_path: Path, mutation):
     service, _reports = _service(tmp_path, lambda *_args, **_kwargs: pytest.fail("preflight must not run"))
@@ -305,9 +326,8 @@ async def test_benchmark_service_fails_closed_when_slot_is_owned(tmp_path: Path)
 @pytest.mark.asyncio
 async def test_benchmark_service_rejects_artifact_outside_approved_root(tmp_path: Path):
     outside = tmp_path / "outside.json"
-    _summary(outside)
-
     def runner(command, **_kwargs):
+        _summary(outside, command)
         if command[-1] == "--check":
             return subprocess.CompletedProcess(command, 0, stdout=outside.read_text(), stderr="")
         return subprocess.CompletedProcess(command, 0, stdout=f"{outside}\n", stderr="")

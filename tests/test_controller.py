@@ -45,6 +45,7 @@ from game_control.protocol import (
     WaitReadiness,
 )
 from game_control.health import ReadinessOutcome
+from game_control.slot import OperationLock, ReservationStore
 
 
 @pytest.mark.asyncio
@@ -247,6 +248,81 @@ async def test_benchmark_is_accepted_as_background_job_and_blocks_profile_start(
 
 
 @pytest.mark.asyncio
+async def test_benchmark_renewal_loss_drains_preflight_and_releases_real_reservation(tmp_path):
+    profile = _profile().model_copy(
+        update={"operations": frozenset({OperationName.BENCHMARK})}
+    )
+    operation = tmp_path / "operation.lock"
+    operation.touch(mode=0o600)
+    release_observations = []
+    preflight_started = threading.Event()
+    preflight_done = threading.Event()
+    preflight_release = threading.Event()
+
+    class Store(ReservationStore):
+        def release_if_owned(self, *lease):
+            release_observations.append(preflight_done.is_set())
+            return super().release_if_owned(*lease)
+
+    store = Store(operation, tmp_path / "reservation.json")
+
+    class Benchmarks:
+        async def prove_idle(self, _profile_id):
+            return None
+
+        def preflight(self, _action, _job_id):
+            preflight_started.set()
+            assert preflight_release.wait(2)
+            preflight_done.set()
+            return {"version": 2, "preflight": {}}
+
+        def prepare_frozen(self, *_args):
+            raise AssertionError("lease loss must prevent benchmark insertion")
+
+        async def run(self, *_args):
+            raise AssertionError("lease loss must prevent worker launch")
+
+        def fail(self, *_args):
+            raise AssertionError("lease loss before insertion has no benchmark row to fail")
+
+    controller = Controller(
+        profiles={profile.id: profile},
+        reservation_store=store,
+        operation_lock_factory=lambda: OperationLock(operation),
+        services=SimpleNamespace(benchmarks=Benchmarks()),
+    )
+    renewal_failed = asyncio.Event()
+
+    async def failing_renewal():
+        await renewal_failed.wait()
+        raise RuntimeError("reservation renewal failed")
+
+    controller._lease_renewal = lambda _lease: asyncio.create_task(failing_renewal())
+    action = RunBenchmark(
+        kind="run_benchmark",
+        profile_id=profile.id,
+        baseline_preset="current",
+        candidate_preset="candidate",
+    )
+    task = asyncio.create_task(controller._run_benchmark(action, "operator", uuid4()))
+    assert await asyncio.to_thread(preflight_started.wait, 1)
+    renewal_failed.set()
+    preflight_release.set()
+
+    with pytest.raises(_ControllerFailure):
+        await asyncio.wait_for(task, timeout=2)
+    assert preflight_done.is_set()
+    assert release_observations == [True]
+    assert store.read() is None
+    assert controller._db().execute(
+        "SELECT state,detail FROM jobs WHERE operation='benchmark'"
+    ).fetchone() == ("failed", "benchmark request validation failed")
+    assert controller._db().execute(
+        "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='benchmark_runs'"
+    ).fetchone() == (0,)
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("operation", ["backup", "restore", "update", "world_clone"])
 async def test_held_maintenance_lease_fences_start_and_is_generation_safe(tmp_path, operation):
     """Every heavy maintenance class shares the durable start reservation."""
@@ -299,6 +375,32 @@ async def test_held_maintenance_lease_fences_start_and_is_generation_safe(tmp_pa
     await task
     assert store.owner is None
     assert store.releases[-1] == lease
+
+
+@pytest.mark.asyncio
+async def test_successful_operation_does_not_hide_reservation_release_failure(tmp_path):
+    profile = _profile().model_copy(update={"operations": frozenset({OperationName.BACKUP})})
+
+    class Store:
+        def reserve_if_available(self, profile_id, operation_id, ttl, **kwargs):
+            self.lease = (profile_id, operation_id, kwargs.get("state_generation", 0))
+
+        def renew_if_owned(self, *_args, **_kwargs):
+            return self.lease
+
+    controller = Controller(
+        profiles={profile.id: profile},
+        reservation_store=Store(),
+        operation_lock_factory=_MemoryLock,
+    )
+
+    async def failed_release(_lease=None):
+        raise RuntimeError("reservation release failed")
+
+    controller._clear_reservation = failed_release
+    with pytest.raises(RuntimeError, match="reservation release failed"):
+        async with controller._operation_lease(profile, "backup", uuid4(), actor="test"):
+            pass
 
 
 @pytest.mark.asyncio
