@@ -1,11 +1,12 @@
 from __future__ import annotations
 
+import json
 import sqlite3
 from datetime import datetime, timezone
 
 import pytest
 
-from game_control.telemetry_migration import MigrationError, migrate
+from tools.migrations.telemetry_migration import MigrationError, main, migrate
 
 
 def make_source(path, rows):
@@ -72,6 +73,35 @@ def test_dry_run_import_and_idempotency_preserve_source(tmp_path):
     with sqlite3.connect(target) as db:
         assert db.execute("SELECT COUNT(*) FROM telemetry_samples").fetchone()[0] == 2
         assert db.execute("SELECT COUNT(*) FROM migration_ledger").fetchone()[0] == 1
+
+
+def test_callable_main_preserves_bounded_offline_cli_contract(tmp_path, capsys):
+    source = tmp_path / "state.db"
+    target = tmp_path / "telemetry.db"
+    backup = tmp_path / "backup.db"
+    make_source(source, [
+        ("minecraft", "tps", "2026-08-23T12:00:00Z", 20.0),
+    ])
+    copy_db(source, backup)
+
+    assert main([
+        "--source", str(source),
+        "--target", str(target),
+        "--backup", str(backup),
+        "--dry-run",
+    ]) == 0
+    report = json.loads(capsys.readouterr().out)
+    assert report["dryRun"] is True
+    assert report["sourceRows"] == 1
+    assert not target.exists()
+
+    assert main([
+        "--source", str(tmp_path / "missing.db"),
+        "--target", str(target),
+        "--backup", str(backup),
+        "--dry-run",
+    ]) == 2
+    assert "migration refused:" in capsys.readouterr().err
 
 
 def test_live_v1_resource_shape_states_and_separate_hashes(tmp_path):
@@ -281,7 +311,7 @@ def test_dry_run_rejects_existing_malformed_target(tmp_path):
 def test_late_sidecar_appearing_after_read_is_rejected(tmp_path, monkeypatch):
     source, target, backup = tmp_path / "state.db", tmp_path / "telemetry.db", tmp_path / "backup.db"
     make_source(source, [("minecraft", "tps", "2026-08-23T12:00:00Z", 20.0)]); copy_db(source, backup)
-    import game_control.telemetry_migration as migration_module
+    import tools.migrations.telemetry_migration as migration_module
     original = migration_module._fingerprint
     calls = 0
     def fingerprint(path):
@@ -358,14 +388,14 @@ def test_replay_allows_new_telemetry_rows_and_postcommit_fault_restores(tmp_path
 
     target.unlink()
     calls = 0
-    original = __import__("game_control.telemetry_migration", fromlist=["_imported_state"])._imported_state
+    original = __import__("tools.migrations.telemetry_migration", fromlist=["_imported_state"])._imported_state
     def fault(connection, rows):
         nonlocal calls
         calls += 1
         if calls == 2:
             raise MigrationError("injected postcommit verification fault")
         return original(connection, rows)
-    monkeypatch.setattr("game_control.telemetry_migration._imported_state", fault)
+    monkeypatch.setattr("tools.migrations.telemetry_migration._imported_state", fault)
     with pytest.raises(MigrationError, match="postcommit"):
         migrate(source, target, backup, writer_probe=lambda: False)
     assert not target.exists()
@@ -416,14 +446,14 @@ def test_postcommit_fault_restores_existing_target_from_private_preimage(tmp_pat
     make_source(source, [("minecraft", "mspt", "2026-08-23T12:00:01Z", 2.0)])
     backup.write_bytes(source.read_bytes())
     calls = 0
-    original = __import__("game_control.telemetry_migration", fromlist=["_imported_state"])._imported_state
+    original = __import__("tools.migrations.telemetry_migration", fromlist=["_imported_state"])._imported_state
     def fault(connection, rows):
         nonlocal calls
         calls += 1
         if calls == 2:
             raise MigrationError("injected postcommit verification fault")
         return original(connection, rows)
-    monkeypatch.setattr("game_control.telemetry_migration._imported_state", fault)
+    monkeypatch.setattr("tools.migrations.telemetry_migration._imported_state", fault)
     with pytest.raises(MigrationError, match="postcommit"):
         migrate(source, target, backup, writer_probe=lambda: False)
     assert target.read_bytes() == before

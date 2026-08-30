@@ -2,17 +2,25 @@
 
 from __future__ import annotations
 
+import argparse
 import hashlib
+import json
 import math
 import os
 import shutil
 import sqlite3
+import sys
 import tempfile
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-from .telemetry_db import _create_v2_schema, _CONTROLLED_METRICS, _require_canonical_v2, _validate_profile
+from game_control.telemetry_db import (
+    _CONTROLLED_METRICS,
+    _create_v2_schema,
+    _require_canonical_v2,
+    _validate_profile,
+)
 
 MIGRATION_VERSION = 2
 METRIC_MAP = {"players": "players", "tps": "tps", "mspt": "mspt",
@@ -505,3 +513,32 @@ def migrate(source: str | Path, target: str | Path, backup: str | Path, *, dry_r
                 preimage.unlink()
             except FileNotFoundError:
                 pass
+
+
+def _parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--source", required=True, type=Path)
+    parser.add_argument("--target", required=True, type=Path)
+    parser.add_argument("--backup", required=True, type=Path)
+    parser.add_argument("--telemetry-source", type=Path)
+    parser.add_argument("--telemetry-backup", type=Path)
+    parser.add_argument("--dry-run", action="store_true")
+    return parser
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = _parser().parse_args(argv)
+    try:
+        report = migrate(
+            args.source,
+            args.target,
+            args.backup,
+            dry_run=args.dry_run,
+            telemetry_source=args.telemetry_source,
+            telemetry_backup=args.telemetry_backup,
+        )
+    except (MigrationError, OSError, sqlite3.Error) as exc:
+        print(f"migration refused: {exc}", file=sys.stderr)
+        return 2
+    print(json.dumps(report, sort_keys=True))
+    return 0

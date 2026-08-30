@@ -218,11 +218,11 @@ class StateDatabase:
 def _migrate_state(connection: sqlite3.Connection) -> None:
     version = connection.execute("PRAGMA user_version").fetchone()[0]
     # StateDatabase only opens the canonical schema.  Historical databases are
-    # upgraded by the offline, locked horizon-state-migrate utility; doing
+    # upgraded by the offline, locked tools/migrations/state_migrate.py utility; doing
     # ALTER TABLE here made a controller startup an implicit migration.
     if version not in (0, 4):
         raise RuntimeError(
-            f"unsupported state database schema version {version}; run horizon-state-migrate"
+            f"unsupported state database schema version {version}; run tools/migrations/state_migrate.py"
         )
     for statement in _STATE_TABLES:
         connection.execute(statement)
@@ -241,7 +241,7 @@ def _migrate_state(connection: sqlite3.Connection) -> None:
         actual = {row[1] for row in connection.execute(f'PRAGMA table_info("{table}")')}
         if not expected.issubset(actual):
             raise RuntimeError(
-                f"non-canonical state database table {table}; run horizon-state-migrate"
+                f"non-canonical state database table {table}; run tools/migrations/state_migrate.py"
             )
     connection.execute(
         "CREATE TRIGGER IF NOT EXISTS events_append_only_update "

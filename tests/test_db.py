@@ -172,7 +172,7 @@ def test_legacy_jobs_require_offline_migration(
     raw.close()
     path.chmod(0o600)
 
-    with pytest.raises(RuntimeError, match="horizon-state-migrate"):
+    with pytest.raises(RuntimeError, match="tools/migrations/state_migrate.py"):
         StateDatabase.open(path)
 
 

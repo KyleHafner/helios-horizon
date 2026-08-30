@@ -1,8 +1,6 @@
 from __future__ import annotations
 
 import hashlib
-import importlib.machinery
-import importlib.util
 import json
 import os
 import sqlite3
@@ -11,14 +9,10 @@ from pathlib import Path
 import pytest
 
 from game_control import state_db
+from tools.migrations import state_migrate as migration
 
 
-UTILITY_PATH = Path(__file__).parents[1] / "ops/bin/horizon-state-migrate"
-loader = importlib.machinery.SourceFileLoader("horizon_state_migrate", str(UTILITY_PATH))
-spec = importlib.util.spec_from_loader("horizon_state_migrate", loader)
-assert spec and spec.loader
-migration = importlib.util.module_from_spec(spec)
-loader.exec_module(migration)
+UTILITY_PATH = Path(__file__).parents[2] / "tools/migrations/state_migrate.py"
 
 
 TS = "2026-08-05T12:00:00Z"
