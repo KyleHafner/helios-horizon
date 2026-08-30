@@ -1,43 +1,79 @@
-# Example deployment guidance
+# Sanitized deployment reference
 
-The checked-in `config/` and `ops/` files show the shape of a hardened deployment. They are not safe to install unchanged.
+The checked-in `config/` and `ops/` trees describe a reviewed deployment shape
+for Horizon. They are public reference material, not a snapshot of any current
+host, and they are not safe to install unchanged.
 
-## Required adaptation
+## Product, reference, and private policy
 
-1. Create dedicated service accounts for the controller, web process, and each game server.
-2. Replace example profile paths, ports, public endpoints, service names, and Crafty server ID.
-3. Keep each mutable root separate from its backup root and immutable release directory.
-4. Provision the Crafty token, proxy credential, and notification destinations as mode `0600` runtime files outside Git.
-5. Bind the web service to loopback or a private interface reachable only by the trusted reverse proxy.
-6. Configure SSO and inject both the fixed proxy credential and authenticated identity.
-7. Restrict the Unix socket to the controller and web accounts; verify peer-credential rejection.
-8. Validate systemd units with `systemd-analyze verify` before installing them.
-9. Exercise backup creation, verification, restore, rollback, and one-profile-at-a-time slot behavior with disposable data.
-10. Confirm stopped game ports and internal telemetry ports are unreachable from untrusted networks.
-11. If adopting the optional H1/H2/G11 reference, review
-    [operations examples](operations-example.md), replace every example
-    identity and path with locally reviewed values, and keep runtime secrets
-    outside Git.
+Product code owns typed actions, validation, lease semantics, publication
+fencing, and the deployment-manifest schema. The checked-in reference owns
+synthetic profile, runner, unit, path, and port choices used to exercise those
+contracts. A target environment must supply an external private deployment
+overlay for real domains, topology, service identities, credentials, backup
+policy, and operational evidence.
 
-## Installer dry run
+Do not copy private values back into the public reference. Do not treat a
+successful alternate-root install as authorization to modify a real host.
 
-The installer accepts an alternate root so its filesystem output can be inspected without touching `/`:
+## Required target review
+
+Before composing a private deployment:
+
+1. Choose dedicated controller, web, and game-service identities and verify
+   their ownership boundaries.
+2. Compile each reviewed profile to fixed paths, ports, units, executable
+   arguments, and capability audiences. None may be caller-selectable.
+3. Keep mutable data, immutable releases, staging, and backup roots distinct.
+4. Provision provider, proxy, RCON, backup, and notification credentials as
+   protected runtime files outside Git.
+5. Bind the web tier only where a trusted reverse proxy can enforce SSO and a
+   second application credential.
+6. Restrict the controller socket to the reviewed web identity and verify Unix
+   peer-credential rejection.
+7. Validate units with `systemd-analyze verify` and independently review their
+   filesystem and capability restrictions.
+8. Exercise backup, restore, rollback, update retry, cancellation, and
+   one-profile-at-a-time behavior with disposable data.
+9. Confirm backend, RCON, and telemetry listeners are unreachable from
+   untrusted networks.
+10. Run both installer drift checks and the independent verifier before any
+    service activation.
+
+Provider credentials and provider-specific instance identifiers are local
+deployment inputs. They are not universal Horizon settings and must never be
+accepted from a browser action.
+
+## Alternate-root inspection
+
+The installer accepts an explicit alternate root. This creates only a staged
+filesystem tree and skips host systemd verification:
 
 ```bash
 root=$(mktemp -d)
-token=$(mktemp)
-printf 'synthetic-token\n' > "$token"
-python3 ops/install.py --apply --root "$root" --token-source "$token" --skip-systemd-verify
-python3 ops/install.py --check --root "$root" --token-source "$token" --skip-systemd-verify
+python3 ops/install.py --apply --root "$root" --skip-systemd-verify
+install -m 0600 /dev/null \
+  "$root/etc/game-control/secrets.d/horizon-b2-rclone.conf"
+python3 "$root/opt/game-control/ops/install.py" \
+  --check --root "$root" --skip-systemd-verify
+python3 scripts/verify-deployed.py --static --root "$root"
 ```
 
-Do not use `--skip-systemd-verify` for a real installation.
+The empty credential is a disposable structural fixture only. Never use
+`--skip-systemd-verify` for a real installation, and never treat a static PASS
+as proof of network, credential, backup, restore, or service behavior.
 
-The baseline installer intentionally does not install the H1/H2/G11 reference
-files. They are examples because the corresponding feature implementation,
-service accounts, game installation, RCON server, capability issuer, and B2
-remote must be composed and verified for the target host before packaging.
+## Reference inventory
 
-## Public-release note
+- `config/examples/` uses explicit `horizon-example` and `example-*`
+  namespaces and documentation-only networks.
+- `config/profiles/`, `config/runner/`, and `config/game-control.toml` are the
+  reviewed package fixtures consumed by deployment tests and the manifest.
+- `ops/` contains bounded fixed entry points, unit examples, and the package
+  installer. It is deployment-shaped product material, not live inventory.
+- `tools/acceptance/`, `tools/migrations/`, and `tools/quality/` are source-only
+  operational or development tools and are excluded from the runtime wheel.
 
-The public repository was produced from a sanitized source snapshot. Operational runbooks, private topology, live identifiers, player/world data, deployment evidence, and prior internal Git history are deliberately excluded.
+The public repository excludes private topology, live identifiers, worlds,
+player data, databases, backup evidence, credentials, remote keys, and
+deployment history.

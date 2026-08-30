@@ -1,138 +1,106 @@
 # Public operations reference
 
-This document is a sanitized deployment reference for the current H1, H2, and
-G11 contracts. It is intentionally separate from the baseline installer:
-feature modules and host-specific service wiring must be reviewed together
-before installation.
+This document explains reusable Horizon operations through a sanitized
+reference deployment. Every address, identity, profile, path, and remote name
+shown here is synthetic or loopback-only; none is a claim about a live host.
+Real operational choices belong in an external private deployment overlay.
 
-All addresses below are documentation examples. Replace example.com and RFC
-5737 addresses with values reviewed for the target environment.
+## Reference network boundary
 
-## Fixed local topology
-
-The intended ownership model is:
+The example flow is:
 
     trusted reverse proxy
             |
             +-- web API on 127.0.0.1:8444
             |
-            +-- public LazyMC listener on 192.0.2.10:25565
+            +-- example gameplay listener on 192.0.2.10:25565
                              |
-                             +-- Horizon-owned backend 127.0.0.1:25566
-                             +-- Horizon-owned RCON 127.0.0.1:25575
-                             +-- Horizon-owned metrics 127.0.0.1:19565
+                             +-- fixed backend 127.0.0.1:25566
+                             +-- fixed RCON 127.0.0.1:25575
+                             +-- fixed metrics 127.0.0.1:19565
 
-The proxy is the only public web entry point. The game backend, RCON, and
-metrics listener remain loopback-only. A public gameplay name such as
-mc.example.com:25565 is a documentation placeholder, not a claim about a
-live endpoint.
+Only the reviewed gameplay listener and trusted proxy are ingress points. The
+backend, RCON, metrics, controller socket, and credential files remain outside
+browser authority. A name such as `mc.example.com` is a documentation
+placeholder.
 
-The intentional example profile is minecraft-sunlit-cobblemon. Its mutable
-data, immutable release data, backup root, systemd unit, runner, ports, and
-owner are all fixed by reviewed configuration. A request cannot select an
-executable, path, unit, endpoint, or profile outside that configuration.
+The checked-in Minecraft profile is one reviewed package fixture. Its mutable
+data, immutable release data, backup root, unit, runner, ports, and owner are
+fixed by configuration. A request cannot select an executable, path, unit,
+endpoint, credential, or alternate profile outside that configuration.
 
-## H1: console, RCON, and online backup
+## Console, RCON, and online backup
 
-The browser command route accepts only a bounded printable command for an
-authenticated operator. The controller maps it to the fixed Sunlit RCON
-transport; callers cannot provide the RCON host, port, password path, FIFO, or
+The command route accepts only a bounded printable command from an
+authenticated operator. The controller maps it to the profile's fixed
+transport; callers cannot provide a host, port, password path, FIFO, or
 executable.
 
-The reference RCON contract is:
+The RCON reference is loopback-only, reads a root-owned mode-0600 runtime
+credential, bounds packet and response sizes, and returns generic failures
+without command or credential material.
 
-- host 127.0.0.1;
-- port 25575;
-- a root-owned, mode-0600 runtime credential, provisioned outside Git;
-- bounded command, packet, credential, response, and timeout values;
-- authentication that accepts the protocol's optional empty response-value
-  packet before the authentication response; and
-- generic failure messages with command and credential material redacted.
+Online application backup is controller-owned:
 
-Online application backup is a controller-owned sequence:
-
-1. prove the profile is eligible and acquire the operation/slot lease;
-2. send fixed save-off and save-all flush commands;
-3. perform one bounded immutable staging/copy pass;
+1. prove eligibility and acquire the durable operation lease;
+2. quiesce and flush through fixed typed commands;
+3. perform one bounded immutable staging and copy pass;
 4. verify staged bytes and manifest metadata;
-5. attempt the fixed save-on cleanup command even when the copy path fails;
-6. persist catalog metadata only after the quiesce and verification gates pass.
+5. run the fixed cleanup command even when copying fails; and
+6. publish catalog metadata only after quiesce and verification pass.
 
-A save-on failure is fail-closed. The result is not advertised as a verified
-backup merely because an archive was written.
+Cleanup failure is fail-closed. An archive is not advertised as verified merely
+because bytes were written.
 
-The optional metrics exporter is fixed to http://127.0.0.1:19565/metrics.
-Responses are streamed under a hard byte cap before accumulation or database
-persistence. TPS/MSPT are telemetry, not a control or authentication path.
+## Capability-scoped wake
 
-## H2: LazyMC capability wake
+A wake proxy is a supervisor, not a Java lifecycle owner. It submits a typed
+request to Horizon, waits for a healthy typed status, and cannot launch,
+signal, stop, or restart the game process directly.
 
-LazyMC is only a proxy/supervisor. It never launches, signals, stops, or
-restarts Java. Its fixed helper submits token-authenticated typed wake and
-status requests to Horizon, then waits for a healthy status projection.
+Capability bindings are fixed by a root-owned issuer. Status and wake scopes,
+profile binding, audience, expiry, replay controls, rate budget, cooldown,
+transport sizes, and timeouts are independently checked. Request bodies carry
+only a request UUID and allowlisted action; they cannot select a profile,
+command, URL, credential, path, or process.
 
-Capability rules:
+A slot conflict becomes `already_active` only after a fresh status proves the
+fixed target owns the slot and is starting or running. An unrelated owner,
+stale state, failed verification, or an untyped response remains a failure.
 
-- the root-only issuer creates fixed Waker/Observer bindings;
-- the Waker is bound to minecraft-sunlit-cobblemon and only status,wake;
-- the Observer has status,tps and no profile binding;
-- request bodies contain a request UUID and an allowlisted action only;
-- profile, command, URL, credential, and path selection are not caller inputs;
-- request/response sizes, token TTL, replay, rate, cooldown, and transport
-  timeouts are bounded; and
-- invalid or expired credentials return safe errors without token material.
+## Fixed backup reconciliation
 
-After a slot_conflict, wake may report already_active only after a fresh typed
-status proves that the fixed target owns the slot and is starting or running.
-An unrelated owner, stopping/failed state, stale/untyped response, or failed
-verification never becomes a success.
+The reconciliation command accepts no caller-supplied profile, remote, prefix,
+archive, staging, retention, credential, or prune target. Reviewed
+configuration fixes those values and points to a protected runtime credential.
 
-The backend listener must remain 127.0.0.1:25566; the combined server
-metadata and backend configuration must be applied together before any restart.
+Planning and application are separate:
 
-## G11: fixed B2 reconciliation
-
-The reconciliation entry point has no profile, remote, prefix, archive,
-staging, retention, or credential arguments. It uses fixed policy from reviewed
-configuration and a root-only runtime credential such as
-/etc/game-control/secrets.d/example-b2-rclone.conf.
-
-Planning and apply are separate:
-
-1. read the local catalog/protection state and fixed remote listing;
-2. validate exact synthetic profile, generation, manifest, size, and full
-   SHA-256 identity;
-3. refuse the entire plan on any mismatch;
+1. read local catalog/protection state and the fixed remote listing;
+2. validate profile, generation, manifest, size, and full digest identity;
+3. refuse the complete plan on any mismatch;
 4. upload only fixed current local candidates;
-5. cryptcheck/verify each replacement before any prune or catalog mutation;
-6. prune only exact allowlisted orphans/older candidates, never unrelated
-   remote objects; and
-7. update protected state only after the corresponding full verification.
+5. verify each replacement before prune or catalog mutation;
+6. prune only exact allowlisted obsolete objects, never unrelated objects; and
+7. publish protected state only after matching local/remote verification.
 
-Repeated plan/apply with unchanged evidence is a no-op. A protected flag may
-move from 0 to 1 only after canonical protection and matching local/remote
-verification. No live remote key, generation ID, archive size, hash, listing,
-or backup evidence belongs in this repository.
+Repeated plan/apply with unchanged evidence is a no-op. No remote key,
+generation, archive size, digest, listing, or backup evidence belongs in this
+repository.
 
-## Example files and installation residual
+## Recovery and verification
 
-- config/examples/ contains synthetic profile, runner, root-config, and
-  LazyMC metadata examples.
-- ops/bin/ contains the three copy-ready H1 Sunlit helper examples added in
-  this lane. H2/G11 helper and unit files remain an installer-integration
-  residual until the parallel source and packaging contracts are complete.
-- The baseline ops/install.py intentionally does not install these files
-  while the public source and packaging lanes are being composed. Do not add
-  them to the installer until the corresponding source modules, profile
-  schema, service accounts, and packaging tests land together.
-- Before a real installation, run systemd-analyze verify against copied units,
-  use a disposable root for installer checks, provision secrets through the
-  host secret mechanism, and perform independent RCON, health, restore, and B2
-  verification.
+- Test installer apply/check and the independent static verifier against a
+  disposable alternate root first.
+- Validate units and their effective restrictions before copying anything to a
+  real host.
+- Provision credentials through the target's private secret mechanism.
+- Exercise typed health, cancellation, startup reconciliation, backup, restore,
+  and rollback paths using disposable data.
+- Treat unavailable or stale telemetry as unavailable or stale, never as zero.
+- Record real topology, account choices, maintenance procedures, and observed
+  evidence only in the external private overlay.
 
-## Exclusions
-
-This public reference omits host Gate11 observers, monitoring fragments,
-migration plans/evidence, private topology, production domains, credentials,
-live IDs, remote keys, hashes, sizes, timestamps, player/world data, and
-deployment history.
+This public reference intentionally omits monitoring inventory, migration
+evidence, production domains, credentials, live IDs, remote keys, player/world
+data, and deployment history.

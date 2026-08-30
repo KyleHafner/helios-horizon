@@ -1,8 +1,16 @@
 # Security model
 
+This document describes reusable product controls and a sanitized deployment
+model. It does not describe a current host. Real topology, identities,
+credentials, and operational evidence belong in an external private deployment
+overlay.
+
 ## Web authentication
 
-The expected deployment has a trusted reverse proxy that performs SSO and injects an authenticated identity. Horizon requires a second fixed proxy credential before it accepts those headers. A client that reaches the application directly cannot authenticate by spoofing the identity header alone.
+The sanitized deployment model has a trusted reverse proxy that performs SSO
+and injects an authenticated identity. Horizon requires a second fixed proxy
+credential before it accepts those headers. A client that reaches the
+application directly cannot authenticate by spoofing the identity header alone.
 
 After proxy authentication, Horizon creates an expiring server-side session. Mutations require:
 
@@ -32,7 +40,9 @@ The example systemd units use narrow writable paths, protected homes/system dire
 
 Proxy credentials, capability tokens, RCON credentials, backup credentials, and notification destinations are loaded from protected runtime files. The application redacts common bearer tokens, webhook URLs, cookies, passwords, configured secrets, and private-key blocks before returning log records.
 
-The repository intentionally excludes live credential files, databases, logs, backups, worlds, inventories, and generated deployment evidence.
+The repository intentionally excludes live credential files, databases, logs,
+backups, worlds, inventories, private topology, and generated deployment
+evidence.
 
 The LazyMC reference is a proxy/supervisor boundary, not a Java lifecycle
 owner: its backend is a fixed loopback listener, and its Waker credential can
@@ -55,3 +65,7 @@ directory, retention count, or archive path. See
 - The examples do not configure a reverse proxy, SSO provider, firewall, game server, or backup destination.
 - Operators must validate service users, permissions, restore behavior, and network exposure for their environment.
 - A controller compromise is privileged by design; minimizing its accepted input and keeping the web boundary unprivileged are central controls, not a substitute for host hardening.
+
+The durable ownership, lease, filesystem, publication, transport, and recovery
+rules are maintained in the
+[security and lifecycle invariant ledger](engineering/security-and-lifecycle-invariants.md).
