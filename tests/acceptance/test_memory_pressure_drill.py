@@ -6,7 +6,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from game_control.memory_drill import (
+from tools.acceptance.memory_pressure_drill import (
     ALLOCATOR_SCRIPT,
     FIXTURE_SLICE,
     MemoryDrillError,

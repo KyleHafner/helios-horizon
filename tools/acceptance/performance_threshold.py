@@ -7,8 +7,9 @@ import json
 from pathlib import Path
 import sys
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "src"))
-from game_control.phase2_threshold import evaluate_thresholds, samples_from_mapping  # noqa: E402
+ROOT = Path(__file__).resolve().parents[2]
+sys.path.insert(0, str(ROOT))
+from tools.acceptance.performance_thresholds import evaluate_thresholds, samples_from_mapping  # noqa: E402
 
 
 def main() -> int:

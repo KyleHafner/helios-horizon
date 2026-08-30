@@ -1,13 +1,15 @@
-#!/opt/game-control/.venv/bin/python
+#!/usr/bin/env python3
 """Collect bounded Phase 2.1 read-only HTTP/SSE inputs (api/v1/status; readOnly) and evaluate them."""
 from __future__ import annotations
 import argparse, hashlib, json
 import math
 from pathlib import Path
 import sys
-sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "src"))
-from game_control.phase2_collector import MAX_BODY, CollectorConfig, collect  # noqa: E402
-from game_control.phase2_threshold import evaluate_thresholds, samples_from_mapping  # noqa: E402
+ROOT = Path(__file__).resolve().parents[2]
+sys.path.insert(0, str(ROOT / "src"))
+sys.path.insert(0, str(ROOT))
+from tools.acceptance.performance_probe import MAX_BODY, CollectorConfig, collect  # noqa: E402
+from tools.acceptance.performance_thresholds import evaluate_thresholds, samples_from_mapping  # noqa: E402
 
 
 BROWSER_V2_ALLOWED = {

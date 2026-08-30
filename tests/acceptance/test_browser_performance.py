@@ -7,7 +7,7 @@ import subprocess
 import pytest
 
 
-SCRIPT = Path(__file__).parents[1] / "scripts/phase2-browser-evidence.py"
+SCRIPT = Path(__file__).parents[2] / "tools/acceptance/browser_performance.py"
 
 
 def _node_stream_probe(events: list[dict]) -> dict:
@@ -139,7 +139,7 @@ def test_browser_harness_v2_has_bounded_hidden_and_reconnect_measurements():
 
 
 def test_watch_fixture_is_identity_free_and_bounded():
-    script = SCRIPT.parents[1] / "ops/bin/horizon-phase2-live-acceptance"
+    script = SCRIPT.with_name("watchhub_acceptance.py")
     text = script.read_text(encoding="utf-8")
     assert 'phase2.live.fixture.v1' in text
     assert 'no arbitrary' in text.lower()
@@ -150,7 +150,7 @@ def test_watch_fixture_is_identity_free_and_bounded():
 
 
 def test_watch_fixture_rejects_non_monotonic_order_contract():
-    script = SCRIPT.parents[1] / "ops/bin/horizon-phase2-live-acceptance"
+    script = SCRIPT.with_name("watchhub_acceptance.py")
     import runpy
     module = runpy.run_path(str(script))
     assert module["_strictly_increasing"]([1, 2, 3, 5, 6, 7])
@@ -161,7 +161,7 @@ def test_watch_fixture_rejects_non_monotonic_order_contract():
 
 
 def test_watch_fixture_rejects_late_slow_item_in_causal_aggregate():
-    script = SCRIPT.parents[1] / "ops/bin/horizon-phase2-live-acceptance"
+    script = SCRIPT.with_name("watchhub_acceptance.py")
     import runpy
     import asyncio
     module = runpy.run_path(str(script))

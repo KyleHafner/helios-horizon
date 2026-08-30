@@ -21,8 +21,8 @@ def test_manifest_is_typed_frozen_and_exactly_sized() -> None:
     assert isinstance(manifest, DeploymentManifest)
     assert len(manifest.files) == 48
     assert len(manifest.directories) == 50
-    assert len(manifest.runtime_sources) == 81
-    assert len(manifest.runtime_files_for()) == 133
+    assert len(manifest.runtime_sources) == 78
+    assert len(manifest.runtime_files_for()) == 130
     assert manifest.generated_entry_point.name == "horizon"
     assert manifest.generated_entry_point.target == "/opt/game-control/.venv/bin/horizon"
     assert manifest.generated_entry_point.module == "game_control.cli:main"

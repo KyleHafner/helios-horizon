@@ -5,7 +5,7 @@ from pathlib import Path
 
 import pytest
 
-from game_control.phase2_threshold import evaluate_thresholds, samples_from_mapping
+from tools.acceptance.performance_thresholds import evaluate_thresholds, samples_from_mapping
 
 
 def complete(**overrides):
@@ -96,7 +96,7 @@ def test_cli_is_read_only_and_writes_report(tmp_path):
         "reconnects": 0, "connection_attempts": 1, "subscriber_bytes": 1,
         "subscribers": 1, "active_intervals": 3, "hidden_tab_requests": 0,
     }))
-    script = Path(__file__).parents[1] / "ops/bin/horizon-phase2-threshold"
+    script = Path(__file__).parents[2] / "tools/acceptance/performance_threshold.py"
     result = subprocess.run([sys.executable, str(script), str(fixture), "--output", str(output)],
                             capture_output=True, text=True, check=True)
     assert not result.stdout

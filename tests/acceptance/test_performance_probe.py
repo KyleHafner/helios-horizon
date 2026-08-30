@@ -5,7 +5,7 @@ from pathlib import Path
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from threading import Thread
 
-from game_control.phase2_collector import CollectorConfig, collect
+from tools.acceptance.performance_probe import CollectorConfig, collect
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -85,7 +85,7 @@ def test_collector_remains_backward_compatible_without_maintenance_fields():
 
 def test_labeled_sequence_rejects_maintenance_gap_without_clearing_event_loop():
     import pytest
-    from game_control.phase2_collector import _collect_sequence_values
+    from tools.acceptance.performance_probe import _collect_sequence_values
     with pytest.raises(ValueError, match="maintenance sequence"):
         _collect_sequence_values([1.0], {"start": 4, "end": 5}, 3, label="maintenance")
     values, cursor = _collect_sequence_values([2.0], {"start": 0, "end": 1}, None, label="event-loop")
@@ -131,14 +131,14 @@ def test_collector_rejects_unbounded_duration():
 
 def test_collector_rejects_sequence_gaps_instead_of_truncating():
     import pytest
-    from game_control.phase2_collector import _collect_event_loop_values
+    from tools.acceptance.performance_probe import _collect_event_loop_values
     with pytest.raises(ValueError):
         _collect_event_loop_values([1, 2], {"start": 4, "end": 6}, 3)
 
 
 def test_collector_revalidates_process_identity_and_clears_cpu_on_drift(monkeypatch):
     import psutil
-    import game_control.phase2_collector as module
+    import tools.acceptance.performance_probe as module
     calls = iter([(10, "horizon.service"), (11, "horizon.service")])
     monkeypatch.setattr(module, "validate_process_identity", lambda *_args, **_kwargs: next(calls))
     monkeypatch.setattr(psutil, "cpu_count", lambda logical=True: 4)
@@ -161,7 +161,7 @@ def test_collector_revalidates_process_identity_and_clears_cpu_on_drift(monkeypa
 
 
 def test_sequence_contract_preserves_300s_and_max_duration_values_exactly():
-    from game_control.phase2_collector import _collect_event_loop_values
+    from tools.acceptance.performance_probe import _collect_event_loop_values
     cursor = None
     collected = []
     for start in range(0, 1_200, 100):
@@ -180,7 +180,7 @@ def test_sequence_contract_preserves_300s_and_max_duration_values_exactly():
 
 def test_sequence_contract_refuses_oversize_window():
     import pytest
-    from game_control.phase2_collector import _collect_event_loop_values
+    from tools.acceptance.performance_probe import _collect_event_loop_values
     with pytest.raises(ValueError):
         _collect_event_loop_values([0] * 1_025, {"start": 0, "end": 1_025}, None)
 
@@ -189,7 +189,7 @@ def test_collector_rejects_invalid_origin_and_only_allowlisted_paths():
     import pytest
     with pytest.raises(ValueError):
         collect(CollectorConfig("file:///tmp", "secret", duration_seconds=1))
-    from game_control.phase2_collector import _get_json
+    from tools.acceptance.performance_probe import _get_json
     with pytest.raises(ValueError):
         _get_json(CollectorConfig("http://localhost", "secret"), "/api/v1/start", lambda *_a, **_k: None)
 
@@ -207,7 +207,7 @@ class FakeResponse:
 
 def test_adversarial_redirect_malformed_and_oversized_payloads_fail_closed():
     import pytest
-    from game_control.phase2_collector import _get_json, _sse_bytes
+    from tools.acceptance.performance_probe import _get_json, _sse_bytes
     config = CollectorConfig("http://localhost", "secret")
     with pytest.raises(ValueError):
         _get_json(config, "/api/v1/status",
@@ -224,7 +224,7 @@ def test_adversarial_redirect_malformed_and_oversized_payloads_fail_closed():
 
 def test_process_identity_requires_expected_cgroup_and_pins_start_time(tmp_path):
     import pytest
-    from game_control.phase2_collector import validate_process_identity
+    from tools.acceptance.performance_probe import validate_process_identity
     proc = tmp_path / "123"
     proc.mkdir()
     (proc / "stat").write_text("123 (java) S " + " ".join(["0"] * 19))
@@ -236,7 +236,7 @@ def test_process_identity_requires_expected_cgroup_and_pins_start_time(tmp_path)
 
 def test_process_cpu_is_host_capacity_normalized_once_and_rejects_invalid_count():
     import pytest
-    from game_control.phase2_collector import normalize_process_cpu_percent, _validated_logical_cpu_count
+    from tools.acceptance.performance_probe import normalize_process_cpu_percent, _validated_logical_cpu_count
     assert normalize_process_cpu_percent(40.0, 4) == 10.0
     assert normalize_process_cpu_percent(10.0, 4) == 2.5
     for count in (0, -1, None, True, 4.0):
@@ -271,7 +271,7 @@ def _browser_v2_fixture():
 def test_browser_v2_parser_derives_natural_reconnects_only_and_rejects_inconsistency():
     import runpy
     import pytest
-    parser = runpy.run_path(str(__import__('pathlib').Path(__file__).parents[1] / 'ops/bin/horizon-phase2-collect'))['_browser_v2']
+    parser = runpy.run_path(str(Path(__file__).parents[2] / "tools/acceptance/performance_collect.py"))["_browser_v2"]
     mapped, checks = parser(_browser_v2_fixture())
     assert mapped["reconnects"] == 1
     assert mapped["connection_attempts"] == 2
@@ -307,7 +307,7 @@ def test_phase2_collect_cli_merges_v2_and_fails_closed_on_adversarial_v2(tmp_pat
     token = tmp_path / "token"; token.write_text("secret\n")
     evidence = tmp_path / "browser.json"; evidence.write_text(json.dumps(_browser_v2_fixture()))
     output = tmp_path / "report.json"
-    script = Path(__file__).parents[1] / "ops/bin/horizon-phase2-collect"
+    script = Path(__file__).parents[2] / "tools/acceptance/performance_collect.py"
     try:
         result = subprocess.run([
             sys.executable, str(script), "--base-url", f"http://127.0.0.1:{server.server_port}",
@@ -338,7 +338,7 @@ def test_phase2_collect_cli_merges_v2_and_fails_closed_on_adversarial_v2(tmp_pat
         server.shutdown(); thread.join()
 
 
-def test_phase2_collect_direct_runtime_uses_deployed_venv_and_packaging_keeps_it_executable():
-    script = Path(__file__).parents[1] / "ops/bin/horizon-phase2-collect"
-    assert script.read_text(encoding="utf-8").splitlines()[0] == "#!/opt/game-control/.venv/bin/python"
+def test_performance_collect_is_source_only_and_executable():
+    script = Path(__file__).parents[2] / "tools/acceptance/performance_collect.py"
+    assert script.read_text(encoding="utf-8").splitlines()[0] == "#!/usr/bin/env python3"
     assert script.stat().st_mode & 0o111
