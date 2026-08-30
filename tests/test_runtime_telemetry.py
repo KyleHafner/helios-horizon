@@ -195,7 +195,7 @@ async def test_single_cycle_uses_one_snapshot_and_one_telemetry_writer_thread(tm
         rcon=None, player_tracker=SimpleNamespace(),
         wall_clock_ms=lambda: next(generic_stamps),
     )
-    runtime = TelemetryRuntime(Status(), collector)
+    runtime = TelemetryRuntime(Status(), collector, database=ResourceRef.borrowed(database))
     try:
         await runtime.sample_once()
         await runtime.close()
@@ -218,6 +218,57 @@ async def test_single_cycle_uses_one_snapshot_and_one_telemetry_writer_thread(tm
             reader.close()
     finally:
         database.close()
+
+
+@pytest.mark.asyncio
+async def test_collector_close_drains_blocked_gc_callback_and_rejects_late_records():
+    entered = asyncio.Event()
+    release = asyncio.Event()
+    writes = []
+
+    class Database:
+        def enqueue_sample(self, *args, **kwargs):
+            writes.append((args, kwargs))
+            return True
+
+    class Parser:
+        def reset(self):
+            return None
+
+        def feed(self, _data):
+            return (SimpleNamespace(duration_ms=7),)
+
+    class Follower:
+        async def follow_async(self, callback):
+            entered.set()
+            await release.wait()
+            await callback(SimpleNamespace(kind="line", line="gc"))
+
+    profile = SimpleNamespace(id="gc", paths=SimpleNamespace(log_files=()))
+    collector = RuntimeTelemetryCollector(
+        profiles=(profile,),
+        config=TelemetryRuntimeConfig(
+            host_metrics=("host_psi_io_some_avg10",), legacy_tps_mode="disabled"
+        ),
+        database=Database(), rcon=None, player_tracker=SimpleNamespace(),
+    )
+    collector._gc_profile = "gc"
+    collector._gc_parser = Parser()
+    collector._followers = {"gc:gc": Follower()}
+    snapshot = SimpleNamespace(profiles=(SimpleNamespace(
+        profile_id="gc", state="running", pid=None, rss_bytes=None,
+    ),))
+    collecting = asyncio.create_task(collector.collect(snapshot))
+    await entered.wait()
+    closing = asyncio.create_task(collector.aclose())
+    await asyncio.sleep(0)
+    assert not closing.done()
+    release.set()
+    await collecting
+    await closing
+    count = len(writes)
+    await collector.collect(snapshot)
+    assert len(writes) == count
 
 
 @pytest.mark.asyncio
@@ -301,14 +352,14 @@ async def test_resource_ownership_is_explicit_for_sampler_rcon_and_database():
         player_tracker=SimpleNamespace(),
     )
     owned_collector = RuntimeTelemetryCollector(
-        profiles=(), config=config, database=ResourceRef.owned(owned_db),
-        rcon=ResourceRef.owned(owned_rcon), player_tracker=SimpleNamespace(),
+        profiles=(), config=config, database=owned_db, rcon=owned_rcon,
+        player_tracker=SimpleNamespace(),
     )
-    await borrowed_collector.close()
-    await owned_collector.close()
+    await borrowed_collector.aclose()
+    await owned_collector.aclose()
     assert borrowed_db.closes == borrowed_rcon.closes == 0
-    assert borrowed_db.drains == 1
-    assert owned_db.closes == owned_rcon.closes == 1
+    assert borrowed_db.drains == 0
+    assert owned_db.closes == owned_rcon.closes == 0
 
     class Collector:
         async def collect(self, _snapshot):
@@ -322,14 +373,58 @@ async def test_resource_ownership_is_explicit_for_sampler_rcon_and_database():
 
     borrowed_runtime = TelemetryRuntime(
         SimpleNamespace(snapshot=lambda **_: None), Collector(), sampler=borrowed_sampler,
+        database=borrowed_db, rcon=borrowed_rcon,
     )
     owned_runtime = TelemetryRuntime(
         SimpleNamespace(snapshot=lambda **_: None), Collector(), sampler=ResourceRef.owned(owned_sampler),
+        database=ResourceRef.owned(owned_db), rcon=ResourceRef.owned(owned_rcon),
     )
     await borrowed_runtime.close()
     await owned_runtime.close()
     assert borrowed_sampler.shutdowns == borrowed_sampler.waits == 0
     assert owned_sampler.shutdowns == owned_sampler.waits == 1
+    assert borrowed_db.drains == 1
+    assert borrowed_db.closes == borrowed_rcon.closes == 0
+    assert owned_db.closes == owned_rcon.closes == 1
+
+
+def test_runtime_rejects_collector_resource_identity_or_missing_refs():
+    class Database:
+        def drain(self, _timeout=None):
+            return True
+
+        def close(self):
+            return None
+
+    class Rcon:
+        profile_id = "minecraft"
+
+    config = TelemetryRuntimeConfig(
+        host_metrics=("host_psi_io_some_avg10",), legacy_tps_mode="disabled"
+    )
+    database, other_database = Database(), Database()
+    rcon, other_rcon = Rcon(), Rcon()
+    collector = RuntimeTelemetryCollector(
+        profiles=(), config=config, database=database, rcon=rcon,
+        player_tracker=SimpleNamespace(),
+    )
+    with pytest.raises(ValueError, match="database"):
+        TelemetryRuntime(SimpleNamespace(snapshot=lambda **_: None), collector)
+    with pytest.raises(ValueError, match="database"):
+        TelemetryRuntime(
+            SimpleNamespace(snapshot=lambda **_: None), collector,
+            database=ResourceRef.borrowed(other_database), rcon=ResourceRef.borrowed(rcon),
+        )
+    with pytest.raises(ValueError, match="rcon"):
+        TelemetryRuntime(
+            SimpleNamespace(snapshot=lambda **_: None), collector,
+            database=ResourceRef.borrowed(database), rcon=ResourceRef.borrowed(other_rcon),
+        )
+    runtime = TelemetryRuntime(
+        SimpleNamespace(snapshot=lambda **_: None), collector,
+        database=ResourceRef.borrowed(database), rcon=ResourceRef.borrowed(rcon),
+    )
+    assert runtime._closed is False
 
 
 @pytest.mark.asyncio
@@ -437,27 +532,35 @@ async def test_collector_drains_before_owned_closes_and_retries_failed_steps():
     database = Database()
     rcon = Rcon(fail_once=True)
     collector = RuntimeTelemetryCollector(
-        profiles=(), config=config, database=ResourceRef.owned(database),
-        rcon=ResourceRef.owned(rcon), player_tracker=SimpleNamespace(),
+        profiles=(), config=config, database=database, rcon=rcon,
+        player_tracker=SimpleNamespace(),
+    )
+    runtime = TelemetryRuntime(
+        SimpleNamespace(snapshot=lambda **_: None), collector,
+        database=ResourceRef.owned(database), rcon=ResourceRef.owned(rcon),
     )
     with pytest.raises(RuntimeError, match="rcon cleanup boom"):
-        await collector.close()
+        await runtime.close()
     assert events == ["drain", "rconclose", "dbclose"]
-    assert collector.health()["closed"] is False
-    await collector.close()
+    assert runtime.health()["closed"] is False
+    await runtime.close()
     assert events == ["drain", "rconclose", "dbclose", "rconclose"]
     assert database.closes == 1 and rcon.closes == 2
 
     events.clear()
     database = Database(drain_result=False)
     collector = RuntimeTelemetryCollector(
-        profiles=(), config=config, database=ResourceRef.owned(database),
-        rcon=None, player_tracker=SimpleNamespace(),
+        profiles=(), config=config, database=database, rcon=None,
+        player_tracker=SimpleNamespace(),
+    )
+    runtime = TelemetryRuntime(
+        SimpleNamespace(snapshot=lambda **_: None), collector,
+        database=ResourceRef.owned(database),
     )
     with pytest.raises(RuntimeError, match="drain failed"):
-        await collector.close()
+        await runtime.close()
     assert events == ["drain"]
-    assert database.closes == 0 and collector.health()["closed"] is False
+    assert database.closes == 0 and runtime.health()["closed"] is False
     database.drain_result = True
-    await collector.close()
+    await runtime.close()
     assert events == ["drain", "drain", "dbclose"]

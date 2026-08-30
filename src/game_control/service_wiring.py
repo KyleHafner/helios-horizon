@@ -77,6 +77,7 @@ from .runtime.telemetry import (
     ResourceRef,
     TelemetryCollector,
     TelemetryRuntimeConfig,
+    _await_cleanup,
 )
 
 
@@ -233,6 +234,14 @@ class _BoundTelemetryCollectors(TelemetryCollector):
                  rcon: PersistentRconTelemetry | Any | None, player_tracker: PlayerTracker,
                  alerts: Any | None = None):
         self._legacy_alerts = alerts
+        self._legacy_rcon_ref = None if rcon is None else (
+            rcon if isinstance(rcon, ResourceRef) else ResourceRef.borrowed(rcon)
+        )
+        self._legacy_database = None if database is None else (
+            database.value if isinstance(database, ResourceRef) else database
+        )
+        self._legacy_rcon_closed = False
+        self._legacy_alerts_closed = False
         config = _legacy_telemetry_config(stats, tuple(_key(profile) for profile in profiles))
         super().__init__(profiles=profiles, config=config, database=database, rcon=rcon,
                          player_tracker=player_tracker,
@@ -265,10 +274,46 @@ class _BoundTelemetryCollectors(TelemetryCollector):
         await super().collect(snapshot)
 
     async def close(self) -> None:
-        await super().close()
-        close = getattr(self._legacy_alerts, "close", None)
-        if callable(close):
-            await close()
+        cancelled = False
+        errors = []
+        was_cancelled, _result, error = await _await_cleanup(super().aclose())
+        cancelled = was_cancelled or cancelled
+        if error is not None:
+            errors.append(error)
+        drain = getattr(self._legacy_database, "drain", None)
+        if callable(drain):
+            was_cancelled, drained, error = await _await_cleanup(asyncio.to_thread(drain, 10.0))
+            cancelled = was_cancelled or cancelled
+            if error is not None:
+                errors.append(error)
+            elif drained is not True:
+                errors.append(RuntimeError("legacy telemetry database drain failed"))
+        elif self._legacy_database is not None:
+            errors.append(RuntimeError("legacy telemetry database drain is unavailable"))
+        if self._legacy_rcon_ref is not None and self._legacy_rcon_ref.owns_value and not self._legacy_rcon_closed:
+            close = getattr(self._legacy_rcon_ref.value, "close", None)
+            if callable(close):
+                was_cancelled, _result, error = await _await_cleanup(close())
+                cancelled = was_cancelled or cancelled
+                if error is None:
+                    self._legacy_rcon_closed = True
+                else:
+                    errors.append(error)
+            else:
+                errors.append(RuntimeError("owned legacy RCON close is unavailable"))
+        if self._legacy_alerts is not None and not self._legacy_alerts_closed:
+            close = getattr(self._legacy_alerts, "close", None)
+            if callable(close):
+                was_cancelled, _result, error = await _await_cleanup(close())
+                cancelled = was_cancelled or cancelled
+                if error is None:
+                    self._legacy_alerts_closed = True
+                else:
+                    errors.append(error)
+        if errors and not cancelled:
+            raise errors[0]
+        if cancelled:
+            raise asyncio.CancelledError
 
 
 

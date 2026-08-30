@@ -634,6 +634,121 @@ def test_legacy_telemetry_config_keeps_no_tick_when_no_approved_profile_exists()
 
 
 @pytest.mark.asyncio
+async def test_legacy_collector_ownership_bridge_closes_only_explicit_rcon():
+    events = []
+
+    class Database:
+        def __init__(self):
+            self.drains = 0
+            self.closes = 0
+
+        def drain(self, _timeout=None):
+            events.append("drain")
+            self.drains += 1
+            return True
+
+        def close(self):
+            self.closes += 1
+
+    class Rcon:
+        profile_id = "minecraft"
+
+        def __init__(self):
+            self.closes = 0
+
+        async def close(self):
+            events.append("rconclose")
+            self.closes += 1
+
+    database, rcon = Database(), Rcon()
+    collector = wiring._BoundTelemetryCollectors(
+        profiles=(), database=database, stats={},
+        rcon=wiring.ResourceRef.owned(rcon), player_tracker=SimpleNamespace(),
+    )
+    await collector.close()
+    assert events == ["drain", "rconclose"]
+    assert rcon.closes == 1
+    assert database.drains == 1
+    assert database.closes == 0
+
+
+@pytest.mark.asyncio
+async def test_legacy_collector_drain_failure_continues_rcon_and_fails_closed():
+    events = []
+
+    class Database:
+        def drain(self, _timeout=None):
+            events.append("drain")
+            return False
+
+    class Rcon:
+        profile_id = "minecraft"
+
+        async def close(self):
+            events.append("rconclose")
+
+    collector = wiring._BoundTelemetryCollectors(
+        profiles=(), database=Database(), stats={},
+        rcon=wiring.ResourceRef.owned(Rcon()), player_tracker=SimpleNamespace(),
+    )
+    with pytest.raises(RuntimeError, match="drain failed"):
+        await collector.close()
+    assert events == ["drain", "rconclose"]
+
+    events.clear()
+    collector = wiring._BoundTelemetryCollectors(
+        profiles=(), database=SimpleNamespace(), stats={},
+        rcon=wiring.ResourceRef.owned(Rcon()), player_tracker=SimpleNamespace(),
+    )
+    with pytest.raises(RuntimeError, match="drain is unavailable"):
+        await collector.close()
+    assert events == ["rconclose"]
+
+    class NoCloseRcon:
+        profile_id = "minecraft"
+
+    collector = wiring._BoundTelemetryCollectors(
+        profiles=(), database=None, stats={},
+        rcon=wiring.ResourceRef.owned(NoCloseRcon()), player_tracker=SimpleNamespace(),
+    )
+    with pytest.raises(RuntimeError, match="RCON close is unavailable"):
+        await collector.close()
+
+
+@pytest.mark.asyncio
+async def test_legacy_collector_drain_cancellation_is_drained_before_rcon_close():
+    started = asyncio.Event()
+    release = threading.Event()
+    events = []
+
+    class Database:
+        def drain(self, _timeout=None):
+            started.set()
+            release.wait()
+            events.append("drain")
+            return True
+
+    class Rcon:
+        profile_id = "minecraft"
+
+        async def close(self):
+            events.append("rconclose")
+
+    collector = wiring._BoundTelemetryCollectors(
+        profiles=(), database=Database(), stats={},
+        rcon=wiring.ResourceRef.owned(Rcon()), player_tracker=SimpleNamespace(),
+    )
+    closing = asyncio.create_task(collector.close())
+    await started.wait()
+    closing.cancel()
+    await asyncio.sleep(0)
+    release.set()
+    with pytest.raises(asyncio.CancelledError):
+        await closing
+    assert events == ["drain", "rconclose"]
+
+
+@pytest.mark.asyncio
 async def test_rcon_collector_uses_one_performance_request_for_tps_and_mspt():
     calls = []
     writes = []

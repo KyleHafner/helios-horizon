@@ -334,8 +334,8 @@ class TelemetryCollector:
     ) -> None:
         self.profiles = tuple(profiles)
         self.config = config
-        self._database_ref = _resource(database)
-        self._rcon_ref = _resource(rcon)
+        self._database = None if database is None else _resource(database).value
+        self._rcon = None if rcon is None else _resource(rcon).value
         self.player_tracker = player_tracker
         self.alert_sink = alert_sink
         self._monotonic = monotonic
@@ -354,8 +354,8 @@ class TelemetryCollector:
         self._failures: dict[str, int] = {}
         self._host = HostTelemetrySource()
         self._closed = False
-        self._rcon_closed = False
-        self._database_closed = False
+        self._intake_closed = False
+        self._collect_lock = asyncio.Lock()
 
         specs = {
             binding.profile_id: ExporterSpec(binding.profile_id, binding.url, PrometheusTickParser())
@@ -386,15 +386,21 @@ class TelemetryCollector:
 
     @property
     def database(self) -> TelemetryDatabaseWriter | None:
-        return None if self._database_ref is None else self._database_ref.value
+        return self._database
 
     @property
     def rcon(self) -> PersistentRconTelemetry | None:
-        return None if self._rcon_ref is None else self._rcon_ref.value
+        return self._rcon
 
     async def collect(self, snapshot: Any) -> None:
-        if self._closed:
+        if self._intake_closed:
             return
+        async with self._collect_lock:
+            if self._intake_closed:
+                return
+            await self._collect(snapshot)
+
+    async def _collect(self, snapshot: Any) -> None:
         statuses = tuple(getattr(snapshot, "profiles", ()))
         running: dict[str, Any] = {
             _key(getattr(status, "profile_id", status)): status for status in statuses
@@ -562,53 +568,17 @@ class TelemetryCollector:
         return {"failures": dict(self._failures), "rcon": None if rcon is None else rcon.__dict__, "closed": self._closed}
 
     async def close(self) -> None:
+        await self.aclose()
+
+    async def aclose(self) -> None:
         if self._closed:
             return
-        cancelled = False
-        errors: list[BaseException] = []
-        database_drained = self._database_ref is None or self._database_closed
-        if self._database_ref is not None and not self._database_closed:
-            drain = getattr(self.database, "drain", None)
-            if callable(drain):
-                was_cancelled, result, error = await _await_cleanup(asyncio.to_thread(drain, 10.0))
-                cancelled = was_cancelled or cancelled
-                if error is None:
-                    if result is True:
-                        database_drained = True
-                    else:
-                        errors.append(RuntimeError("telemetry database drain failed"))
-                else:
-                    errors.append(error)
-            else:
-                errors.append(RuntimeError("telemetry database drain is unavailable"))
-        if self._rcon_ref is not None and self._rcon_ref.owns_value and not self._rcon_closed:
-            close = getattr(self.rcon, "close", None)
-            if callable(close):
-                was_cancelled, _result, error = await _await_cleanup(close())
-                cancelled = was_cancelled or cancelled
-                if error is None:
-                    self._rcon_closed = True
-                else:
-                    errors.append(error)
-            else:
-                errors.append(RuntimeError("owned RCON close is unavailable"))
-        if self._database_ref is not None and database_drained and self._database_ref.owns_value and not self._database_closed:
-            close = getattr(self.database, "close", None)
-            if callable(close):
-                was_cancelled, _result, error = await _await_cleanup(asyncio.to_thread(close))
-                cancelled = was_cancelled or cancelled
-                if error is None:
-                    self._database_closed = True
-                else:
-                    errors.append(error)
-            else:
-                errors.append(RuntimeError("owned telemetry database close is unavailable"))
-        if errors:
-            self._failures["close"] = self._failures.get("close", 0) + len(errors)
-        if errors and not cancelled:
-            raise errors[0]
-        if not errors:
-            self._closed = True
+        self._intake_closed = True
+        cancelled, _result, error = await _await_cleanup(self._collect_lock.acquire())
+        if error is not None:
+            raise error
+        self._collect_lock.release()
+        self._closed = True
         if cancelled:
             raise asyncio.CancelledError
 
@@ -616,13 +586,36 @@ class TelemetryCollector:
 class TelemetryRuntime:
     """Own one cadence callback and one in-flight snapshot/cycle gate."""
 
-    def __init__(self, status: StatusSnapshotProvider, collector: TelemetryCollectorProtocol, *, sampler: ResourceRef[TelemetrySampler] | TelemetrySampler | None = None, interval_seconds: float = 5.0) -> None:
+    def __init__(
+        self,
+        status: StatusSnapshotProvider,
+        collector: TelemetryCollectorProtocol,
+        *,
+        sampler: ResourceRef[TelemetrySampler] | TelemetrySampler | None = None,
+        database: ResourceRef[TelemetryDatabaseWriter] | TelemetryDatabaseWriter | None = None,
+        rcon: ResourceRef[PersistentRconTelemetry] | PersistentRconTelemetry | None = None,
+        interval_seconds: float = 5.0,
+    ) -> None:
         self.status = status
         self.collector = collector
         sampler_value = _resource(sampler)
         if sampler_value is None:
             sampler_value = ResourceRef.owned(Scheduler(self.sample_once, interval_seconds=interval_seconds))
         self._sampler_ref = sampler_value
+        self._database_ref = _resource(database)
+        self._rcon_ref = _resource(rcon)
+        missing = object()
+        for name, reference in (("database", self._database_ref), ("rcon", self._rcon_ref)):
+            collector_value = getattr(collector, name, missing)
+            if collector_value is missing:
+                continue
+            expected = None if reference is None else reference.value
+            if collector_value is not expected:
+                raise ValueError(f"collector {name} does not match runtime resource")
+            if collector_value is not None and reference is None:
+                raise ValueError(f"collector {name} has no runtime ownership ref")
+        self._rcon_closed = False
+        self._database_closed = False
         self._inflight: set[asyncio.Task[Any]] = set()
         self._cycle_lock = asyncio.Lock()
         self._closing = False
@@ -699,10 +692,49 @@ class TelemetryRuntime:
             cancelled = was_cancelled or cancelled
             if error is not None:
                 errors.append(error)
-        was_cancelled, _result, error = await _await_cleanup(self.collector.close())
+        collector_close = getattr(self.collector, "aclose", None)
+        if collector_close is None:
+            collector_close = self.collector.close
+        was_cancelled, _result, error = await _await_cleanup(collector_close())
         cancelled = was_cancelled or cancelled
         if error is not None:
             errors.append(error)
+        database_drained = self._database_ref is None or self._database_closed
+        if self._database_ref is not None and not self._database_closed:
+            drain = getattr(self._database_ref.value, "drain", None)
+            if callable(drain):
+                was_cancelled, result, error = await _await_cleanup(asyncio.to_thread(drain, 10.0))
+                cancelled = was_cancelled or cancelled
+                if error is None and result is True:
+                    database_drained = True
+                elif error is None:
+                    errors.append(RuntimeError("telemetry database drain failed"))
+                else:
+                    errors.append(error)
+            else:
+                errors.append(RuntimeError("telemetry database drain is unavailable"))
+        if self._rcon_ref is not None and self._rcon_ref.owns_value and not self._rcon_closed:
+            close = getattr(self._rcon_ref.value, "close", None)
+            if callable(close):
+                was_cancelled, _result, error = await _await_cleanup(close())
+                cancelled = was_cancelled or cancelled
+                if error is None:
+                    self._rcon_closed = True
+                else:
+                    errors.append(error)
+            else:
+                errors.append(RuntimeError("owned RCON close is unavailable"))
+        if self._database_ref is not None and database_drained and self._database_ref.owns_value and not self._database_closed:
+            close = getattr(self._database_ref.value, "close", None)
+            if callable(close):
+                was_cancelled, _result, error = await _await_cleanup(asyncio.to_thread(close))
+                cancelled = was_cancelled or cancelled
+                if error is None:
+                    self._database_closed = True
+                else:
+                    errors.append(error)
+            else:
+                errors.append(RuntimeError("owned telemetry database close is unavailable"))
         if errors:
             self._cleanup_failures["close"] = self._cleanup_failures.get("close", 0) + len(errors)
         if errors and not cancelled:
