@@ -5,6 +5,7 @@ import json
 import os
 import shutil
 from contextlib import contextmanager
+from dataclasses import replace
 from pathlib import Path
 from typing import Iterator
 
@@ -284,3 +285,150 @@ def test_fresh_state_resume_rejects_ambiguous_or_untrusted_production(
     assert not context.active_link.exists()
     assert not context.active_link.is_symlink()
     assert update._installed_version() is None
+
+
+@pytest.mark.parametrize("invalid", [
+    "wrong-owner", "wrong-mode", "hardlink", "metadata-mismatch",
+    "version-mismatch",
+])
+def test_fresh_production_state_rejects_explicit_identity_and_metadata_faults(
+    tmp_path: Path, monkeypatch, invalid: str,
+) -> None:
+    context = _fresh_context(
+        tmp_path, monkeypatch, promote.PublicationAction.STATE,
+    )
+    with pytest.raises(promote.PublicationRefused, match="post-action ownership loss"):
+        promote.promote(context)
+    metadata = context.state_root / ".horizon/release.json"
+    if invalid == "wrong-owner":
+        real_lstat = Path.lstat
+
+        def wrong_owner(path: Path):
+            info = real_lstat(path)
+            if path == context.state_root:
+                fields = list(info)
+                fields[4] = info.st_uid + 1
+                return os.stat_result(fields)
+            return info
+
+        monkeypatch.setattr(Path, "lstat", wrong_owner)
+    elif invalid == "wrong-mode":
+        context.state_root.chmod(0o770)
+    elif invalid == "hardlink":
+        os.link(
+            context.state_root / "ops.json",
+            context.state_root / "world/ops-hardlink.json",
+        )
+    elif invalid == "metadata-mismatch":
+        _write_json(metadata, {
+            "profile_id": "minecraft-sunlit-cobblemon",
+            "version": "wrong",
+            "manifest_sha256": context.manifest_sha256,
+            "archive_sha256": "v" * 64,
+        })
+        metadata.chmod(0o640)
+    else:
+        (context.state_root / ".versions/v1").rename(
+            context.state_root / ".versions/wrong",
+        )
+    before = metadata.read_bytes()
+    _bind_installed_version(monkeypatch, context)
+
+    with pytest.raises(promote.PromotionError):
+        promote.promote(context)
+
+    assert not context.active_link.exists()
+    assert not context.active_link.is_symlink()
+    assert metadata.read_bytes() == before
+    assert update._installed_version() is None
+
+
+def test_fresh_candidate_root_regular_file_is_bounded(
+    tmp_path: Path, monkeypatch,
+) -> None:
+    context = _fresh_context(
+        tmp_path, monkeypatch, promote.PublicationAction.RELEASE,
+    )
+    shutil.rmtree(context.candidate)
+    context.candidate.write_bytes(b"not-a-directory")
+
+    with pytest.raises(promote.PromotionError, match="directory is unsafe"):
+        promote.promote(context)
+
+    assert not context.active_link.exists()
+    assert not context.active_link.is_symlink()
+
+
+@pytest.mark.parametrize("race", [
+    "candidate-source-replaced",
+    "destination-broken-symlink",
+    "production-replaced",
+    "candidate-reappeared",
+    "active-broken-symlink",
+])
+def test_fresh_publication_guard_rechecks_path_identity_and_absence(
+    tmp_path: Path, monkeypatch, race: str,
+) -> None:
+    base = _fresh_context(
+        tmp_path, monkeypatch, promote.PublicationAction.RELEASE,
+    )
+    mutated = False
+    metadata_before: bytes | None = None
+
+    @contextmanager
+    def racing_guard(action: promote.PublicationAction) -> Iterator[None]:
+        nonlocal mutated, metadata_before
+        if not mutated and (
+            action is promote.PublicationAction.STATE
+            and race in {"candidate-source-replaced", "destination-broken-symlink"}
+        ):
+            metadata_before = (
+                base.candidate / "state/.horizon/release.json"
+            ).read_bytes()
+            if race == "candidate-source-replaced":
+                moved = base.candidate / "state-before-race"
+                (base.candidate / "state").rename(moved)
+                shutil.copytree(moved, base.candidate / "state")
+            else:
+                base.state_root.symlink_to(
+                    base.state_root.with_name("missing-state"),
+                    target_is_directory=True,
+                )
+            mutated = True
+        elif not mutated and action is promote.PublicationAction.ACTIVE_LINK:
+            metadata_before = (
+                base.state_root / ".horizon/release.json"
+            ).read_bytes()
+            if race == "production-replaced":
+                moved = base.state_root.with_name("state-before-race")
+                base.state_root.rename(moved)
+                shutil.copytree(moved, base.state_root)
+            elif race == "candidate-reappeared":
+                (base.candidate / "state").symlink_to(
+                    base.candidate / "missing-state", target_is_directory=True,
+                )
+            elif race == "active-broken-symlink":
+                base.active_link.symlink_to(
+                    base.active_link.with_name("missing-active"),
+                    target_is_directory=True,
+                )
+            mutated = True
+        yield
+
+    context = replace(base, publication_guard=racing_guard)
+
+    with pytest.raises(promote.PublicationRefused, match="publication"):
+        promote.promote(context)
+
+    assert mutated
+    if context.active_link.is_symlink():
+        assert context.active_link.resolve(strict=False) != context.release.resolve()
+    else:
+        assert not context.active_link.exists()
+    metadata = (
+        context.state_root / ".horizon/release.json"
+        if context.state_root.is_dir() and not context.state_root.is_symlink()
+        else context.candidate / "state/.horizon/release.json"
+    )
+    assert metadata_before is not None
+    assert metadata.read_bytes() == metadata_before

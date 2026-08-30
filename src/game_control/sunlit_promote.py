@@ -79,6 +79,16 @@ class PromotionContext:
     publication_guard: PublicationGuard | None = None
 
 
+@dataclass(frozen=True, slots=True)
+class _PathIdentity:
+    device: int
+    inode: int
+    file_type: int
+    owner_uid: int
+    owner_gid: int
+    mode: int
+
+
 def _validate_version(version: str) -> str:
     if not isinstance(version, str) or not version or "/" in version or version in {".", ".."}:
         raise PromotionError("promotion version is unsafe")
@@ -229,8 +239,12 @@ def _guarded_replace(
     source: Path,
     destination: Path,
     directory: Path,
+    *,
+    precondition: Callable[[], None] | None = None,
 ) -> None:
     with _publication(context, action):
+        if precondition is not None:
+            precondition()
         os.replace(source, destination)
         _fsync_dir(directory)
 
@@ -241,8 +255,11 @@ def _guarded_activate(
     release: Path,
     *,
     expected_prior: str | None,
+    precondition: Callable[[], None] | None = None,
 ) -> None:
     with _publication(context, action):
+        if precondition is not None:
+            precondition()
         activate_release(
             context.active_link,
             context.release_root,
@@ -271,6 +288,36 @@ def _trusted_directory(
     ):
         raise PromotionError("promotion directory is unsafe")
     return info
+
+
+def _path_identity(path: Path) -> _PathIdentity:
+    try:
+        info = path.lstat()
+    except OSError as exc:
+        raise PromotionError("publication path identity is unavailable") from exc
+    return _PathIdentity(
+        device=info.st_dev,
+        inode=info.st_ino,
+        file_type=stat.S_IFMT(info.st_mode),
+        owner_uid=info.st_uid,
+        owner_gid=info.st_gid,
+        mode=stat.S_IMODE(info.st_mode),
+    )
+
+
+def _require_path_identity(path: Path, expected: _PathIdentity) -> None:
+    if _path_identity(path) != expected:
+        raise PromotionError("publication path identity changed")
+
+
+def _require_path_absent(path: Path) -> None:
+    try:
+        path.lstat()
+    except FileNotFoundError:
+        return
+    except OSError as exc:
+        raise PromotionError("publication destination cannot be proven absent") from exc
+    raise PromotionError("publication destination is not absent")
 
 
 def _expected_links(document: dict, context: PromotionContext) -> dict[str, str]:
@@ -584,19 +631,24 @@ def _resume_published_release(context: PromotionContext, runtime: Path, document
     if _tree_digest(runtime) != _tree_digest(context.release):
         raise PromotionError("published release does not match the reviewed candidate")
     if candidate_present:
-        _verify_fresh_state_tree(context, candidate_state, document, sunlit_owner)
+        candidate_identity = _verify_fresh_state_tree(
+            context, candidate_state, document, sunlit_owner,
+        )
         _guarded_replace(
             context,
             PublicationAction.STATE,
             candidate_state,
             context.state_root,
             context.state_root.parent,
+            precondition=lambda: _assert_fresh_state_move(
+                candidate_state, candidate_identity, context.state_root,
+            ),
         )
-        _verify_fresh_state_tree(
+        production_identity = _verify_fresh_state_tree(
             context, context.state_root, document, sunlit_owner,
         )
     elif production_present:
-        _verify_fresh_state_tree(
+        production_identity = _verify_fresh_state_tree(
             context, context.state_root, document, sunlit_owner,
         )
     else:
@@ -606,6 +658,10 @@ def _resume_published_release(context: PromotionContext, runtime: Path, document
         PublicationAction.ACTIVE_LINK,
         context.release,
         expected_prior=None,
+        precondition=lambda: _assert_fresh_activation(
+            context, candidate_state, production_identity, document,
+            sunlit_owner,
+        ),
     )
     shutil.rmtree(runtime)
     _fsync_dir(context.candidate)
@@ -743,7 +799,7 @@ def _verify_fresh_state_tree(
     state: Path,
     document: dict,
     sunlit_owner: tuple[int, int],
-) -> None:
+) -> _PathIdentity:
     """Prove a fully prepared fresh state tree before moving or activating it."""
     fixed_parent = (
         context.candidate if state == context.candidate / "state"
@@ -857,6 +913,47 @@ def _verify_fresh_state_tree(
     }
     if manifest_record != document or release_record != expected_release:
         raise PromotionError("fresh state metadata identity mismatch")
+    return _PathIdentity(
+        device=state_info.st_dev,
+        inode=state_info.st_ino,
+        file_type=stat.S_IFMT(state_info.st_mode),
+        owner_uid=state_info.st_uid,
+        owner_gid=state_info.st_gid,
+        mode=stat.S_IMODE(state_info.st_mode),
+    )
+
+
+def _assert_fresh_state_move(
+    candidate_state: Path,
+    candidate_identity: _PathIdentity,
+    production_state: Path,
+) -> None:
+    """Fence a fresh STATE rename to its previously validated source."""
+    _require_path_identity(candidate_state, candidate_identity)
+    _require_path_absent(production_state)
+
+
+def _assert_fresh_activation(
+    context: PromotionContext,
+    candidate_state: Path,
+    production_identity: _PathIdentity,
+    document: dict,
+    sunlit_owner: tuple[int, int],
+) -> None:
+    """Repeat the complete state proof inside the ACTIVE_LINK owner fence."""
+    _require_path_identity(context.state_root, production_identity)
+    _require_path_absent(candidate_state)
+    _require_path_absent(context.active_link)
+    verified = _verify_fresh_state_tree(
+        context, context.state_root, document, sunlit_owner,
+    )
+    if verified != production_identity:
+        raise PromotionError("production state identity changed during validation")
+    # Keep the final pointer prerequisites adjacent to activation even when the
+    # recursive proof scanned a large world tree.
+    _require_path_identity(context.state_root, production_identity)
+    _require_path_absent(candidate_state)
+    _require_path_absent(context.active_link)
 
 
 def _metadata_backup(context: PromotionContext, sunlit_owner: tuple[int, int]) -> dict[str, tuple[bytes, int, int, int] | None]:
@@ -1196,15 +1293,21 @@ def _promote(context: PromotionContext) -> dict:
             context.release_root,
         )
         release_published = True
+        candidate_identity = _verify_fresh_state_tree(
+            context, state, document, sunlit_owner,
+        )
         _guarded_replace(
             context,
             PublicationAction.STATE,
             state,
             context.state_root,
             context.state_root.parent,
+            precondition=lambda: _assert_fresh_state_move(
+                state, candidate_identity, context.state_root,
+            ),
         )
         state_moved = True
-        _verify_fresh_state_tree(
+        production_identity = _verify_fresh_state_tree(
             context, context.state_root, document, sunlit_owner,
         )
         _guarded_activate(
@@ -1212,6 +1315,9 @@ def _promote(context: PromotionContext) -> dict:
             PublicationAction.ACTIVE_LINK,
             context.release,
             expected_prior=None,
+            precondition=lambda: _assert_fresh_activation(
+                context, state, production_identity, document, sunlit_owner,
+            ),
         )
     except BaseException as exc:
         if isinstance(exc, PublicationRefused):

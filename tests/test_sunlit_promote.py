@@ -323,6 +323,8 @@ def test_guard_refusal_preserves_resumable_forward_state(
     monkeypatch.setattr(MODULE, "_prepare_state_ownership", lambda *_args: None)
     monkeypatch.setattr(MODULE, "_verify_release_ownership", lambda *_args: None)
     monkeypatch.setattr(MODULE, "_verify_fresh_state_tree", lambda *_args: None)
+    monkeypatch.setattr(MODULE, "_assert_fresh_state_move", lambda *_args: None)
+    monkeypatch.setattr(MODULE, "_assert_fresh_activation", lambda *_args: None)
     monkeypatch.setattr(MODULE, "_fsync_tree", lambda *_args: (_ for _ in ()).throw(
         AssertionError("fsync-tree must be stubbed before publication")
     ) if guard_depth else None)
