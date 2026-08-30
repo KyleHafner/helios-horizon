@@ -55,6 +55,7 @@ class TelemetrySampler:
         self._durations_ms: deque[float] = deque(maxlen=int(duration_capacity))
         self._stop = asyncio.Event()
         self._task: asyncio.Task[None] | None = None
+        self._callback_task: asyncio.Task[Any] | None = None
         self._running = False
         self._closed = False
         self._started_at: float | None = None
@@ -105,7 +106,19 @@ class TelemetrySampler:
         try:
             result = self.sample_once()
             if inspect.isawaitable(result):
-                await result
+                callback_task = asyncio.ensure_future(result)
+                self._callback_task = callback_task
+                try:
+                    await asyncio.shield(callback_task)
+                except asyncio.CancelledError:
+                    callback_task.cancel()
+                    try:
+                        await callback_task
+                    except BaseException:
+                        pass
+                    raise
+                finally:
+                    self._callback_task = None
         except SamplerInvariantError:
             raise
         except asyncio.CancelledError:
@@ -134,6 +147,13 @@ class TelemetrySampler:
             try:
                 await task
             except asyncio.CancelledError:
+                pass
+        callback = self._callback_task
+        if callback is not None and not callback.done():
+            callback.cancel()
+            try:
+                await callback
+            except BaseException:
                 pass
 
     async def wait_closed(self) -> None:

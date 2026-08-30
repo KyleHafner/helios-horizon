@@ -193,6 +193,13 @@ class PersistentRconTelemetry:
                     self._last_error = TelemetryErrorCode.NONE
                     self._last_success_at = self._clock()
                     return result
+                except asyncio.CancelledError:
+                    disconnect = asyncio.create_task(self._disconnect_locked(), name="horizon-rcon-disconnect")
+                    try:
+                        await asyncio.shield(disconnect)
+                    except asyncio.CancelledError:
+                        await disconnect
+                    raise
                 except RconError as exc:
                     last = exc
                     code = _error_code(exc)

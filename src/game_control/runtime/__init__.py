@@ -9,14 +9,18 @@ from .protocols import (
     AlertObservation,
     AlertSink,
     StatusSnapshotProvider,
-    TelemetryCollector,
+    TelemetryCollector as TelemetryCollectorProtocol,
     TelemetryDatabaseWriter,
     TelemetrySampler,
 )
 from .telemetry import (
     DEFAULT_HOST_METRICS,
     ExporterBinding,
+    GcLogBinding,
     LegacyTpsMode,
+    ResourceRef,
+    TelemetryCollector,
+    TelemetryRuntime,
     TelemetryRuntimeConfig,
 )
 
@@ -25,10 +29,14 @@ __all__ = [
     "AlertSink",
     "DEFAULT_HOST_METRICS",
     "ExporterBinding",
+    "GcLogBinding",
     "LegacyTpsMode",
+    "ResourceRef",
     "StatusSnapshotProvider",
     "TelemetryCollector",
+    "TelemetryCollectorProtocol",
     "TelemetryDatabaseWriter",
+    "TelemetryRuntime",
     "TelemetryRuntimeConfig",
     "TelemetrySampler",
 ]

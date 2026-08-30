@@ -156,6 +156,32 @@ async def test_mid_request_deactivation_is_serialized_and_cleans_up():
 
 
 @pytest.mark.asyncio
+async def test_request_cancellation_disconnects_without_retry_or_backoff():
+    started = asyncio.Event()
+    release = asyncio.Event()
+    writer = Writer()
+    channel = PersistentRconTelemetry("profile", sleep=lambda _delay: pytest.fail("backoff"))
+    channel._reader = Reader(b"")
+    channel._writer = writer
+
+    async def blocked(_command):
+        started.set()
+        await release.wait()
+        return "There are 0 of a max of 20 players online"
+
+    channel._request_locked = blocked
+    request = asyncio.create_task(channel.execute(TelemetryCommand.PLAYER_COUNT))
+    await started.wait()
+    request.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await request
+    assert writer.closed and writer.waited
+    assert not channel.health.connected
+    assert channel.health.reconnects == 0
+    release.set()
+
+
+@pytest.mark.asyncio
 async def test_timeout_and_nonfinite_jitter_are_safe():
     channel, _ = make_channel([], max_attempts=2, jitter=lambda _: math.inf)
 

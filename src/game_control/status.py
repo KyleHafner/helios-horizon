@@ -77,6 +77,7 @@ class StatusService:
         telemetry_db: Any | None = None,
         monotonic: Callable[[], float] = time.monotonic,
         telemetry_sampler: Any | None = None,
+        telemetry_health_provider: Callable[[], Mapping[str, Any]] | None = None,
         capability_evidence: Callable[[], bool] | None = None,
         ups_health: Callable[[], bool] | None = None,
         benchmark_safety: BenchmarkPreflight | None = None,
@@ -102,6 +103,7 @@ class StatusService:
         self._refresh_lock = asyncio.Lock()
         self.telemetry_db = telemetry_db
         self.telemetry_sampler = telemetry_sampler
+        self.telemetry_health_provider = telemetry_health_provider
         self.capability_evidence = capability_evidence
         self.ups_health = ups_health
         self.benchmark_safety = benchmark_safety or BenchmarkPreflight(
@@ -448,6 +450,11 @@ class StatusService:
                 recorder(error)
 
     def telemetry_health(self) -> dict[str, Any]:
+        if self.telemetry_health_provider is not None:
+            try:
+                return dict(self.telemetry_health_provider())
+            except Exception as error:
+                return {"ok": False, "last_sample_age_ms": None, "last_error": type(error).__name__[:64]}
         if self.telemetry_db is None:
             health: dict[str, Any] = {
                 "ok": False,

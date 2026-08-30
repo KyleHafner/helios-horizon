@@ -12,6 +12,15 @@ from game_control.capability_evidence import WakeSafetyEvidence
 from game_control.status import StatusService, derive_state
 
 
+def test_typed_telemetry_health_provider_precedes_legacy_storage():
+    service = StatusService(
+        [],
+        telemetry_db=SimpleNamespace(health=lambda: {"ok": False}),
+        telemetry_health_provider=lambda: {"ok": True, "source": "runtime"},
+    )
+    assert service.telemetry_health() == {"ok": True, "source": "runtime"}
+
+
 @pytest.mark.asyncio
 async def test_cached_snapshot_stays_responsive_while_sync_maintenance_probe_blocks():
     entered = threading.Event()

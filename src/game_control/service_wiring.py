@@ -72,16 +72,16 @@ from .root_state import RootActiveJobsReader, RootGenerationReader
 from .status import StatusService
 from .updates import UpdateService
 from .worlds import WorldService
+from .runtime.telemetry import (
+    DEFAULT_HOST_METRICS,
+    ResourceRef,
+    TelemetryCollector,
+    TelemetryRuntimeConfig,
+)
 
 
 SUNLIT_ONLINE_SNAPSHOT_SECONDS = 240.0
-_HOST_TELEMETRY_METRICS = (
-    "service_io_read_bytes_total", "service_io_write_bytes_total",
-    "service_io_read_ops_total", "service_io_write_ops_total",
-    "host_psi_io_some_avg10", "host_psi_io_full_avg10",
-    "host_disk_read_io_time_ms_total", "host_disk_write_io_time_ms_total",
-    "host_network_rx_bytes_total", "host_network_tx_bytes_total",
-)
+_HOST_TELEMETRY_METRICS = DEFAULT_HOST_METRICS
 
 # Controller-facing history pages are read frequently and can contain enough
 # rows to make sqlite3.fetchall() visible on the event loop.  Keep a small,
@@ -167,215 +167,106 @@ class _StatusFacade:
         )
 
 
-class _BoundTelemetryCollectors:
-    """Non-UI collectors owned by the five-second slotd sampler."""
+def _legacy_telemetry_config(stats: Mapping[str, Any], approved_profile_ids: tuple[str, ...]):
+    """Translate the pre-runtime stats shape at this temporary boundary only."""
+    if not isinstance(stats, Mapping):
+        raise ValueError("legacy telemetry settings are invalid")
+    allowed = {
+        "exporter_url", "tick_profile", "log_checkpoint_dir", "gc_log_path",
+        "gc_profile_id", "host_metrics", "legacy_tps_mode", "legacy_tps_interval_seconds",
+        "tps_interval_seconds",
+    }
+    if set(stats) - allowed:
+        raise ValueError("legacy telemetry settings contain unknown keys")
+    approved = tuple(str(getattr(item, "value", item)) for item in approved_profile_ids)
+    settings: dict[str, Any] = {
+        "legacy_tps_mode": stats.get("legacy_tps_mode", "disabled"),
+    }
+    for key in ("log_checkpoint_dir", "host_metrics", "legacy_tps_interval_seconds"):
+        if key in stats:
+            settings[key] = stats[key]
+    if "legacy_tps_interval_seconds" not in settings and "tps_interval_seconds" in stats:
+        settings["legacy_tps_interval_seconds"] = stats["tps_interval_seconds"]
+    exporter_url = stats.get("exporter_url")
+    if exporter_url is not None:
+        tick_profile = stats.get("tick_profile")
+        if tick_profile is None and ProfileId.MINECRAFT_SUNLIT_COBBLEMON.value in approved:
+            tick_profile = ProfileId.MINECRAFT_SUNLIT_COBBLEMON.value
+        tick_profile = str(getattr(tick_profile, "value", tick_profile))
+        if tick_profile not in approved:
+            raise ValueError("legacy tick profile is not in the approved root registry")
+        settings.update(exporter_url=exporter_url, tick_profile=tick_profile)
+    gc_profile = stats.get("gc_profile_id")
+    gc_path = stats.get("gc_log_path")
+    if gc_profile is None and gc_path is None and stats.get("log_checkpoint_dir") and ProfileId.MINECRAFT_SUNLIT_COBBLEMON.value in approved:
+        # Temporary compatibility default for the pre-binding production TOML.
+        gc_profile = ProfileId.MINECRAFT_SUNLIT_COBBLEMON.value
+        gc_path = "/srv/game-servers/minecraft-sunlit-cobblemon/logs/gc.log"
+    if gc_profile is not None or gc_path is not None:
+        settings.update(gc_profile_id=str(getattr(gc_profile, "value", gc_profile)), gc_log_path=gc_path)
+    return TelemetryRuntimeConfig.from_root_config(settings, approved_profile_ids=approved)
+
+
+class _LegacyAlertSink:
+    def __init__(self, target: Any):
+        self.target = target
+
+    def observe(self, observation: Any) -> None:
+        self.target.observe(
+            observation.profile_id,
+            profile_state=observation.profile_state,
+            now=observation.now,
+            mspt_p95=observation.mspt_p95,
+            rss_bytes=observation.rss_bytes,
+            wake_duration_ms=observation.wake_duration_ms,
+            benchmark_regression=observation.benchmark_regression,
+        )
+
+
+class _BoundTelemetryCollectors(TelemetryCollector):
+    """Compatibility adapter retaining the pre-runtime collector call shape."""
 
     def __init__(self, *, profiles: tuple[Any, ...], database: Any, stats: Mapping[str, Any],
-                 rcon: PersistentRconTelemetry | None, player_tracker: PlayerTracker,
+                 rcon: PersistentRconTelemetry | Any | None, player_tracker: PlayerTracker,
                  alerts: Any | None = None):
-        self.profiles = profiles
-        self.database = database
-        self.rcon = rcon
-        self.player_tracker = player_tracker
-        self.alerts = alerts
-        self._last_tick = 0.0
-        self._tick: TickTelemetry | None = None
-        self._tick_profile: str | None = None
-        self._followers: dict[str, LogFollower] = {}
-        self._gc_parser: GcTelemetryParser | None = None
-        self._tick_buckets: tuple[float, ...] = ()
-        self._host_state: dict[str, str] = {}
-        self._last_active_profile: str | None = None
-        self._rcon_was_active = False
-        self._failures: dict[str, int] = {}
-        self._host = HostTelemetrySource()
-        exporter_url = stats.get("exporter_url")
-        if exporter_url is not None:
-            profile = next((p for p in profiles if _key(p) == ProfileId.MINECRAFT_SUNLIT_COBBLEMON.value), None)
-            if profile is not None:
-                profile_id = _key(profile)
-                spec = ExporterSpec(profile_id, str(exporter_url), PrometheusTickParser())
-                self._tick = TickTelemetry(ExporterRegistry({profile_id: spec}))
-                self._tick_profile = profile_id
-        checkpoint_dir = stats.get("log_checkpoint_dir")
-        if checkpoint_dir:
-            root = Path(checkpoint_dir)
-            for profile in profiles:
-                logs = getattr(getattr(profile, "paths", None), "log_files", ())
-                if logs:
-                    self.player_tracker.register_incremental(_key(profile))
-                    self._followers[_key(profile)] = LogFollower(
-                        logs[0], root / f"{_key(profile)}.json", start_at_end=True
-                    )
-        if any(_key(profile) == ProfileId.MINECRAFT_SUNLIT_COBBLEMON.value for profile in profiles) and checkpoint_dir:
-            gc_path = Path("/srv/game-servers/minecraft-sunlit-cobblemon/logs/gc.log")
-            self._gc_parser = GcTelemetryParser()
-            self._followers["minecraft-sunlit-cobblemon:gc"] = LogFollower(
-                gc_path, Path(checkpoint_dir) / "minecraft-sunlit-cobblemon-gc.json", start_at_end=True
-            )
+        self._legacy_alerts = alerts
+        config = _legacy_telemetry_config(stats, tuple(_key(profile) for profile in profiles))
+        super().__init__(profiles=profiles, config=config, database=database, rcon=rcon,
+                         player_tracker=player_tracker,
+                         alert_sink=None if alerts is None else _LegacyAlertSink(alerts))
+
+    @property
+    def alerts(self) -> Any | None:
+        return self._legacy_alerts
+
+    @alerts.setter
+    def alerts(self, value: Any | None) -> None:
+        self._legacy_alerts = value
+        self.alert_sink = None if value is None else _LegacyAlertSink(value)
 
     async def collect(self, *, running: Mapping[str, Any]) -> None:
-        def is_running(profile_id: str) -> bool:
+        statuses = []
+        for profile in self.profiles:
+            profile_id = _key(profile)
             value = running.get(profile_id, False)
             if isinstance(value, bool):
-                return value
-            return getattr(getattr(value, "state", None), "value", getattr(value, "state", None)) == "running"
-
-        now = time.monotonic()
-        tick_running = is_running(self._tick_profile or "")
-        if self._tick is not None and self._tick_profile is not None and now - self._last_tick >= 10.0:
-            self._last_tick = now
-            tick_p95 = await self._collect_tick(self._tick_profile, tick_running)
-        else:
-            tick_p95 = None
-        if self.rcon is not None:
-            rcon_running = is_running(self.rcon.profile_id)
-            await self.rcon.set_active(rcon_running)
-            if rcon_running:
-                await self._collect_rcon()
-                self._rcon_was_active = True
-            elif self._rcon_was_active:
-                stamp = int(time.time() * 1000)
-                for metric in ("players", "tps", "mspt"):
-                    self._record(self.rcon.profile_id, metric, None, "inactive", labels={"source": "rcon"}, ts_ms=stamp)
-                self._rcon_was_active = False
-        for profile_id, follower in self._followers.items():
-            try:
-                if profile_id == "minecraft-sunlit-cobblemon:gc" and not is_running("minecraft-sunlit-cobblemon"):
-                    self._record("minecraft-sunlit-cobblemon", "gc_pause", None, "inactive")
-                    continue
-                if profile_id.endswith(":gc") and self._gc_parser is not None:
-                    async def gc_callback(event: Any) -> None:
-                        if event.kind == "reset":
-                            self._gc_parser.reset()
-                            return
-                        for gc_event in self._gc_parser.feed((str(event.line or "") + "\n").encode()):
-                            if gc_event.duration_ms is not None:
-                                self._record("minecraft-sunlit-cobblemon", "gc_pause", gc_event.duration_ms, "available")
-                    await follower.follow_async(gc_callback)
-                else:
-                    await follower.follow_async(lambda event, pid=profile_id: self.player_tracker.ingest_event(pid, event))
-            except Exception:
-                self._failures[f"log:{profile_id}"] = self._failures.get(f"log:{profile_id}", 0) + 1
-        active = next((profile for profile in self.profiles if is_running(_key(profile))), None)
-        active_id = None if active is None else _key(active)
-        inactive_targets = {item for item in (self._last_active_profile, self._tick_profile,
-                                               None if self.rcon is None else self.rcon.profile_id) if item}
-        for profile_id in inactive_targets - ({active_id} if active_id else set()):
-            if self._host_state.get(profile_id) != "inactive":
-                for metric in _HOST_TELEMETRY_METRICS:
-                    self._record(profile_id, metric, None, "inactive")
-                self._host_state[profile_id] = "inactive"
-        if active is not None:
-            status = running.get(active_id)
-            try:
-                pid = None if isinstance(status, bool) else getattr(status, "pid", None)
-                values = self._host.collect(active, pid=pid)
-                for metric in _HOST_TELEMETRY_METRICS:
-                    value = values.get(metric)
-                    self._record(active_id, metric, value, "available" if value is not None else "unavailable")
-                self._host_state[active_id] = "available"
-                self._last_active_profile = active_id
-            except Exception:
-                self._failures["host"] = self._failures.get("host", 0) + 1
-                for metric in _HOST_TELEMETRY_METRICS:
-                    self._record(active_id, metric, None, "unavailable")
-                self._host_state[active_id] = "unavailable"
-            if self.alerts is not None:
-                self.alerts.observe(
-                    active_id,
-                    profile_state="running",
-                    now=now,
-                    mspt_p95=tick_p95 if active_id == self._tick_profile else None,
-                    rss_bytes=None if isinstance(status, bool) else getattr(status, "rss_bytes", None),
-                )
-        elif self.alerts is not None and self._last_active_profile is not None:
-            self.alerts.observe(self._last_active_profile, profile_state="stopped", now=now)
-
-    async def _collect_tick(self, profile_id: str, running: bool) -> float | None:
-        if not running:
-            for metric in ("mspt", "mspt_p50", "mspt_p95", "mspt_p99"):
-                self._record(profile_id, metric, None, "inactive")
-            for bucket in self._tick_buckets:
-                self._record(profile_id, "tick_ms_bucket", None, "inactive",
-                             labels={"bucket": "+Inf" if bucket == float("inf") else str(bucket), "source": "prometheus"})
-            return None
-        try:
-            def fetch() -> str:
-                with urllib.request.urlopen(str(self._tick.registry.get(profile_id).url), timeout=2.0) as response:
-                    raw = response.read(1_048_577)
-                    if len(raw) > 1_048_576:
-                        raise ValueError("exporter response exceeded bound")
-                    return raw.decode("utf-8", "replace")
-            window = self._tick.scrape(profile_id, await asyncio.to_thread(fetch))
-            if window.state == "available":
-                for metric, value in (
-                    ("mspt_p50", window.p50_ms),
-                    ("mspt_p95", window.p95_ms),
-                    ("mspt_p99", window.p99_ms),
-                ):
-                    self._record(profile_id, metric, value, "available")
-                for bucket, count in window.histogram:
-                    self._record(profile_id, "tick_ms_bucket", count, "available", labels={"bucket": "+Inf" if bucket == float("inf") else str(bucket), "source": "prometheus"})
-                self._tick_buckets = tuple(bucket for bucket, _count in window.histogram)
-                return window.p95_ms
+                statuses.append(type("LegacyStatus", (), {
+                    "profile_id": profile_id,
+                    "state": "running" if value else "stopped",
+                    "pid": None,
+                    "rss_bytes": None,
+                })())
             else:
-                for metric in ("mspt_p50", "mspt_p95", "mspt_p99"):
-                    self._record(profile_id, metric, None, "unavailable")
-                for bucket in self._tick_buckets:
-                    self._record(profile_id, "tick_ms_bucket", None, "unavailable",
-                                 labels={"bucket": "+Inf" if bucket == float("inf") else str(bucket), "source": "prometheus"})
-        except Exception:
-            self._failures["tick"] = self._failures.get("tick", 0) + 1
-            for metric in ("mspt_p50", "mspt_p95", "mspt_p99"):
-                self._record(profile_id, metric, None, "unavailable")
-            for bucket in self._tick_buckets:
-                self._record(profile_id, "tick_ms_bucket", None, "unavailable",
-                             labels={"bucket": "+Inf" if bucket == float("inf") else str(bucket), "source": "prometheus"})
-        return None
-
-    async def _collect_rcon(self) -> None:
-        scrape_ts_ms = int(time.time() * 1000)
-        try:
-            players = await self.rcon.execute(TelemetryCommand.PLAYER_COUNT)
-            if not isinstance(players, PlayerCountResult):
-                raise ValueError("typed player-count result unavailable")
-            self._record(self.rcon.profile_id, "players", players.online, "available", labels={"source": "rcon"}, ts_ms=scrape_ts_ms)
-        except Exception:
-            self._failures["rcon:players"] = self._failures.get("rcon:players", 0) + 1
-            self._record(self.rcon.profile_id, "players", None, "unavailable", labels={"source": "rcon"}, ts_ms=scrape_ts_ms)
-        try:
-            performance = await self.rcon.execute(TelemetryCommand.PERFORMANCE)
-            if not isinstance(performance, PerformanceResult):
-                raise ValueError("typed performance result unavailable")
-            self._record(self.rcon.profile_id, "tps", performance.tps, "available", labels={"source": "rcon"}, ts_ms=scrape_ts_ms)
-            self._record(self.rcon.profile_id, "mspt", performance.mspt, "available", labels={"source": "rcon"}, ts_ms=scrape_ts_ms)
-        except Exception:
-            for metric in ("tps", "mspt"):
-                self._failures[f"rcon:{metric}"] = self._failures.get(f"rcon:{metric}", 0) + 1
-                self._record(self.rcon.profile_id, metric, None, "unavailable", labels={"source": "rcon"}, ts_ms=scrape_ts_ms)
-
-    def _record(self, profile_id: str, metric: str, value: Any, state: str, *, labels: Mapping[str, str] | None = None,
-                ts_ms: int | None = None) -> None:
-        if self.database is None:
-            return
-        try:
-            enqueue = getattr(self.database, "enqueue_sample", None)
-            if not callable(enqueue):
-                return
-            enqueue(profile_id, metric, value, ts_ms=int(time.time() * 1000) if ts_ms is None else ts_ms,
-                    state=state, labels=labels)
-        except Exception:
-            self._failures[f"db:{metric}"] = self._failures.get(f"db:{metric}", 0) + 1
-
-    def health(self) -> dict[str, Any]:
-        return {"failures": dict(self._failures), "rcon": None if self.rcon is None else self.rcon.health.__dict__}
+                statuses.append(value)
+        snapshot = type("LegacySnapshot", (), {"profiles": tuple(statuses)})()
+        await super().collect(snapshot)
 
     async def close(self) -> None:
-        if self.rcon is not None:
-            await self.rcon.close()
-        if self.alerts is not None:
-            await self.alerts.close()
+        await super().close()
+        close = getattr(self._legacy_alerts, "close", None)
+        if callable(close):
+            await close()
+
 
 
 class _PerformanceAlerts:
@@ -1250,7 +1141,7 @@ def _build_service_seams_impl(
         profiles=profile_items,
         database=telemetry_db,
         stats=stats,
-        rcon=rcon_telemetry,
+        rcon=None if rcon_telemetry is None else ResourceRef.owned(rcon_telemetry),
         player_tracker=player_tracker,
     )
     status_service.telemetry_collectors = collector

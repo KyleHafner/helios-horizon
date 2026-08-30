@@ -98,6 +98,27 @@ async def test_explicit_shutdown_cancels_supervised_task():
 
 
 @pytest.mark.asyncio
+async def test_shutdown_cancels_and_awaits_callback_task():
+    started = asyncio.Event()
+    finished = asyncio.Event()
+
+    async def sample():
+        started.set()
+        try:
+            await asyncio.sleep(60)
+        finally:
+            finished.set()
+
+    sampler = TelemetrySampler(sample, interval_seconds=60)
+    task = sampler.start()
+    await started.wait()
+    await sampler.shutdown()
+    assert task.done()
+    assert finished.is_set()
+    assert sampler._callback_task is None
+
+
+@pytest.mark.asyncio
 async def test_duration_ring_and_age_are_bounded():
     clock = FakeClock()
     count = 0
