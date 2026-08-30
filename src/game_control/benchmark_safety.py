@@ -157,7 +157,7 @@ class BenchmarkPreflight:
         if self.ups_health is None:
             return EvidenceItem("ups_acceptable", False, "unavailable", "UPS provider", observed_at, "UPS evidence is unavailable")
         try:
-            ok = bool(await self._call(self.ups_health))
+            ok = (await self._call(self.ups_health)) is True
         except BaseException:
             ok = False
         return EvidenceItem("ups_acceptable", ok, "available" if ok else "unavailable", "UPS provider", observed_at, "" if ok else "UPS is unavailable or unacceptable")

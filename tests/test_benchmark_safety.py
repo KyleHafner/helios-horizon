@@ -86,6 +86,28 @@ async def test_benchmark_preflight_fails_closed_for_unavailable_safety_inputs():
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("ups_result", [object(), 1, "true", [True]])
+async def test_benchmark_preflight_requires_exact_true_for_ups_provider(ups_result):
+    now = datetime(2026, 8, 29, tzinfo=timezone.utc)
+    preflight = BenchmarkPreflight(
+        storage_paths=(),
+        ups_health=lambda: ups_result,
+        clock=lambda: now,
+    )
+
+    evidence = await preflight.evaluate(
+        snapshot=_snapshot(now),
+        maintenance_window=True,
+        rollback_safe=True,
+        public_wake_policy="safe",
+    )
+
+    ups = next(item for item in evidence.items if item.check == "ups_acceptable")
+    assert ups.result is False
+    assert ups.state == "unavailable"
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("storage_result", [object(), SimpleNamespace(free="bad")])
 async def test_benchmark_preflight_fails_closed_for_malformed_storage_results(storage_result):
     now = datetime(2026, 8, 29, tzinfo=timezone.utc)
