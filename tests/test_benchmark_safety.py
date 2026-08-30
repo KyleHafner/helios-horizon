@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 from datetime import datetime, timezone
 import sqlite3
 from types import SimpleNamespace
@@ -105,6 +106,89 @@ async def test_benchmark_preflight_requires_exact_true_for_ups_provider(ups_resu
     ups = next(item for item in evidence.items if item.check == "ups_acceptable")
     assert ups.result is False
     assert ups.state == "unavailable"
+
+
+@pytest.mark.asyncio
+async def test_benchmark_preflight_propagates_cancellation_from_ups_provider():
+    started = asyncio.Event()
+
+    async def ups_provider():
+        started.set()
+        await asyncio.Future()
+
+    preflight = BenchmarkPreflight(
+        storage_paths=(),
+        ups_health=ups_provider,
+        clock=lambda: datetime(2026, 8, 29, tzinfo=timezone.utc),
+    )
+    task = asyncio.create_task(preflight.evaluate(
+        snapshot=_snapshot(datetime(2026, 8, 29, tzinfo=timezone.utc)),
+        maintenance_window=True,
+        rollback_safe=True,
+        public_wake_policy="safe",
+    ))
+    await started.wait()
+
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+
+@pytest.mark.asyncio
+async def test_benchmark_preflight_propagates_cancellation_from_wake_provider():
+    started = asyncio.Event()
+
+    async def wake_provider():
+        started.set()
+        await asyncio.Future()
+
+    preflight = BenchmarkPreflight(
+        storage_paths=(),
+        ups_health=lambda: True,
+        wake_evidence=wake_provider,
+        clock=lambda: datetime(2026, 8, 29, tzinfo=timezone.utc),
+    )
+    task = asyncio.create_task(preflight.evaluate(
+        snapshot=_snapshot(datetime(2026, 8, 29, tzinfo=timezone.utc)),
+        maintenance_window=True,
+        rollback_safe=True,
+        public_wake_policy="safe",
+    ))
+    await started.wait()
+
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("provider", ["ups_health", "wake_evidence"])
+async def test_benchmark_preflight_fails_closed_for_provider_exceptions(provider):
+    def failing_provider():
+        raise RuntimeError("provider unavailable")
+
+    kwargs = {provider: failing_provider}
+    preflight = BenchmarkPreflight(
+        storage_paths=(),
+        **kwargs,
+        clock=lambda: datetime(2026, 8, 29, tzinfo=timezone.utc),
+    )
+
+    evidence = await preflight.evaluate(
+        snapshot=_snapshot(datetime(2026, 8, 29, tzinfo=timezone.utc)),
+        maintenance_window=True,
+        rollback_safe=True,
+        public_wake_policy="safe",
+    )
+
+    expected_check = "ups_acceptable" if provider == "ups_health" else "no_wake_session"
+    expected_source = "UPS provider" if provider == "ups_health" else "root wake evidence"
+    item = next(
+        item for item in evidence.items
+        if item.check == expected_check and item.source == expected_source
+    )
+    assert item.result is False
+    assert item.state == "unavailable"
 
 
 @pytest.mark.asyncio

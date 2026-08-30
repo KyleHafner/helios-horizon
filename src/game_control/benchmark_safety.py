@@ -144,7 +144,7 @@ class BenchmarkPreflight:
                     and math.isfinite(free)
                     and free >= 5 * 1024**3
                 )
-            except BaseException:
+            except Exception:
                 return False
 
         ok = all(not isinstance(result, BaseException) and has_acceptable_free_space(result) for result in results)
@@ -158,7 +158,7 @@ class BenchmarkPreflight:
             return EvidenceItem("ups_acceptable", False, "unavailable", "UPS provider", observed_at, "UPS evidence is unavailable")
         try:
             ok = (await self._call(self.ups_health)) is True
-        except BaseException:
+        except Exception:
             ok = False
         return EvidenceItem("ups_acceptable", ok, "available" if ok else "unavailable", "UPS provider", observed_at, "" if ok else "UPS is unavailable or unacceptable")
 
@@ -215,7 +215,7 @@ class BenchmarkPreflight:
         if self.wake_evidence is not None:
             try:
                 wake = await self._call(self.wake_evidence)
-            except BaseException:
+            except Exception:
                 wake = None
         wake_ok = isinstance(wake, WakeSafetyEvidence) and wake.available is True and wake.clear is True
         checks.append(EvidenceItem("no_wake_session", False, "unavailable", "root wake evidence", observed_at, "root wake evidence is unavailable"))
