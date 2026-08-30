@@ -61,6 +61,6 @@ def test_main_dispatches_direct_callable(monkeypatch: pytest.MonkeyPatch) -> Non
         calls.append((args.command, args.apply))
         return 7
 
-    monkeypatch.setattr(cli, "_pending", handler)
+    monkeypatch.setattr(cli, "_backup", handler)
     assert cli.main(["backup", "reconcile", "--apply"]) == 7
     assert calls == [("backup", True)]
