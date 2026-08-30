@@ -4,6 +4,7 @@ from pathlib import Path
 import os
 from types import SimpleNamespace
 import subprocess
+import sys
 
 import pytest
 
@@ -201,6 +202,50 @@ def test_path_replacement_between_lstat_and_open_fails_closed(
     monkeypatch.setattr(os, "open", swapping_open)
     with pytest.raises(boundary.ScanError, match="tracked-file-changed:README.md"):
         boundary.scan_repository(root)
+
+
+def test_fifo_replacement_between_lstat_and_open_fails_without_blocking(tmp_path: Path) -> None:
+    root = _repository(tmp_path, {"README.md": "safe\n"})
+    script = r"""
+from pathlib import Path
+import os
+import sys
+
+from tools.quality import check_public_boundary as boundary
+
+root = Path(sys.argv[1])
+target = root / "README.md"
+original_open = boundary.os.open
+replaced = False
+
+def swapping_open(path, flags, *args):
+    global replaced
+    if Path(path) == target and not replaced:
+        replaced = True
+        target.unlink()
+        os.mkfifo(target)
+    return original_open(path, flags, *args)
+
+boundary.os.open = swapping_open
+try:
+    boundary.scan_repository(root)
+except boundary.ScanError as exc:
+    if str(exc) == "tracked-file-changed:README.md":
+        raise SystemExit(0)
+    raise
+raise SystemExit("scanner accepted a FIFO replacement")
+"""
+
+    result = subprocess.run(
+        [sys.executable, "-c", script, str(root)],
+        cwd=ROOT,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        timeout=3,
+    )
+
+    assert result.returncode == 0, result.stderr
 
 
 def test_diagnostic_unsafe_tracked_path_fails_closed(tmp_path: Path) -> None:

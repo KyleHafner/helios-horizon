@@ -161,10 +161,11 @@ def _file_identity(metadata: os.stat_result) -> tuple[int, int, int, int, int, i
 
 def _read_tracked_text(path: Path, relative: str, expected: os.stat_result) -> str:
     no_follow = getattr(os, "O_NOFOLLOW", None)
-    if no_follow is None:
-        raise ScanError("no-follow-open-unavailable")
+    non_block = getattr(os, "O_NONBLOCK", None)
+    if no_follow is None or non_block is None:
+        raise ScanError("safe-open-flags-unavailable")
     try:
-        descriptor = os.open(path, os.O_RDONLY | os.O_CLOEXEC | no_follow)
+        descriptor = os.open(path, os.O_RDONLY | os.O_CLOEXEC | no_follow | non_block)
     except OSError as exc:
         raise ScanError(f"tracked-text-unreadable:{relative}") from exc
     try:
