@@ -87,6 +87,30 @@ async def test_benchmark_preflight_fails_closed_for_unavailable_safety_inputs():
 
 
 @pytest.mark.asyncio
+async def test_benchmark_preflight_default_storage_is_unavailable_without_explicit_paths():
+    now = datetime(2026, 8, 29, tzinfo=timezone.utc)
+    calls = 0
+
+    def host_storage(_path):
+        nonlocal calls
+        calls += 1
+        return SimpleNamespace(free=10 * 1024**3)
+
+    preflight = BenchmarkPreflight(storage_usage=host_storage, clock=lambda: now)
+    evidence = await preflight.evaluate(
+        snapshot=_snapshot(now),
+        maintenance_window=True,
+        rollback_safe=True,
+        public_wake_policy="safe",
+    )
+
+    storage = next(item for item in evidence.items if item.check == "storage_acceptable")
+    assert storage.result is False
+    assert storage.state == "unavailable"
+    assert calls == 0
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("ups_result", [object(), 1, "true", [True]])
 async def test_benchmark_preflight_requires_exact_true_for_ups_provider(ups_result):
     now = datetime(2026, 8, 29, tzinfo=timezone.utc)
@@ -201,6 +225,51 @@ async def test_benchmark_preflight_fails_closed_for_malformed_storage_results(st
         clock=lambda: now,
     )
 
+    evidence = await preflight.evaluate(
+        snapshot=_snapshot(now),
+        maintenance_window=True,
+        rollback_safe=True,
+        public_wake_policy="safe",
+    )
+
+    storage = next(item for item in evidence.items if item.check == "storage_acceptable")
+    assert storage.result is False
+    assert storage.state == "unavailable"
+
+
+@pytest.mark.asyncio
+async def test_benchmark_preflight_fails_closed_for_storage_provider_exception():
+    now = datetime(2026, 8, 29, tzinfo=timezone.utc)
+
+    def unavailable(_path):
+        raise OSError("storage probe unavailable")
+
+    preflight = BenchmarkPreflight(
+        storage_paths=("root",),
+        storage_usage=unavailable,
+        clock=lambda: now,
+    )
+    evidence = await preflight.evaluate(
+        snapshot=_snapshot(now),
+        maintenance_window=True,
+        rollback_safe=True,
+        public_wake_policy="safe",
+    )
+
+    storage = next(item for item in evidence.items if item.check == "storage_acceptable")
+    assert storage.result is False
+    assert storage.state == "unavailable"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("free", [0, 5 * 1024**3 - 1])
+async def test_benchmark_preflight_rejects_explicitly_unacceptable_storage(free):
+    now = datetime(2026, 8, 29, tzinfo=timezone.utc)
+    preflight = BenchmarkPreflight(
+        storage_paths=("root",),
+        storage_usage=lambda _path: SimpleNamespace(free=free),
+        clock=lambda: now,
+    )
     evidence = await preflight.evaluate(
         snapshot=_snapshot(now),
         maintenance_window=True,

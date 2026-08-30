@@ -110,7 +110,10 @@ class BenchmarkPreflight:
     def __init__(
         self,
         *,
-        storage_paths: tuple[str, ...] = ("/srv/game-servers", "/var/lib/game-control"),
+        # Storage is safety evidence, so callers must opt into the paths they
+        # have actually configured.  An unconfigured preflight must not turn
+        # the host's incidental free space into benchmark authorization.
+        storage_paths: tuple[str, ...] = (),
         storage_usage: Callable[[str], Any] = shutil.disk_usage,
         ups_health: Callable[[], Any] | None = None,
         session_store: Any | None = None,
