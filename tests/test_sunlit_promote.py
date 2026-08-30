@@ -3,22 +3,19 @@ from __future__ import annotations
 import hashlib
 import json
 import os
-import runpy
 from pathlib import Path
 from types import SimpleNamespace
 
+from game_control import sunlit_promote as MODULE
+
 
 ROOT = Path(__file__).parents[1]
-PROMOTE = ROOT / "ops/bin/horizon-sunlit-promote"
-
-
 def _write_json(path: Path, value: dict) -> None:
     path.write_text(json.dumps(value), encoding="utf-8")
     path.chmod(0o600)
 
 
 def test_promotes_exact_inactive_candidate_into_fixed_layout(tmp_path: Path, monkeypatch) -> None:
-    helper = runpy.run_path(str(PROMOTE), run_name="horizon-sunlit-promote")
     stage = tmp_path / "stage"
     candidate = stage / "candidate-v2"
     runtime = candidate / "runtime"
@@ -60,7 +57,7 @@ def test_promotes_exact_inactive_candidate_into_fixed_layout(tmp_path: Path, mon
     manifest = stage / "manifest.json"
     _write_json(manifest, document)
     _write_json(candidate / "candidate.json", {"active": False, "version": "v1", "manifest_sha256": manifest_sha})
-    globals_ = helper["promote"].__globals__
+    globals_ = MODULE.promote.__globals__
     replacements = {
         "VERSION": "v1",
         "MANIFEST_SHA256": manifest_sha,
@@ -79,7 +76,7 @@ def test_promotes_exact_inactive_candidate_into_fixed_layout(tmp_path: Path, mon
     monkeypatch.setattr(globals_["subprocess"], "run", lambda *_args, **_kwargs: SimpleNamespace(stdout="inactive\n"))
     monkeypatch.setitem(globals_, "_sunlit_ids", lambda: (os.getuid(), os.getgid()))
 
-    report = helper["promote"]()
+    report = MODULE.promote()
 
     assert report["active"] is True
     assert active.is_symlink() and active.resolve() == (release_root / "v1").resolve()
@@ -90,11 +87,10 @@ def test_promotes_exact_inactive_candidate_into_fixed_layout(tmp_path: Path, mon
     assert (state_root / ".horizon/manifest.json").is_file()
     assert not (candidate / "runtime").exists()
     assert not (candidate / "state").exists()
-    assert helper["promote"]() == report
+    assert MODULE.promote() == report
 
 
 def test_upgrades_existing_release_without_replacing_stable_state(tmp_path: Path, monkeypatch) -> None:
-    helper = runpy.run_path(str(PROMOTE), run_name="horizon-sunlit-promote")
     stage = tmp_path / "stage"
     candidate = stage / "candidate"
     runtime = candidate / "runtime"
@@ -154,7 +150,7 @@ def test_upgrades_existing_release_without_replacing_stable_state(tmp_path: Path
     manifest = stage / "manifest.json"
     _write_json(manifest, document)
     _write_json(candidate / "candidate.json", {"active": False, "version": "v2", "manifest_sha256": manifest_sha})
-    globals_ = helper["promote"].__globals__
+    globals_ = MODULE.promote.__globals__
     for name, value in {
         "VERSION": "v2",
         "MANIFEST_SHA256": manifest_sha,
@@ -172,7 +168,7 @@ def test_upgrades_existing_release_without_replacing_stable_state(tmp_path: Path
     monkeypatch.setattr(globals_["subprocess"], "run", lambda *_args, **_kwargs: SimpleNamespace(stdout="inactive\n"))
     monkeypatch.setitem(globals_, "_sunlit_ids", lambda: (os.getuid(), os.getgid()))
 
-    report = helper["promote"]()
+    report = MODULE.promote()
 
     assert report["version"] == "v2"
     assert active.resolve() == new_release.resolve()
@@ -183,4 +179,4 @@ def test_upgrades_existing_release_without_replacing_stable_state(tmp_path: Path
     assert (new_release / "world").resolve() == (state_root / "world").resolve()
     assert not (candidate / "runtime").exists()
     assert not (candidate / "state").exists()
-    assert helper["promote"]() == report
+    assert MODULE.promote() == report

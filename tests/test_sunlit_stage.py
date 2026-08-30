@@ -3,13 +3,11 @@ from __future__ import annotations
 import hashlib
 import json
 import subprocess
-import sys
 import zipfile
+from argparse import Namespace
 from pathlib import Path
 
-
-ROOT = Path(__file__).parents[1]
-CLI = ROOT / "ops/bin/horizon-sunlit-stage"
+from game_control import sunlit_stage as MODULE
 
 
 def _manifest(tmp_path: Path):
@@ -51,9 +49,12 @@ def _manifest(tmp_path: Path):
 def test_stages_complete_inactive_candidate(tmp_path: Path):
     archive, prior, manifest = _manifest(tmp_path)
     candidate = tmp_path / "candidate"
-    result = subprocess.run([sys.executable, str(CLI), "--manifest", str(manifest), "--archive", str(archive), "--prior-runtime", str(prior), "--candidate-root", str(candidate)], cwd=ROOT, text=True, capture_output=True)
+    try:
+        report = MODULE.stage(Namespace(manifest=manifest, archive=archive, prior_runtime=prior, candidate_root=candidate))
+        result = subprocess.CompletedProcess([], 0, json.dumps(report), "")
+    except Exception as exc:  # retain the CLI-shaped assertion surface for policy failures
+        result = subprocess.CompletedProcess([], 2, "", str(exc))
     assert result.returncode == 0, result.stderr
-    report = json.loads(result.stdout)
     assert report["active"] is False
     assert (candidate / "runtime/world/data").read_bytes() == b"world"
     assert (candidate / "runtime/ops.json").read_bytes() == b"ops"
@@ -68,6 +69,10 @@ def test_rejects_tampered_manifest_and_cleans_candidate(tmp_path: Path):
     archive, prior, manifest = _manifest(tmp_path)
     document = json.loads(manifest.read_text()); document["artifact"]["version"] = "tampered"; manifest.write_text(json.dumps(document))
     candidate = tmp_path / "candidate"
-    result = subprocess.run([sys.executable, str(CLI), "--manifest", str(manifest), "--archive", str(archive), "--prior-runtime", str(prior), "--candidate-root", str(candidate)], cwd=ROOT, text=True, capture_output=True)
+    try:
+        MODULE.stage(Namespace(manifest=manifest, archive=archive, prior_runtime=prior, candidate_root=candidate))
+        result = subprocess.CompletedProcess([], 0, "", "")
+    except Exception as exc:
+        result = subprocess.CompletedProcess([], 2, "", str(exc))
     assert result.returncode != 0
     assert not candidate.exists()

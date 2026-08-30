@@ -1,16 +1,13 @@
 from __future__ import annotations
 
 import json
-import runpy
 from pathlib import Path
+
+from game_control import sunlit_update as MODULE
 
 
 ROOT = Path(__file__).parents[1]
-AUTO = ROOT / "ops/bin/horizon-sunlit-auto-update"
-
-
 def test_discovers_latest_exact_official_server_pack(monkeypatch) -> None:
-    helper = runpy.run_path(str(AUTO), run_name="horizon-sunlit-auto-update")
     calls = []
 
     def fetch(url: str):
@@ -32,8 +29,8 @@ def test_discovers_latest_exact_official_server_pack(monkeypatch) -> None:
             ]
         }
 
-    monkeypatch.setitem(helper["discover"].__globals__, "_fetch_json", fetch)
-    release = helper["discover"]()
+    monkeypatch.setattr(MODULE, "_fetch_json", fetch)
+    release = MODULE.discover()
 
     assert release["version"] == "1.2.3-SSV4.1.4"
     assert release["file_id"] == "21"
@@ -41,28 +38,72 @@ def test_discovers_latest_exact_official_server_pack(monkeypatch) -> None:
 
 
 def test_check_reports_current_without_mutation(tmp_path: Path, monkeypatch) -> None:
-    helper = runpy.run_path(str(AUTO), run_name="horizon-sunlit-auto-update")
     state = tmp_path / "state/.horizon"
     state.mkdir(parents=True)
     (state / "release.json").write_text(json.dumps({"version": "v2"}), encoding="utf-8")
-    globals_ = helper["run"].__globals__
-    monkeypatch.setitem(globals_, "STATE_ROOT", tmp_path / "state")
-    monkeypatch.setitem(globals_, "discover", lambda: {"version": "v2"})
-    monkeypatch.setitem(globals_, "_stage", lambda _release: (_ for _ in ()).throw(AssertionError("must not stage")))
+    monkeypatch.setattr(MODULE, "STATE_ROOT", tmp_path / "state")
+    monkeypatch.setattr(MODULE, "discover", lambda: {"version": "v2"})
+    monkeypatch.setattr(MODULE, "_stage", lambda _release: (_ for _ in ()).throw(AssertionError("must not stage")))
 
-    assert helper["run"](check_only=False) == {"state": "current", "installed": "v2", "available": None}
+    assert MODULE.run(check_only=False) == {"state": "current", "installed": "v2", "available": None}
 
 
 def test_inactive_gate_defers_before_staging(monkeypatch) -> None:
-    helper = runpy.run_path(str(AUTO), run_name="horizon-sunlit-auto-update")
-    globals_ = helper["run"].__globals__
-    monkeypatch.setitem(globals_, "discover", lambda: {"version": "v2", "file_id": "2"})
-    monkeypatch.setitem(globals_, "_installed_version", lambda: "v1")
-    monkeypatch.setitem(globals_, "_inactive", lambda: False)
-    monkeypatch.setitem(globals_, "_stage", lambda _release: (_ for _ in ()).throw(AssertionError("must not stage")))
-    monkeypatch.setattr(globals_["os"], "geteuid", lambda: 0)
+    monkeypatch.setattr(MODULE, "discover", lambda: {"version": "v2", "file_id": "2"})
+    monkeypatch.setattr(MODULE, "_installed_version", lambda: "v1")
+    monkeypatch.setattr(MODULE, "_inactive", lambda: False)
+    monkeypatch.setattr(MODULE, "_stage", lambda _release: (_ for _ in ()).throw(AssertionError("must not stage")))
+    monkeypatch.setattr(MODULE.os, "geteuid", lambda: 0)
 
-    assert helper["run"](check_only=False) == {"state": "deferred", "installed": "v1", "available": "v2"}
+    assert MODULE.run(check_only=False) == {"state": "deferred", "installed": "v1", "available": "v2"}
+
+
+def test_package_update_has_no_retired_manifest_stage_or_promote_dispatch() -> None:
+    source = Path(MODULE.__file__).read_text(encoding="utf-8")
+    assert "MANIFEST_HELPER" not in source
+    assert "STAGE_HELPER" not in source
+    assert "PROMOTE_HELPER" not in source
+    assert "horizon-sunlit-manifest" not in source
+    assert "horizon-sunlit-stage" not in source
+    assert "horizon-sunlit-promote" not in source
+
+
+def test_stage_uses_package_policy_without_retired_helper_spawn(tmp_path: Path, monkeypatch) -> None:
+    archive = tmp_path / "server-pack.zip"
+    archive.write_bytes(b"archive")
+    overlay = tmp_path / "overlay.jar"
+    overlay.write_bytes(b"overlay")
+    staging = tmp_path / "staging"
+    staging.mkdir()
+    manifest = {
+        "manifest_version": 1,
+        "profile_id": "minecraft-sunlit-cobblemon",
+        "artifact": {
+            "project_id": MODULE.PROJECT_ID,
+            "file_id": "42",
+            "version": "v2",
+            "archive": {"size": archive.stat().st_size, "sha256": MODULE.hashlib.sha256(archive.read_bytes()).hexdigest()},
+        },
+        "manifest_sha256": "a" * 64,
+    }
+    monkeypatch.setattr(MODULE, "STAGING_ROOT", staging)
+    monkeypatch.setattr(MODULE, "STATE_ROOT", tmp_path / "state")
+    monkeypatch.setattr(MODULE, "OVERLAY", overlay)
+    monkeypatch.setattr(MODULE, "make_manifest", lambda _args: manifest)
+    monkeypatch.setattr(MODULE, "_download", lambda _release, target: (target.write_bytes(b"archive"), MODULE.hashlib.sha256(b"archive").hexdigest())[1])
+    monkeypatch.setattr(MODULE, "_run", lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("retired helper spawned")))
+
+    def fake_stage(args):
+        args.candidate_root.mkdir()
+        (args.candidate_root / "candidate.json").write_text(
+            json.dumps({"version": "v2", "manifest_sha256": "a" * 64}), encoding="utf-8"
+        )
+        return {"active": False}
+
+    monkeypatch.setattr(MODULE, "stage", fake_stage)
+    root, loaded = MODULE._stage({"version": "v2", "file_id": "42", "size": archive.stat().st_size, "url": "https://example.invalid/42"})
+    assert root == staging / "sunlit-v2"
+    assert loaded["manifest_sha256"] == "a" * 64
 
 
 def test_systemd_timer_and_installer_are_wired() -> None:

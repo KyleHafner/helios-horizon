@@ -2,13 +2,14 @@ from __future__ import annotations
 
 import hashlib
 import json
-import os
 import subprocess
-import sys
 import zipfile
+from argparse import Namespace
 from pathlib import Path
 
-CLI = Path(__file__).parents[1] / "ops/bin/horizon-sunlit-manifest"
+import pytest
+
+from game_control import sunlit_manifest as MODULE
 
 
 def invoke(tmp_path: Path, *, members=("config/a.txt",), extra=(), destination="overlay.txt", output=None, size_delta=0, archive_hash=None, url="https://example.invalid/artifact.zip"):
@@ -22,8 +23,18 @@ def invoke(tmp_path: Path, *, members=("config/a.txt",), extra=(), destination="
     overlay = tmp_path / "overlay"
     overlay.write_bytes(b"overlay")
     out = output or (tmp_path / "manifest.json")
-    args = [sys.executable, str(CLI), "--archive", str(archive), "--version", "1.0.0", "--project-id", "123", "--file-id", "456", "--url", url, "--archive-size", str(archive.stat().st_size + size_delta), "--archive-sha256", archive_hash or hashlib.sha256(archive.read_bytes()).hexdigest(), "--overlay-source", str(overlay), "--overlay-destination", destination, "--overlay-sha256", hashlib.sha256(overlay.read_bytes()).hexdigest(), "--output", str(out)]
-    return subprocess.run(args, text=True, capture_output=True), out
+    args = Namespace(archive=archive, version="1.0.0", project_id="123", file_id="456", url=url,
+                     archive_size=archive.stat().st_size + size_delta,
+                     archive_sha256=archive_hash or hashlib.sha256(archive.read_bytes()).hexdigest(),
+                     overlay_source=overlay, overlay_destination=destination,
+                     overlay_sha256=hashlib.sha256(overlay.read_bytes()).hexdigest())
+    try:
+        document = MODULE.make_manifest(args)
+        MODULE.atomic_write(out, (json.dumps(document, sort_keys=True, indent=2) + "\n").encode())
+        result = subprocess.CompletedProcess([], 0, "", "")
+    except MODULE.ManifestError as exc:
+        result = subprocess.CompletedProcess([], 2, "", f"error: {exc}")
+    return result, out
 
 
 def test_manifest_is_deterministic_and_mode_0600(tmp_path):
@@ -88,5 +99,10 @@ def test_rejects_symlink_overlay_and_encrypted_member(tmp_path):
         z.writestr(info, "/etc/passwd")
     overlay = root / "overlay"
     overlay.symlink_to(archive)
-    args = [sys.executable, str(CLI), "--archive", str(archive), "--version", "1", "--project-id", "1", "--file-id", "1", "--url", "https://example.invalid/x", "--archive-size", str(archive.stat().st_size), "--archive-sha256", hashlib.sha256(archive.read_bytes()).hexdigest(), "--overlay-source", str(overlay), "--overlay-destination", "x", "--overlay-sha256", "0" * 64, "--output", str(root / "out")]
-    assert subprocess.run(args, capture_output=True).returncode != 0
+    with pytest.raises(MODULE.ManifestError):
+        MODULE.make_manifest(Namespace(
+            archive=archive, version="1", project_id="1", file_id="1",
+            url="https://example.invalid/x", archive_size=archive.stat().st_size,
+            archive_sha256=hashlib.sha256(archive.read_bytes()).hexdigest(),
+            overlay_source=overlay, overlay_destination="x", overlay_sha256="0" * 64,
+        ))
