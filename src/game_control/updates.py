@@ -280,14 +280,23 @@ class UpdateService:
     @classmethod
     def _fsync_tree(cls, root: Path) -> None:
         """Make every regular extracted file and directory durable bottom-up."""
-        entries = sorted(root.rglob("*"), key=lambda item: len(item.parts), reverse=True)
-        for path in entries:
-            if path.is_symlink():
-                continue
-            if path.is_file():
-                cls._fsync_file(path)
-            elif path.is_dir():
-                cls._fsync_dir(path)
+        entries = tuple(root.rglob("*"))
+        # Path.rglob() does not promise traversal order.  Flush all regular
+        # files first, then directories deepest-first, with a stable lexical
+        # tie-breaker so a nested directory can never precede a same-depth
+        # top-level file on a different filesystem/provider.
+        files = sorted(
+            (path for path in entries if path.is_file() and not path.is_symlink()),
+            key=lambda path: path.as_posix(),
+        )
+        directories = sorted(
+            (path for path in entries if path.is_dir() and not path.is_symlink()),
+            key=lambda path: (-len(path.parts), path.as_posix()),
+        )
+        for path in files:
+            cls._fsync_file(path)
+        for path in directories:
+            cls._fsync_dir(path)
         cls._fsync_dir(root)
 
     def _trusted_checksum(self, profile: Any) -> str:

@@ -28,6 +28,14 @@ _RCON_LIST_RESPONSE = re.compile(
     r"(?: (?P<names>.*))?\Z"
 )
 _MINECRAFT_PLAYER_NAME = re.compile(r"\A[A-Za-z0-9_]{1,16}\Z")
+_SYSTEMD_ZONE_OFFSETS = {
+    "UTC": 0,
+    "GMT": 0,
+    # Helios runs in America/New_York. Keep this fallback deliberately narrow:
+    # abbreviations such as CST and BST are ambiguous across regions.
+    "EST": -5,
+    "EDT": -4,
+}
 
 
 def _systemd_fields(payload: bytes) -> dict[str, str]:
@@ -340,6 +348,22 @@ def _parse_started_at(value: str) -> datetime | None:
     try:
         parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
     except ValueError:
+        # Python's %Z parser only accepts UTC/GMT and the process-local names;
+        # on a UTC CI runner it rejects a valid systemd `... EDT` value.  The
+        # deployment-local abbreviations emitted by systemd have fixed offsets
+        # here, so parse them without consulting the runner's TZ.
+        zone = value.rsplit(" ", 1)[-1]
+        offset_hours = _SYSTEMD_ZONE_OFFSETS.get(zone)
+        if offset_hours is not None:
+            try:
+                parsed = datetime.strptime(
+                    value.rsplit(" ", 1)[0], "%a %Y-%m-%d %H:%M:%S"
+                ).replace(
+                    tzinfo=timezone(timedelta(hours=offset_hours), name=zone)
+                )
+                return parsed
+            except ValueError:
+                return None
         for fmt in ("%a %Y-%m-%d %H:%M:%S %Z", "%a %Y-%m-%d %H:%M:%S %z"):
             try:
                 parsed = datetime.strptime(value, fmt)

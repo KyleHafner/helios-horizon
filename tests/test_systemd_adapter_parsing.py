@@ -262,6 +262,20 @@ def test_parse_started_at_interprets_dst_abbreviation_as_host_local_time() -> No
     assert parsed.utcoffset() == timedelta(hours=-4)
 
 
+@pytest.mark.parametrize(
+    ("value", "offset"),
+    [
+        ("Mon 2026-01-12 08:00:00 EST", timedelta(hours=-5)),
+        ("Mon 2026-07-13 08:00:00 EDT", timedelta(hours=-4)),
+        ("Mon 2026-07-13 12:00:00 UTC", timedelta(0)),
+    ],
+)
+def test_parse_started_at_abbreviations_are_independent_of_runner_timezone(value, offset) -> None:
+    parsed = systemd_module._parse_started_at(value)
+    assert parsed is not None
+    assert parsed.utcoffset() == offset
+
+
 @pytest.mark.parametrize("value", ["", "not-a-pid", "0", "-1", "  "])
 def test_parse_pid_returns_none_for_invalid_or_nonpositive_values(value) -> None:
     assert systemd_module._parse_pid(value) is None
