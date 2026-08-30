@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import hashlib
+import asyncio
+import inspect
 import os
 import re
 import shutil
@@ -10,9 +12,23 @@ import uuid
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any, Callable, Mapping
 
 from .errors import SafeError
+from .backups import BackupService
+from .models import ProfileId
+from .protocol import JobAccepted
+
+
+def _rpc_key(value: Any) -> str:
+    value = getattr(value, "id", value)
+    value = getattr(value, "value", value)
+    return str(value)
+
+
+def _close_database(database: Any | None) -> None:
+    if database is not None and hasattr(database, "close"):
+        database.close()
 
 
 _NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9 _.-]{0,63}$")
@@ -137,3 +153,65 @@ def _sha256(path: Path) -> str:
         for chunk in iter(lambda: stream.read(1024 * 1024), b""):
             digest.update(chunk)
     return digest.hexdigest()
+
+
+class WorldRpcFacade:
+    """Typed RPC translator for paired, stopped world cloning."""
+
+    def __init__(self, service: WorldService, profiles: Mapping[str, Any], adapters: Mapping[Any, Any]):
+        self.service, self.profiles, self.adapters = service, profiles, adapters
+
+    async def _stopped(self) -> None:
+        for profile_id in (ProfileId.TERRARIA_VANILLA.value, ProfileId.TERRARIA_TMOD.value):
+            profile = self.profiles.get(profile_id)
+            adapter = self.adapters.get(getattr(profile, "id", None)) if profile is not None else None
+            if profile is None or adapter is None or not hasattr(adapter, "observe"):
+                raise SafeError("profile_unavailable", "profile state could not be proven")
+            value = adapter.observe(profile)
+            observation = await value if inspect.isawaitable(value) else value
+            if bool(getattr(observation, "running", False)):
+                raise SafeError("profile_running", "profiles must be stopped before clone")
+
+    def _stopped_sync_pair(self) -> bool:
+        for profile_id in (ProfileId.TERRARIA_VANILLA.value, ProfileId.TERRARIA_TMOD.value):
+            profile = self.profiles.get(profile_id)
+            adapter = self.adapters.get(getattr(profile, "id", None)) if profile is not None else None
+            if profile is None or adapter is None or not hasattr(adapter, "observe"):
+                raise SafeError("profile_unavailable", "profile state could not be proven")
+            value = adapter.observe(profile)
+            if inspect.isawaitable(value):
+                value = asyncio.run(value)
+            if bool(getattr(value, "running", False)):
+                raise SafeError("profile_running", "profiles must be stopped before clone")
+        return True
+
+    def _stopped_sync(self, profile: Any) -> bool:
+        adapter = self.adapters.get(getattr(profile, "id", None)) or self.adapters.get(_rpc_key(profile))
+        if adapter is None or not hasattr(adapter, "observe"):
+            raise SafeError("profile_unavailable", "profile state could not be proven")
+        value = adapter.observe(profile)
+        if inspect.isawaitable(value):
+            value = asyncio.run(value)
+        if bool(getattr(value, "running", False)):
+            raise SafeError("profile_running", "profile is running; it must be stopped before clone")
+        return True
+
+    async def confirm_clone(self, action: Any, actor: str | None = None, request_id: Any = None, payload: Mapping[str, Any] | None = None, lease_check: Any = None) -> JobAccepted:
+        payload = payload or {}
+        await self._stopped()
+        source_backup = self.service.backup_service
+        def work():
+            worker_db = getattr(type(source_backup.database), "open", lambda _p: None)(getattr(source_backup.database, "path", None)) if getattr(source_backup, "database", None) is not None else None
+            worker_backup = BackupService(self.service.vanilla, database=worker_db, stopped_check=lambda: self._stopped_sync(self.service.vanilla), free_space=source_backup.free_space, clock=source_backup.clock, tar_runner=source_backup.tar_runner)
+            worker_service = WorldService(self.service.vanilla, self.service.tmod, backup_service=worker_backup, stopped_check=lambda *_: self._stopped_sync_pair(), clock=self.service.clock, lease_check=lease_check)
+            try:
+                result = worker_service.clone_vanilla_to_tmod(str(payload.get("source_world_id", "")), str(payload.get("destination_name", "")), actor, request_id)
+                return result, worker_db is not None
+            finally:
+                _close_database(worker_db)
+        result, isolated = await asyncio.to_thread(work)
+        if not isolated and getattr(result, "source_backup", None) is not None:
+            self.service.backup_service._insert(result.source_backup)
+        return JobAccepted(job_id=__import__("uuid").uuid4().hex, state="running")
+
+    clone = confirm_clone

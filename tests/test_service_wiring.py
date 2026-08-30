@@ -48,6 +48,9 @@ from game_control import slotd_main
 
 
 class _Adapter:
+    async def aclose(self):
+        return None
+
     async def observe(self, profile):
         return SimpleNamespace(
             running=False,
@@ -123,6 +126,9 @@ class _State:
     def __init__(self):
         self.connection = SimpleNamespace()
 
+    def close(self):
+        return None
+
 
 @pytest.mark.asyncio
 async def test_build_controller_wires_real_typed_service_seams(monkeypatch, tmp_path):
@@ -152,7 +158,8 @@ async def test_build_controller_wires_real_typed_service_seams(monkeypatch, tmp_
     config = tmp_path / "controller.toml"
     config.write_text("[crafty]\nbase_url='https://127.0.0.1:8443'\ntoken_path='/dev/null'\n")
 
-    controller = slotd_main.build_controller(config)
+    assembly = await slotd_main.build_controller_assembly(config)
+    controller = assembly.controller
     assert controller.services.status is not None
     assert controller.services.logs is not None
     assert controller.services.backups is not None
@@ -346,8 +353,9 @@ def test_worker_database_helpers_fail_closed_and_close_initialized_worker():
 
 
 @pytest.mark.asyncio
-async def test_b2_backup_fails_closed_when_worker_database_cannot_open(monkeypatch):
+async def test_b2_backup_fails_closed_when_worker_database_cannot_open(monkeypatch, tmp_path):
     profile = _profile(ProfileId.MINECRAFT, AdapterKind.CRAFTY)
+    profile.paths.backup_root = str(tmp_path)
     facade = _BackupFacade(
         {profile.id.value: profile},
         {profile.id: _Adapter()},

@@ -13,9 +13,11 @@ import pwd
 import socket
 import stat
 import struct
+import sys
 import tomllib
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import Any
 from uuid import UUID
 
 from .controller import Controller
@@ -26,6 +28,10 @@ from .slot import ReservationStore, SlotInspector
 from .state_db import StateDatabase, STATE_DB_PATH
 from .models import AdapterKind, HealthState
 from .service_wiring import build_service_seams
+from .service_wiring import _ContainerSlot
+from .service_container import ServiceContainer
+from .runtime.telemetry import ResourceRef
+from .runtime.telemetry import TelemetryRuntime
 from .rcon import RCON_HOST, RCON_PASSWORD_PATH, RCON_PORT, RconClient, SunlitRconTransport
 from .rcon_telemetry import PersistentRconTelemetry
 from .schedule import parse_schedule
@@ -33,7 +39,7 @@ from .protocol import (
     MAX_REQUEST_BYTES,
     MAX_RESPONSE_BYTES,
     ErrorCode,
-    RpcFailure,
+    RpcFailure as _RpcFailure,
     RpcResponse,
     RpcSuccess,
     SafeDetails,
@@ -52,6 +58,7 @@ CRAFTY_TOKEN_PATH = Path("/etc/game-control/secrets.d/crafty-token")
 READ_TIMEOUT_SECONDS = 10.0
 WRITE_TIMEOUT_SECONDS = 10.0
 _LOG = logging.getLogger(__name__)
+RpcFailure = _RpcFailure
 
 
 class UnixRpcServer:
@@ -197,7 +204,7 @@ class UnixRpcServer:
                 data = await asyncio.wait_for(
                     reader.readuntil(b"\n"), timeout=READ_TIMEOUT_SECONDS
                 )
-            except (asyncio.LimitOverrunError, asyncio.IncompleteReadError, asyncio.TimeoutError) as exc:
+            except (asyncio.LimitOverrunError, asyncio.IncompleteReadError, asyncio.TimeoutError):
                 response = failure(request_id, ErrorCode.INVALID_REQUEST, "invalid request")
                 await self._write(
                     writer,
@@ -321,7 +328,7 @@ class UnixRpcServer:
 RpcServer = UnixRpcServer
 
 
-def build_controller(config_path: str | os.PathLike[str] = ROOT_CONFIG) -> Controller:
+def _build_controller_unmanaged(config_path: str | os.PathLike[str] = ROOT_CONFIG, *, provisional: _ProvisionalOwner | None = None) -> Controller:
     """Construct the production root controller from a closed root config."""
     config_file = Path(config_path)
     if config_file.is_symlink() or not config_file.is_file():
@@ -348,6 +355,8 @@ def build_controller(config_path: str | os.PathLike[str] = ROOT_CONFIG) -> Contr
     reservation_path = Path(config.get("reservation_path", "/run/game-control/reservation.json"))
     registry = ProfileRegistry.load(profiles_dir)
     state_db = StateDatabase.open(state_path)
+    if provisional is not None:
+        provisional.register(state_db, state_db.close)
     crafty_cfg = config.get("crafty", {})
     if not crafty_cfg and ("crafty_base_url" in config or "crafty_token_path" in config):
         crafty_cfg = {
@@ -393,11 +402,17 @@ def build_controller(config_path: str | os.PathLike[str] = ROOT_CONFIG) -> Contr
                     token,
                     verify=crafty_cfg.get("verify", crafty_cfg.get("ca_path")),
                 )
+                if provisional is not None:
+                    provisional.register(crafty, crafty.aclose)
             adapters[profile.id] = crafty
         else:
             if profile.id.value == "minecraft-sunlit-cobblemon":
                 sunlit_rcon = RconClient(**rcon_kwargs)
+                if provisional is not None:
+                    provisional.register(sunlit_rcon, lambda: None)
                 rcon_telemetry = PersistentRconTelemetry(profile.id.value, **rcon_kwargs)
+                if provisional is not None:
+                    provisional.register(rcon_telemetry, rcon_telemetry.close)
                 adapters[profile.id] = SystemdAdapter(rcon=sunlit_rcon)
             else:
                 adapters[profile.id] = SystemdAdapter()
@@ -450,10 +465,13 @@ def build_controller(config_path: str | os.PathLike[str] = ROOT_CONFIG) -> Contr
         benchmark_config=benchmark_config,
         rcon_telemetry=rcon_telemetry,
         reservation_store=reservation_store,
+        crafty_adapters=(crafty,) if crafty is not None else (),
+        own_telemetry_resources=True,
+        register_owned=provisional.register if provisional is not None else None,
     )
     if services.session_store is not None:
         services.session_store.recover(now=datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"))
-    return Controller(
+    controller = Controller(
         profiles=registry,
         state_db=state_db,
         reservation_store=reservation_store,
@@ -467,6 +485,101 @@ def build_controller(config_path: str | os.PathLike[str] = ROOT_CONFIG) -> Contr
         schedules=schedules,
         schedule_config_path=config_file,
     )
+    if provisional is not None:
+        provisional.register(controller, controller.aclose)
+    return controller
+
+
+class _ProvisionalOwner:
+    """Transactional ledger for root-created resources before publication."""
+    def __init__(self) -> None:
+        self._resources: list[tuple[Any, Any]] = []
+        self._seen: set[int] = set()
+        self._transferred = False
+
+    def register(self, value: Any, close: Any) -> Any:
+        if value is not None and id(value) not in self._seen:
+            self._seen.add(id(value))
+            self._resources.append((value, close))
+            if isinstance(value, TelemetryRuntime):
+                for reference in (value._sampler_ref, value._rcon_ref, value._database_ref):
+                    if reference is not None and reference.owns_value:
+                        self.discard(reference.value)
+        return value
+
+    def transfer(self) -> None:
+        self._transferred = True
+        self._resources.clear()
+
+    def discard(self, value: Any) -> None:
+        identity = id(value)
+        self._seen.discard(identity)
+        self._resources = [(item, close) for item, close in self._resources if item is not value]
+
+    async def aclose(self) -> None:
+        if self._transferred:
+            return
+        # Tear down in dependency order: typed owners first, root state last.
+        resources = tuple(reversed(self._resources))
+        self._resources.clear()
+        first: BaseException | None = None
+        for _resource, close in resources:
+            try:
+                result = close()
+                if inspect.isawaitable(result):
+                    await result
+            except BaseException as exc:
+                if first is None:
+                    first = exc
+        if first is not None:
+            raise first
+
+
+class _RootAssembly:
+    def __init__(self, controller: Controller, services: Any, container: ServiceContainer):
+        self.controller, self.services, self.container = controller, services, container
+
+    async def aclose(self) -> None:
+        await self.container.aclose()
+
+
+async def build_controller_assembly(config_path: str | os.PathLike[str] = ROOT_CONFIG) -> _RootAssembly:
+    """Build the complete root graph and publish it only after finalization."""
+    provisional = _ProvisionalOwner()
+    try:
+        controller = _build_controller_unmanaged(config_path, provisional=provisional)
+        services = controller.services
+        updates = tuple(services.updates.services.values())
+        history = services.audit.history
+        notification_service = services.notifications.service
+        container = ServiceContainer(
+            controller=controller,
+            state_database=ResourceRef.owned(controller.state_db),
+            telemetry_runtime=ResourceRef.owned(services.telemetry_runtime),
+            alert_runtime=ResourceRef.owned(services.alerts),
+            history_queries=ResourceRef.owned(history),
+            crafty_adapters=tuple(ResourceRef.owned(adapter) for adapter in services._crafty_adapters),
+            update_services=tuple(ResourceRef.owned(update) for update in updates),
+            notification_service=ResourceRef.owned(notification_service),
+            legacy_tps_sampler=ResourceRef.owned(services.tps_sampler) if services.tps_sampler is not None else None,
+        )
+        if not isinstance(services._container_slot, _ContainerSlot):
+            raise RuntimeError("service container slot is unavailable")
+        services._finalize_container(container)
+        provisional.transfer()
+        return _RootAssembly(controller, services, container)
+    except BaseException:
+        await provisional.aclose()
+        raise
+
+
+def build_controller(config_path: str | os.PathLike[str] = ROOT_CONFIG) -> Controller:
+    """Synchronous compatibility wrapper; reject nested event-loop use."""
+    try:
+        asyncio.get_running_loop()
+    except RuntimeError:
+        return asyncio.run(build_controller_assembly(config_path)).controller
+    raise RuntimeError("build_controller() cannot run inside an event loop; await build_controller_assembly()")
 
 
 async def _await_free_slot(
@@ -545,31 +658,11 @@ async def _await_systemd_profile_ready(
 
 
 async def serve() -> None:
-    controller = build_controller()
-    server = UnixRpcServer(controller)
-    backups = getattr(controller.services, "backups", None)
-    # Finish all durable restore, job, reservation, and process reconciliation
-    # before exposing the authority-changing Unix socket.
-    try:
-        if backups is not None and hasattr(backups, "reconcile_startup"):
-            backups.reconcile_startup()
-        await controller.reconcile_startup()
-    except BaseException:
-        await server.close()
-        raise
-    await server.start()
-    initialization = asyncio.create_task(asyncio.sleep(0))
-    maintenance_task = asyncio.create_task(_maintenance_loop(controller, initialization=initialization))
-    loop_lag_task = asyncio.create_task(_event_loop_lag_loop(controller))
-    telemetry_sampler = getattr(getattr(controller, "services", None), "telemetry_sampler", None)
-    telemetry_task = None
-    if telemetry_sampler is not None:
-        telemetry_task = asyncio.create_task(
-            _run_telemetry_sampler(telemetry_sampler, initialization),
-            name="horizon-telemetry-supervisor",
-        )
-    tps_task = None
-    tps_sampler = getattr(controller.services, "tps_sampler", None)
+    assembly = await build_controller_assembly()
+    controller = assembly.controller
+    server: UnixRpcServer | None = None
+    owned_tasks: list[asyncio.Task[Any]] = []
+    task_roles: dict[asyncio.Task[Any], str] = {}
 
     async def minecraft_running() -> bool:
         minecraft_id = (
@@ -605,15 +698,36 @@ async def serve() -> None:
             observed = await observed
         return bool(getattr(observed, "running", False))
 
-    if tps_sampler is not None:
-        tps_task = asyncio.create_task(tps_sampler.run(minecraft_running))
-    server_task = asyncio.create_task(server._server.serve_forever())  # type: ignore[union-attr]
-    supervised = {server_task, maintenance_task, initialization, loop_lag_task}
-    if telemetry_task is not None:
-        supervised.add(telemetry_task)
-    if tps_task is not None:
-        supervised.add(tps_task)
     try:
+        server = UnixRpcServer(controller)
+        backups = getattr(controller.services, "backups", None)
+        if backups is not None and hasattr(backups, "reconcile_startup"):
+            backups.reconcile_startup()
+        await controller.reconcile_startup()
+        await server.start()
+        initialization = asyncio.create_task(asyncio.sleep(0), name="horizon-initialization")
+        owned_tasks.append(initialization)
+        task_roles[initialization] = "initialization"
+        maintenance_task = asyncio.create_task(_maintenance_loop(controller, initialization=initialization), name="horizon-maintenance-supervisor")
+        owned_tasks.append(maintenance_task)
+        task_roles[maintenance_task] = "maintenance"
+        loop_lag_task = asyncio.create_task(_event_loop_lag_loop(controller), name="horizon-event-loop-lag-supervisor")
+        owned_tasks.append(loop_lag_task)
+        task_roles[loop_lag_task] = "event_loop_lag"
+        telemetry_sampler = getattr(getattr(controller, "services", None), "telemetry_sampler", None)
+        if telemetry_sampler is not None:
+            telemetry_task = asyncio.create_task(_run_telemetry_sampler(telemetry_sampler, initialization), name="horizon-telemetry-supervisor")
+            owned_tasks.append(telemetry_task)
+            task_roles[telemetry_task] = "telemetry"
+        tps_sampler = getattr(controller.services, "tps_sampler", None)
+        if tps_sampler is not None:
+            tps_task = asyncio.create_task(tps_sampler.run(minecraft_running), name="horizon-legacy-tps-supervisor")
+            owned_tasks.append(tps_task)
+            task_roles[tps_task] = "legacy_tps"
+        server_task = asyncio.create_task(server._server.serve_forever(), name="horizon-rpc-supervisor")  # type: ignore[union-attr]
+        owned_tasks.append(server_task)
+        task_roles[server_task] = "rpc"
+        supervised = set(owned_tasks)
         while supervised:
             done, _pending = await asyncio.wait(supervised, return_when=asyncio.FIRST_COMPLETED)
             for task in done:
@@ -621,73 +735,79 @@ async def serve() -> None:
                 if task.cancelled():
                     raise asyncio.CancelledError
                 error = task.exception()
-                if task is initialization:
+                role = task_roles[task]
+                if role == "initialization":
                     if error is not None:
                         raise error
                     continue
-                if task is maintenance_task:
+                if role == "maintenance":
                     if error is not None:
                         raise error
                     raise RuntimeError("slotd maintenance task exited unexpectedly")
-                if task is telemetry_task:
+                if role == "telemetry":
                     if error is not None:
                         raise error
                     raise RuntimeError("slotd telemetry sampler exited unexpectedly")
-                if task is tps_task:
+                if role == "legacy_tps":
                     if error is not None:
                         raise error
                     raise RuntimeError("slotd tick telemetry task exited unexpectedly")
-                if task is server_task:
+                if role == "rpc":
                     if error is not None:
                         raise error
                     raise RuntimeError("slotd RPC server task exited unexpectedly")
+                if role == "event_loop_lag":
+                    if error is not None:
+                        raise error
+                    raise RuntimeError("slotd event-loop-lag task exited unexpectedly")
                 if error is not None:
                     raise error
             if not supervised:
                 return
     finally:
+        active_failure = sys.exc_info()[0] is not None
+        cleanup_error: BaseException | None = None
+        caller_cancelled = False
+
+        async def drain(task: asyncio.Future[Any]) -> None:
+            nonlocal caller_cancelled
+            while not task.done():
+                try:
+                    await asyncio.shield(task)
+                    break
+                except asyncio.CancelledError:
+                    # A child that cancelled itself propagates CancelledError
+                    # through shield too; only an interruption of this
+                    # cleanup task is the caller's cancellation.
+                    if task.done():
+                        continue
+                    caller_cancelled = True
+                    continue
+        for task in owned_tasks:
+            if not task.done():
+                task.cancel()
+        pending_tasks = tuple(task for task in owned_tasks if not task.done())
+        if pending_tasks:
+            drain_task = asyncio.ensure_future(asyncio.gather(*pending_tasks, return_exceptions=True))
+            await drain(drain_task)
+        if server is not None:
+            close_task = asyncio.ensure_future(server.close())
+            await drain(close_task)
+            try:
+                close_task.result()
+            except BaseException as exc:
+                cleanup_error = exc
+        close_assembly = asyncio.ensure_future(assembly.aclose())
+        await drain(close_assembly)
         try:
-            if not loop_lag_task.done():
-                loop_lag_task.cancel()
-            await asyncio.gather(loop_lag_task, return_exceptions=True)
-            if not server_task.done():
-                server_task.cancel()
-            await asyncio.gather(server_task, return_exceptions=True)
-            if not maintenance_task.done():
-                maintenance_task.cancel()
-            await asyncio.gather(maintenance_task, return_exceptions=True)
-            if telemetry_task is not None and not telemetry_task.done():
-                telemetry_task.cancel()
-            if telemetry_task is not None:
-                await asyncio.gather(telemetry_task, return_exceptions=True)
-            if telemetry_sampler is not None:
-                shutdown = getattr(telemetry_sampler, "shutdown", None)
-                if callable(shutdown):
-                    result = shutdown()
-                    if inspect.isawaitable(result):
-                        await result
-            if tps_task is not None and not tps_task.done():
-                tps_task.cancel()
-            if tps_task is not None:
-                await asyncio.gather(tps_task, return_exceptions=True)
-            try:
-                if not initialization.done():
-                    initialization.cancel()
-                await asyncio.gather(initialization, return_exceptions=True)
-            finally:
-                if tps_sampler is not None:
-                    await tps_sampler.aclose()
-        finally:
-            try:
-                close_services = getattr(getattr(controller, "services", None), "aclose", None)
-                if not callable(close_services):
-                    close_services = getattr(getattr(controller, "services", None), "close", None)
-                if callable(close_services):
-                    result = close_services()
-                    if inspect.isawaitable(result):
-                        await result
-            finally:
-                await server.close()
+            close_assembly.result()
+        except BaseException as exc:
+            if cleanup_error is None:
+                cleanup_error = exc
+        if caller_cancelled:
+            raise asyncio.CancelledError
+        if cleanup_error is not None and not active_failure:
+            raise cleanup_error
 
 
 async def _event_loop_lag_loop(controller: Any, interval: float = 0.25) -> None:

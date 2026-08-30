@@ -21,6 +21,7 @@ import httpx
 from .errors import SafeError
 from .models import NotificationEvent
 from .protocol import NotificationConfig, NotificationTarget
+from .protocol import JobAccepted
 from .redaction import Redactor, SecretRegistry
 
 CHANNELS = ("discord", "telegram")
@@ -353,4 +354,31 @@ class NotificationService:
         return True
 
 
-__all__ = ["NotificationService", "CHANNELS", "DEFAULT_SECRET_DIR", "TIMEOUT_SECONDS"]
+class NotificationRpcFacade:
+    """Typed RPC translator for root-configured notification delivery."""
+
+    def __init__(self, service: NotificationService):
+        self.service = service
+
+    async def get_config(self, action: Any, actor: str | None = None, request_id: Any = None) -> NotificationConfig:
+        return self.service.get_config(action.profile_id)
+
+    async def set_rule(self, action: Any, actor: str | None = None, request_id: Any = None) -> NotificationConfig:
+        return self.service.set_rule(action, actor, request_id)
+
+    async def test(self, action: Any, actor: str | None = None, request_id: Any = None) -> JobAccepted:
+        profile = self.service._get_profile(action.profile_id)
+        try:
+            secret = self.service._secret(action.channel)
+            await asyncio.to_thread(self.service._post, action.channel, secret, "game-control notification test")
+        except SafeError as exc:
+            self.service._audit(actor or "system", "test_notification", _profile_id(profile), "failed", exc.code)
+            raise
+        self.service._audit(actor or "system", "test_notification", _profile_id(profile), "succeeded")
+        return JobAccepted(job_id=uuid.uuid4().hex, state="running")
+
+    async def send(self, profile_id: Any, event: Any, state_generation: int, message: str) -> bool:
+        return await self.service.send_async(profile_id, event, state_generation, message)
+
+
+__all__ = ["NotificationService", "NotificationRpcFacade", "CHANNELS", "DEFAULT_SECRET_DIR", "TIMEOUT_SECONDS"]

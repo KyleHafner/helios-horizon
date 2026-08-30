@@ -26,11 +26,46 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from enum import StrEnum
 from pathlib import Path, PurePosixPath
-from typing import Any, Callable, Iterable, Protocol
+from typing import Any, Callable, Iterable, Mapping, Protocol
 
 from .errors import SafeError
 from .interim_maintenance_control import maintenance_argv, maintenance_popen
 from .models import BackupDestination, ProfileId
+from .protocol import BackupPage, BackupSummary, JobAccepted
+
+
+def _rpc_key(value: Any) -> str:
+    value = getattr(value, "id", value)
+    value = getattr(value, "value", value)
+    return str(value)
+
+
+def _rpc_database_path(database: Any) -> Any | None:
+    path = getattr(database, "path", None)
+    opener = getattr(type(database), "open", None)
+    if path is None or not callable(opener):
+        return None
+    try:
+        return opener(path)
+    except Exception:
+        return None
+
+
+def _rpc_close_database(database: Any | None) -> None:
+    if database is not None and hasattr(database, "close"):
+        database.close()
+
+
+def _rpc_timestamp(value: Any) -> datetime:
+    if isinstance(value, datetime):
+        return value
+    if value is None:
+        return datetime.fromtimestamp(0, timezone.utc)
+    try:
+        parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+    except ValueError:
+        return datetime.fromtimestamp(0, timezone.utc)
+    return parsed if parsed.tzinfo is not None else parsed.replace(tzinfo=timezone.utc)
 
 
 _MANIFEST = "manifest.json"
@@ -369,7 +404,7 @@ class B2ProtectionService:
             backup_class = BackupClass(backup_class)
         except (TypeError, ValueError) as exc:
             raise SafeError("invalid_backup_destination", "backup class is not approved") from exc
-        destination = validate_destination(self.destination.destination_id, record.profile_id)
+        validate_destination(self.destination.destination_id, record.profile_id)
         prefix = b2_prefix(record.profile_id, backup_class)
         remote_key = f"{prefix}/{record.id}{_ARCHIVE_SUFFIX}"
         digest = _sha256(record.path)
@@ -2046,3 +2081,178 @@ class _ExternalArchive:
 
     def close(self) -> None:
         shutil.rmtree(self._staging, ignore_errors=True)
+
+
+class BackupRpcFacade:
+    """Typed RPC translator; backup policy remains in ``BackupService``."""
+
+    def __init__(
+        self,
+        profiles: Mapping[str, Any],
+        adapters: Mapping[Any, Any],
+        database: Any,
+        *,
+        b2_transport: Any | None = None,
+        sunlit_online_backup: Any | None = None,
+        telemetry_db: Any | None = None,
+        backup_service_factory: Callable[..., BackupService] = BackupService,
+        restore_service_factory: Callable[..., RestoreService] = RestoreService,
+        isolated_database_factory: Callable[[Any], Any | None] = _rpc_database_path,
+        close_database: Callable[[Any | None], None] = _rpc_close_database,
+    ) -> None:
+        self.profiles = profiles
+        self.adapters = adapters
+        self.database = database
+        self.b2_transport = b2_transport or B2CommandTransport()
+        self.sunlit_online_backup = sunlit_online_backup
+        self._backup_service_factory = backup_service_factory
+        self._restore_service_factory = restore_service_factory
+        self._isolated_database_factory = isolated_database_factory
+        self._close_database = close_database
+        self.protection = B2ProtectionService(database=database, transport=self.b2_transport)
+        self._profile_locks = {key: asyncio.Lock() for key in profiles}
+        self.services = {
+            key: backup_service_factory(
+                profile,
+                database=database,
+                stopped_check=lambda profile=profile: self._stopped_sync(profile),
+                protection_service=self.protection,
+                telemetry_db=telemetry_db,
+            )
+            for key, profile in profiles.items()
+        }
+        self.restores = {
+            key: restore_service_factory(
+                profile,
+                backup_service=self.services[key],
+                stopped_check=lambda profile=profile: self._stopped_sync(profile),
+            )
+            for key, profile in profiles.items()
+        }
+
+    def _service(self, profile_id: Any) -> tuple[Any, BackupService]:
+        key = _rpc_key(profile_id)
+        try:
+            return self.profiles[key], self.services[key]
+        except KeyError as exc:
+            raise SafeError("profile_not_found", "profile was not found") from exc
+
+    async def _stopped(self, profile: Any) -> None:
+        adapter = self.adapters.get(getattr(profile, "id", None)) or self.adapters.get(_rpc_key(profile))
+        if adapter is None or not hasattr(adapter, "observe"):
+            raise SafeError("profile_unavailable", "profile state could not be proven")
+        try:
+            value = adapter.observe(profile)
+            observation = await value if inspect.isawaitable(value) else value
+        except Exception as exc:
+            raise SafeError("profile_unavailable", "profile state could not be proven") from exc
+        if bool(getattr(observation, "running", False)):
+            raise SafeError("profile_running", "profile is running; it must be stopped before backup")
+
+    def _stopped_sync(self, profile: Any) -> bool:
+        adapter = self.adapters.get(getattr(profile, "id", None)) or self.adapters.get(_rpc_key(profile))
+        if adapter is None or not hasattr(adapter, "observe"):
+            raise SafeError("profile_unavailable", "profile state could not be proven")
+        try:
+            value = adapter.observe(profile)
+            if inspect.isawaitable(value):
+                value = asyncio.run(value)
+        except SafeError:
+            raise
+        except Exception as exc:
+            raise SafeError("profile_unavailable", "profile state could not be proven") from exc
+        if bool(getattr(value, "running", False)):
+            raise SafeError("profile_running", "profile is running; it must be stopped before backup")
+        return True
+
+    async def list(self, action: Any, actor: str | None = None, request_id: Any = None) -> BackupPage:
+        profile, service = self._service(action.profile_id)
+        result = service.list(action, actor, request_id)
+        if isinstance(result, BackupPage):
+            return result
+        return BackupPage(items=tuple(
+            BackupSummary(
+                id=str(getattr(record, "id", "")), profile_id=profile.id,
+                created_at=_rpc_timestamp(getattr(record, "created_at", None)), size_bytes=max(0, int(getattr(record, "size_bytes", 0))),
+                verified=bool(getattr(record, "verified", False)), protected=bool(getattr(record, "protected", False)),
+            ) for record in result
+        ), next_cursor=None)
+
+    async def create(self, action: Any, actor: str | None = None, request_id: Any = None, lease_check: Any = None) -> JobAccepted:
+        profile, service = self._service(action.profile_id)
+        async with self._profile_locks.setdefault(_rpc_key(profile), asyncio.Lock()):
+            adapter = self.adapters.get(getattr(profile, "id", None)) or self.adapters.get(_rpc_key(profile))
+            if adapter is None or not hasattr(adapter, "observe"):
+                raise SafeError("profile_unavailable", "profile state could not be proven")
+            try:
+                observed = adapter.observe(profile)
+                observed = await observed if inspect.isawaitable(observed) else observed
+            except Exception as exc:
+                raise SafeError("profile_unavailable", "profile state could not be proven") from exc
+            online = bool(getattr(observed, "running", False))
+            sunlit = _rpc_key(profile) == ProfileId.MINECRAFT_SUNLIT_COBBLEMON.value
+            if online and (not sunlit or self.sunlit_online_backup is None):
+                raise SafeError("profile_running", "profile is running; it must be stopped before backup")
+            if not online:
+                await self._stopped(profile)
+            def work():
+                worker_db = self._isolated_database_factory(self.database)
+                if action.destination is BackupDestination.HORIZON_B2 and worker_db is None:
+                    raise SafeError("backup_protection_failed", "durable backup state is unavailable")
+                worker = self._backup_service_factory(
+                    profile, database=worker_db, stopped_check=lambda: self._stopped_sync(profile),
+                    free_space=service.free_space, clock=service.clock, tar_runner=service.tar_runner,
+                    protection_service=B2ProtectionService(database=worker_db, transport=self.b2_transport, clock=service.clock),
+                    lease_check=lease_check,
+                )
+                try:
+                    if online:
+                        worker.online_transport = self.sunlit_online_backup
+                        result = worker.create_online(action, actor, request_id, protected=bool(action.protected), max_snapshot_seconds=240.0)
+                    else:
+                        result = worker.create(action, actor, request_id, protected=bool(action.protected))
+                    return result, worker_db is not None
+                finally:
+                    self._close_database(worker_db)
+            record, isolated = await asyncio.to_thread(work)
+            if not isolated:
+                service._insert(record)
+            return JobAccepted(job_id=getattr(record, "id", uuid.uuid4().hex), state="running")
+
+    def protect(self, profile_id: Any, backup_id: str, protected: bool = True):
+        _profile, service = self._service(profile_id)
+        return service.protect(backup_id, protected)
+
+    async def confirm_restore(self, action: Any, actor: str | None = None, request_id: Any = None, payload: Mapping[str, Any] | None = None, lease_check: Any = None) -> JobAccepted:
+        payload = payload or {}
+        profile, _service = self._service(payload.get("profile_id", getattr(action, "profile_id", None)))
+        await self._stopped(profile)
+        backup_id = str(payload.get("backup_id", ""))
+        if not backup_id or "/" in backup_id or "\\" in backup_id or backup_id in {".", ".."}:
+            raise SafeError("invalid_backup", "backup archive is not approved")
+        archive = Path(profile.paths.backup_root) / f"{backup_id}.tar.zst"
+        source_backup = self.services[_rpc_key(profile)]
+        source_restore = self.restores[_rpc_key(profile)]
+        def work():
+            worker_db = self._isolated_database_factory(self.database)
+            worker_backup = self._backup_service_factory(profile, database=worker_db, stopped_check=lambda: self._stopped_sync(profile), free_space=source_backup.free_space, clock=source_backup.clock, tar_runner=source_backup.tar_runner, lease_check=lease_check)
+            worker_restore = self._restore_service_factory(profile, backup_service=worker_backup, stopped_check=lambda: self._stopped_sync(profile), free_space=source_restore.free_space, health_check=None, lease_check=lease_check)
+            try:
+                result = worker_restore.restore(archive, actor, request_id)
+                destinations = result.destinations or (result.destination,)
+                if all(destination.is_dir() for destination in destinations):
+                    worker_restore.finalize(result)
+                else:
+                    worker_restore.rollback(result)
+                    raise SafeError("restore_health_failed", "restored profile failed health validation")
+                return result
+            finally:
+                self._close_database(worker_db)
+        result = await asyncio.to_thread(work)
+        return JobAccepted(job_id=getattr(result, "backup_id", uuid.uuid4().hex), state="running")
+
+    restore = confirm_restore
+
+    def reconcile_startup(self) -> None:
+        for restore in self.restores.values():
+            restore.reconcile()

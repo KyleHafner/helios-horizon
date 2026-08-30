@@ -16,7 +16,7 @@ import os
 import sqlite3
 import sys
 import time
-from contextlib import asynccontextmanager, nullcontext
+from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
 from enum import StrEnum
 from pathlib import Path
@@ -31,7 +31,6 @@ from .idle_stop import IdleStopTracker
 from .models import BackupDestination, NotificationEvent, OperationName, Profile, ProfileId
 from .schedule import ScheduleBook, ScheduleEntry, parse_schedule
 from .schedule_config import ScheduleConfigError, write_schedule_config
-from .stats_queries import stats_heatmap, stats_summary, stats_tps
 from .profile_config import ConfigValidationError, get_profile_config, set_profile_config
 from .protocol import (
     AuditPage,
@@ -65,7 +64,6 @@ from .protocol import (
     ScheduleResponse,
     ScheduleView,
     SetSchedules,
-    ScheduleSpec,
     SetProfileConfig,
     JobAccepted,
     ReadinessResult,
@@ -80,7 +78,7 @@ from .protocol import (
     PrepareSwitch,
     PrepareUpdate,
     PrepareWorldClone,
-    ProfileStatus,
+    PageOptions,
     PerfSnapshot,
     PublicProfile,
     PublicEndpoint,
@@ -114,10 +112,11 @@ from .protocol import (
     success,
     failure,
 )
-from .slot import ReservationStore, SlotInspector, OperationLock
+from .slot import SlotInspector, OperationLock
 from .perf import PerformanceTracker
 from .db_telemetry import collect_perf_databases_async
 from .introspection import signature_parameters
+from .runtime.protocols import AlertObservation
 
 _LOG = logging.getLogger(__name__)
 
@@ -233,7 +232,7 @@ STREAM_ACTIONS = frozenset({Watch})
 
 
 def _action_types() -> set[type]:
-    from typing import Annotated, get_args, get_origin, Union
+    from typing import Annotated, get_args, get_origin
 
     args = get_args(RpcAction)
     union = args[0] if args and get_origin(RpcAction) is Annotated else RpcAction
@@ -432,12 +431,12 @@ class Controller:
         alerts = getattr(getattr(self, "services", None), "alerts", None)
         if metric == "wake_duration" and alerts is not None:
             try:
-                alerts.observe(
-                    profile_id,
+                alerts.observe(AlertObservation(
+                    profile_id=str(getattr(profile_id, "value", profile_id)),
                     profile_state="running" if success else "starting",
                     now=time.monotonic(),
                     wake_duration_ms=duration_ms,
-                )
+                ))
             except Exception:
                 _LOG.debug("wake alert evaluation dropped", exc_info=True)
 
@@ -1543,7 +1542,7 @@ class Controller:
                     ready = await self._probe_start_health(source_profile, rollback_task)
                     if ready is False:
                         raise RuntimeError("rollback readiness failed")
-                except Exception as rollback_exc:
+                except Exception:
                     await self._record_event(source, "rollback_failed", "rollback did not restore the previous profile")
                     await self._record_audit(
                         actor,
@@ -2067,10 +2066,16 @@ class Controller:
         return EventPage(items=(), next_cursor=None)
 
     async def _get_stats_summary(self, action: GetStatsSummary, actor: str, request_id: UUID) -> dict[str, Any]:
-        return stats_summary(self._db(), action.profile_id.value, action.days, hours=action.hours, now=_iso(self._clock()))
+        service = self._service("stats", "stats_summary")
+        if service is None:
+            raise _ControllerFailure(ErrorCode.INTERNAL_ERROR, "history query service unavailable")
+        return await self._invoke(service, action, actor, request_id, now=_iso(self._clock()))
 
     async def _get_stats_heatmap(self, action: GetStatsHeatmap, actor: str, request_id: UUID) -> dict[str, Any]:
-        return stats_heatmap(self._db(), action.profile_id.value, action.days, hours=action.hours, now=_iso(self._clock()))
+        service = self._service("stats", "stats_heatmap")
+        if service is None:
+            raise _ControllerFailure(ErrorCode.INTERNAL_ERROR, "history query service unavailable")
+        return await self._invoke(service, action, actor, request_id, now=_iso(self._clock()))
 
     async def _get_stats_tps(self, action: GetStatsTps, actor: str, request_id: UUID) -> dict[str, Any]:
         if action.profile_id.value not in {"minecraft", "minecraft-sunlit-cobblemon"}:
@@ -2078,10 +2083,7 @@ class Controller:
         service = self._service("stats", "tps")
         if service is not None:
             return await self._invoke(service, action, actor, request_id, now=_iso(self._clock()))
-        return stats_tps(
-            self._db(), action.profile_id.value, action.window, now=_iso(self._clock()),
-            resolution=action.resolution, limit=action.limit,
-        )
+        raise _ControllerFailure(ErrorCode.INTERNAL_ERROR, "history query service unavailable")
 
     async def _get_profile_config(self, action: GetProfileConfig, actor: str, request_id: UUID) -> ProfileConfigResponse:
         profile = self._profile(action.profile_id)
@@ -2276,12 +2278,12 @@ class Controller:
                     _LOG.warning("rolling benchmark regression evaluation failed", exc_info=True)
             if alerts is not None:
                 try:
-                    alerts.observe(
-                        action.profile_id,
+                    alerts.observe(AlertObservation(
+                        profile_id=str(getattr(action.profile_id, "value", action.profile_id)),
                         profile_state="stopped",
                         now=time.monotonic(),
                         benchmark_regression=regression,
-                    )
+                    ))
                 except Exception:
                     _LOG.debug("benchmark alert evaluation dropped", exc_info=True)
             await self._transaction(
@@ -2432,7 +2434,7 @@ class Controller:
         async with self._operation_lease(profile, operation, request_id, actor=actor) as (lease, renewal):
             job_id = await self._transaction(lambda: self._job_intent(actor, operation, profile.id))
             try:
-                result = await self._await_lease(
+                await self._await_lease(
                     self._invoke(service, action, actor, request_id,
                                  lease_check=lambda: self._lease_owned_sync(lease), **extra),
                     renewal,

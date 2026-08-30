@@ -27,6 +27,8 @@ from .adapters.crafty import parse_version_text
 from .errors import SafeError
 from .interim_maintenance_control import maintenance_argv
 from .protocol import UpdateStatus
+from .protocol import JobAccepted
+from .backups import BackupService
 
 STEAMCMD_ARGV = (
     "/opt/steamcmd/steamcmd.sh",
@@ -55,6 +57,22 @@ MAX_COMPRESSION_RATIO = 100
 def _id(profile: Any) -> str:
     value = getattr(profile, "id", profile)
     return getattr(value, "value", str(value))
+
+
+def _isolated_database(database: Any) -> Any | None:
+    path = getattr(database, "path", None)
+    opener = getattr(type(database), "open", None)
+    if path is None or not callable(opener):
+        return None
+    try:
+        return opener(path)
+    except Exception:
+        return None
+
+
+def _close_database(database: Any | None) -> None:
+    if database is not None and hasattr(database, "close"):
+        database.close()
 
 
 @dataclass(frozen=True)
@@ -551,6 +569,65 @@ class UpdateService:
         self._rollback_link(current, os.path.relpath(target_path, current.parent))
         self._record(profile_obj, "rolled_back", None, target)
         return UpdateResult("rolled_back", _id(profile_obj), self._strategy(profile_obj), None, target)
+
+
+class UpdateRpcFacade:
+    """Typed RPC translator; update policy remains in ``UpdateService``."""
+
+    def __init__(self, services: Mapping[str, UpdateService], profiles: Mapping[str, Any], adapters: Mapping[Any, Any], *, update_service_factory: Callable[..., UpdateService] = UpdateService):
+        self.services, self.profiles, self.adapters = services, profiles, adapters
+        self._update_service_factory = update_service_factory
+
+    async def _stopped(self, profile: Any) -> None:
+        adapter = self.adapters.get(getattr(profile, "id", None)) or self.adapters.get(_id(profile))
+        if adapter is None or not hasattr(adapter, "observe"):
+            raise SafeError("profile_unavailable", "profile state could not be proven")
+        value = adapter.observe(profile)
+        observation = await value if inspect.isawaitable(value) else value
+        if bool(getattr(observation, "running", False)):
+            raise SafeError("profile_running", "profile is running; it must be stopped before update")
+
+    def _stopped_sync(self, profile: Any) -> bool:
+        adapter = self.adapters.get(getattr(profile, "id", None)) or self.adapters.get(_id(profile))
+        if adapter is None or not hasattr(adapter, "observe"):
+            raise SafeError("profile_unavailable", "profile state could not be proven")
+        value = adapter.observe(profile)
+        if inspect.isawaitable(value):
+            value = asyncio.run(value)
+        if bool(getattr(value, "running", False)):
+            raise SafeError("profile_running", "profile is running; it must be stopped before update")
+        return True
+
+    async def check(self, action: Any, actor: str | None = None, request_id: Any = None) -> UpdateStatus:
+        key = _id(action.profile_id)
+        try:
+            return await asyncio.to_thread(self.services[key].check, action.profile_id)
+        except KeyError as exc:
+            raise SafeError("profile_not_found", "profile was not found") from exc
+
+    async def confirm(self, action: Any, actor: str | None = None, request_id: Any = None, payload: Mapping[str, Any] | None = None, lease_check: Any = None) -> JobAccepted:
+        key = _id((payload or {}).get("profile_id", action.profile_id))
+        try:
+            service = self.services[key]
+            profile = self.profiles[key]
+        except KeyError as exc:
+            raise SafeError("profile_not_found", "profile was not found") from exc
+        await self._stopped(profile)
+        source_backup = service.backup_service
+        def work():
+            worker_db = _isolated_database(service.database)
+            worker_backup = BackupService(profile, database=worker_db, stopped_check=lambda: self._stopped_sync(profile), free_space=source_backup.free_space, clock=source_backup.clock, tar_runner=source_backup.tar_runner)
+            worker_service = self._update_service_factory({key: profile}, database=worker_db, backup_service=worker_backup, runner=service.runner, downloader=service.downloader, stage_release=service.stage_release, verify_release=service.verify_release, stopped_check=lambda *_: self._stopped_sync(profile), http_client=service.http_client, clock=service.clock, lease_check=lease_check)
+            try:
+                return worker_service.apply(profile), worker_db is not None
+            finally:
+                _close_database(worker_db)
+        result, isolated = await asyncio.to_thread(work)
+        if not isolated:
+            service._record(profile, getattr(result, "state", "succeeded"), getattr(result, "prior_version", None), getattr(result, "new_version", None))
+        return JobAccepted(job_id=__import__("uuid").uuid4().hex, state="running")
+
+    apply = confirm
 
 
 __all__ = ["UpdateService", "UpdateResult", "STEAMCMD_ARGV"]

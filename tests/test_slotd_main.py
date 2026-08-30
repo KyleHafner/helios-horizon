@@ -28,6 +28,108 @@ import game_control.slotd_main as slotd_main
 from game_control.slotd_main import UnixRpcServer, _await_free_slot, _await_systemd_profile_ready, _maintenance_loop
 
 
+class _TestAssembly:
+    def __init__(self, controller):
+        self.controller = controller
+
+    async def aclose(self):
+        first_error = None
+        sampler = getattr(self.controller.services, "tps_sampler", None)
+        if sampler is not None:
+            try:
+                await sampler.aclose()
+            except BaseException as exc:
+                first_error = exc
+        close = getattr(self.controller.services, "close", None)
+        if close is not None:
+            try:
+                await close()
+            except BaseException as exc:
+                if first_error is None:
+                    first_error = exc
+        if first_error is not None:
+            raise first_error
+
+
+async def _test_assembly(controller):
+    return _TestAssembly(controller)
+
+
+@pytest.mark.asyncio
+async def test_provisional_owner_closes_registered_resources_once_in_reverse_order():
+    events = []
+    owner = slotd_main._ProvisionalOwner()
+    owner.register("state", lambda: events.append("state"))
+    owner.register("service", lambda: events.append("service"))
+    owner.register("service", lambda: events.append("duplicate"))
+
+    await owner.aclose()
+    await owner.aclose()
+
+    assert events == ["service", "state"]
+
+
+@pytest.mark.asyncio
+async def test_serve_closes_partial_task_creation_without_pending_tasks(monkeypatch):
+    class Services:
+        tps_sampler = None
+
+        async def close(self):
+            return None
+
+    class Controller:
+        services = Services()
+        profiles = ()
+        adapters = {}
+        slot_inspector = None
+
+        async def reconcile_startup(self):
+            return None
+
+        async def maintenance_tick(self):
+            await asyncio.sleep(3600)
+
+    class Server:
+        def __init__(self, _controller):
+            self._server = self
+            self.closed = False
+
+        async def start(self):
+            return None
+
+        async def serve_forever(self):
+            await asyncio.sleep(3600)
+
+        async def close(self):
+            self.closed = True
+
+    server = None
+    calls = 0
+    real_create_task = asyncio.create_task
+
+    def create_task(coro, *args, **kwargs):
+        nonlocal calls
+        calls += 1
+        if calls == 4:
+            coro.close()
+            raise RuntimeError("server task creation failed")
+        return real_create_task(coro, *args, **kwargs)
+
+    def make_server(controller):
+        nonlocal server
+        server = Server(controller)
+        return server
+
+    monkeypatch.setattr(slotd_main, "build_controller_assembly", lambda: _test_assembly(Controller()))
+    monkeypatch.setattr(slotd_main, "UnixRpcServer", make_server)
+    monkeypatch.setattr(slotd_main.asyncio, "create_task", create_task)
+
+    with pytest.raises(RuntimeError, match="server task creation failed"):
+        await slotd_main.serve()
+
+    assert server is not None and server.closed is True
+
+
 class _Reader:
     def __init__(self, request: RpcRequest):
         self.request = (request.model_dump_json() + "\n").encode()
@@ -528,7 +630,7 @@ async def test_serve_cleans_up_after_startup_lock_failure_and_signal_shutdown(mo
         server = Server(controller)
         return server
 
-    monkeypatch.setattr(slotd_main, "build_controller", lambda: Controller())
+    monkeypatch.setattr(slotd_main, "build_controller_assembly", lambda: _test_assembly(Controller()))
     monkeypatch.setattr(slotd_main, "UnixRpcServer", make_server)
 
     with pytest.raises(BlockingIOError, match="operation lock unavailable"):
@@ -587,7 +689,7 @@ async def test_serve_cancels_tps_sampler_and_closes_it_on_shutdown(monkeypatch) 
         async def close(self):
             return None
 
-    monkeypatch.setattr(slotd_main, "build_controller", lambda: Controller())
+    monkeypatch.setattr(slotd_main, "build_controller_assembly", lambda: _test_assembly(Controller()))
     monkeypatch.setattr(slotd_main, "UnixRpcServer", Server)
 
     with pytest.raises(asyncio.CancelledError):
@@ -648,7 +750,7 @@ async def test_serve_closes_services_and_server_when_tps_close_fails(monkeypatch
         server = Server(controller)
         return server
 
-    monkeypatch.setattr(slotd_main, "build_controller", lambda: Controller())
+    monkeypatch.setattr(slotd_main, "build_controller_assembly", lambda: _test_assembly(Controller()))
     monkeypatch.setattr(slotd_main, "UnixRpcServer", make_server)
 
     with pytest.raises(RuntimeError, match="tps close failed"):
@@ -696,7 +798,7 @@ async def test_serve_fails_when_maintenance_task_exits_unexpectedly(monkeypatch)
     async def exited_loop(*_args, **_kwargs):
         return None
 
-    monkeypatch.setattr(slotd_main, "build_controller", lambda: Controller())
+    monkeypatch.setattr(slotd_main, "build_controller_assembly", lambda: _test_assembly(Controller()))
     monkeypatch.setattr(slotd_main, "UnixRpcServer", make_server)
     monkeypatch.setattr(slotd_main, "_maintenance_loop", exited_loop)
 
@@ -741,7 +843,7 @@ async def test_serve_fails_when_rpc_server_exits_normally(monkeypatch):
     async def running_loop(*_args, **_kwargs):
         await asyncio.sleep(3600)
 
-    monkeypatch.setattr(slotd_main, "build_controller", lambda: Controller())
+    monkeypatch.setattr(slotd_main, "build_controller_assembly", lambda: _test_assembly(Controller()))
     monkeypatch.setattr(slotd_main, "UnixRpcServer", make_server)
     monkeypatch.setattr(slotd_main, "_maintenance_loop", running_loop)
 
