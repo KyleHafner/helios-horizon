@@ -381,7 +381,10 @@ def _parse_monotonic_started_at(value: str) -> datetime | None:
         return None
     if micros <= 0:
         return None
-    age = time.monotonic() - micros / 1_000_000
+    try:
+        age = time.monotonic() - micros / 1_000_000
+    except (OverflowError, ValueError):
+        return None
     if age < 0 or age > 365 * 24 * 3600:
         return None
     return datetime.now(timezone.utc) - timedelta(seconds=age)

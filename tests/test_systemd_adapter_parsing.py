@@ -274,15 +274,18 @@ async def test_stop_settle_rejects_duplicate_or_malformed_systemd_properties() -
 async def test_observe_prefers_monotonic_activation_over_realtime(monkeypatch) -> None:
     fixed_now = 1_000_000.0
     monkeypatch.setattr(systemd_module.time, "monotonic", lambda: fixed_now)
+    before = datetime.now(timezone.utc)
     observation = await _observe_from(
         (
             f"ActiveState=active\nSubState=running\nMainPID=987\n"
-            f"ExecMainStartTimestamp=Mon 2026-07-13 08:00:00 EDT\n"
+            f"ExecMainStartTimestamp=2020-01-01T00:00:00Z\n"
             f"ExecMainStartTimestampMonotonic={int((fixed_now - 2) * 1_000_000)}\n"
         ).encode()
     )
+    after = datetime.now(timezone.utc)
     assert observation.started_at is not None
     assert observation.started_at.tzinfo == timezone.utc
+    assert before - timedelta(seconds=2.5) <= observation.started_at <= after - timedelta(seconds=1.5)
 
 
 @pytest.mark.asyncio
@@ -301,20 +304,22 @@ def test_parse_started_at_rejects_empty_invalid_and_naive_values(value) -> None:
 
 
 @pytest.mark.parametrize(
-    "value",
+    ("value", "expected_utc", "expected_offset"),
     [
-        "2026-07-13T12:00:00Z",
-        "2026-07-13T12:00:00+00:00",
-        "Mon 2026-07-13 12:00:00 UTC",
-        "Mon 2026-07-13 12:00:00 GMT",
-        "Mon 2026-07-13 08:00:00 -0400",
-        "Mon 2026-07-13 17:30:00 +05:30",
+        ("2026-07-13T12:00:00Z", datetime(2026, 7, 13, 12, tzinfo=timezone.utc), timedelta(0)),
+        ("2026-07-13T12:00:00+00:00", datetime(2026, 7, 13, 12, tzinfo=timezone.utc), timedelta(0)),
+        ("Mon 2026-07-13 12:00:00 UTC", datetime(2026, 7, 13, 12, tzinfo=timezone.utc), timedelta(0)),
+        ("Mon 2026-07-13 12:00:00 GMT", datetime(2026, 7, 13, 12, tzinfo=timezone.utc), timedelta(0)),
+        ("Mon 2026-07-13 08:00:00 -0400", datetime(2026, 7, 13, 12, tzinfo=timezone.utc), timedelta(hours=-4)),
+        ("Mon 2026-07-13 17:30:00 +05:30", datetime(2026, 7, 13, 12, tzinfo=timezone.utc), timedelta(hours=5, minutes=30)),
     ],
 )
-def test_parse_started_at_accepts_aware_systemd_formats(value) -> None:
+def test_parse_started_at_accepts_aware_systemd_formats(value, expected_utc, expected_offset) -> None:
     parsed = systemd_module._parse_started_at(value)
     assert parsed is not None
     assert parsed.tzinfo is not None
+    assert parsed.astimezone(timezone.utc) == expected_utc
+    assert parsed.utcoffset() == expected_offset
 
 
 @pytest.mark.parametrize(
@@ -370,6 +375,11 @@ def test_parse_monotonic_start_time_rejects_bad_future_and_stale_values(monkeypa
         )
         is None
     )
+
+
+def test_parse_monotonic_start_time_rejects_oversized_integer(monkeypatch) -> None:
+    monkeypatch.setattr(systemd_module.time, "monotonic", lambda: 1_000_000.0)
+    assert systemd_module._parse_monotonic_started_at("9" * 400) is None
 
 
 def test_parse_monotonic_start_time_accepts_recent_value(monkeypatch) -> None:
