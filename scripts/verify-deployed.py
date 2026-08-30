@@ -15,6 +15,7 @@ Exit status:
 from __future__ import annotations
 
 import argparse
+import importlib.util
 import json
 import os
 import pwd
@@ -33,6 +34,21 @@ from typing import Any
 
 
 TARGET_ROOT = Path("/")
+PACKAGE_ROOT = Path(__file__).resolve().parents[1]
+
+
+def _load_deployment_manifest():
+    path = PACKAGE_ROOT / "src/game_control/deployment_manifest.py"
+    spec = importlib.util.spec_from_file_location("_horizon_deployment_manifest_verify", path)
+    if spec is None or spec.loader is None:
+        raise RuntimeError("deployment manifest is unavailable")
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = module
+    spec.loader.exec_module(module)
+    return module.get_manifest()
+
+
+_DEPLOYMENT_MANIFEST = _load_deployment_manifest()
 ETC = TARGET_ROOT / "etc/game-control"
 PROFILES = ETC / "profiles.d"
 RUNNERS = ETC / "runner.d"
@@ -50,94 +66,28 @@ PERF_API_URL = os.environ.get("HORIZON_VERIFY_PERF_API_URL", "http://192.0.2.10:
 PROXY_CREDENTIAL = TARGET_ROOT / "run/credentials/game-control-web.service/proxy-token"
 STATUS_P50_BUDGET_MS = 150.0
 
-PROFILE_IDS = ("minecraft-sunlit-cobblemon", "terraria-vanilla", "terraria-tmod")
+PROFILE_IDS = tuple(profile.id for profile in _DEPLOYMENT_MANIFEST.profiles)
 EXPECTED_SERVICES = ("game-slotd.service", "game-control-web.service")
-RETIRED_SERVICES = ("crafty.service", "pz-rising.service")
+RETIRED_SERVICES = tuple(name for name in _DEPLOYMENT_MANIFEST.retired.names if name.endswith(".service"))
 RELAY_STATE_EXPECTATIONS = {
-    "private": {
-        "bore-minecraft-fenced.service": False,
-        "horizon-terraria-relay.service": False,
-    },
-    "production": {
-        "bore-minecraft-fenced.service": True,
-        # This relay has no install target and remains disarmed until an
-        # operator explicitly starts it for a Terraria session.
-        "horizon-terraria-relay.service": False,
-    },
+    mode.name: dict(mode.expectations) for mode in _DEPLOYMENT_MANIFEST.relay_modes
 }
-PROFILE_UNITS = {
-    "minecraft-sunlit-cobblemon": "minecraft-sunlit-cobblemon.service",
-    "terraria-vanilla": "terraria-vanilla.service",
-    "terraria-tmod": "terraria-tmod.service",
-}
-EXPECTED_UNIT_FILES = frozenset(
-    {
-        "game-control-web.service",
-        "game-slotd.service",
-        "horizon-bore-liveness.service",
-        "horizon-bore-liveness.timer",
-        "horizon-sunlit-auto-update.service",
-        "horizon-sunlit-auto-update.timer",
-        "lazymc-minecraft.service",
-        "games.slice",
-        "bore-minecraft-fenced.service",
-        "horizon-alert-drill@.service",
-        "horizon-alert-notify@.service",
-        "horizon-terraria-relay.service",
-        "minecraft-sunlit-cobblemon.service",
-        "terraria-vanilla.service",
-        "terraria-tmod.service",
-    }
-)
+PROFILE_UNITS = {profile.id: profile.unit for profile in _DEPLOYMENT_MANIFEST.profiles}
+_SYSTEMD_NAMESPACE = next(ns for ns in _DEPLOYMENT_MANIFEST.namespaces if ns.name == "systemd")
+_LIBEXEC_NAMESPACE = next(ns for ns in _DEPLOYMENT_MANIFEST.namespaces if ns.name == "libexec")
+EXPECTED_UNIT_FILES = frozenset(_SYSTEMD_NAMESPACE.exact)
 # Only names in these explicit Horizon namespaces are owned by this package.
 # The systemd unit directory is shared with the host, so unrelated regular
 # unit files (for example distro-provided dbus aliases) must not invalidate
 # Horizon's package manifest.  Keep this policy narrow: a new Horizon-owned
 # name must still be added to EXPECTED_UNIT_FILES before it can pass.
 HORIZON_UNIT_NAMES = EXPECTED_UNIT_FILES
-HORIZON_UNIT_PREFIXES = (
-    "game-control-",
-    "game-slotd",
-    "horizon-",
-    "lazymc-",
-    "bore-minecraft-fenced",
-)
-EXPECTED_PROFILE_FILES = frozenset(f"{profile_id}.toml" for profile_id in PROFILE_IDS)
-EXPECTED_RUNNER_FILES = frozenset(f"{profile_id}.json" for profile_id in PROFILE_IDS)
-EXPECTED_DIRECTORIES = {
-    "etc/game-control": 0o755,
-    "etc/game-control/profiles.d": 0o755,
-    "etc/game-control/runner.d": 0o755,
-    "etc/game-control/secrets.d": 0o700,
-    "etc/game-control/arm": 0o700,
-    "etc/game-control/lazymc": 0o755,
-    "etc/systemd/journald@horizon.conf.d": 0o700,
-    "etc/wireguard": 0o700,
-    "usr/local/share/horizon": 0o755,
-    "opt/game-control/web": 0o755,
-    "opt/game-servers/minecraft-sunlit-cobblemon": 0o755,
-    "opt/game-servers/minecraft-sunlit-cobblemon/releases": 0o755,
-    "srv/game-servers/minecraft-sunlit-cobblemon": 0o750,
-    "var/backups/game-servers": 0o700,
-    "var/backups/game-servers/minecraft-sunlit-cobblemon": 0o700,
-    "var/backups/game-servers/terraria-vanilla": 0o700,
-    "var/backups/game-servers/terraria-tmod": 0o700,
-    "var/lib/game-control/alerts": 0o700,
-    "var/lib/game-control/horizon-journal": 0o700,
-    "var/lib/game-control/migrations": 0o700,
-}
-EXPECTED_SYMLINKS = {
-    "srv/game-servers/minecraft-sunlit-cobblemon/libraries": "/opt/game-servers/minecraft-sunlit-cobblemon/libraries",
-}
-LEGACY_TARGET_FILES = frozenset(
-    {
-        "minecraft.toml",
-        "pz-rising.toml",
-        "minecraft.json",
-        "pz-rising.json",
-        "pz-rising.service",
-    }
-)
+HORIZON_UNIT_PREFIXES = _SYSTEMD_NAMESPACE.prefixes
+EXPECTED_PROFILE_FILES = frozenset(next(ns for ns in _DEPLOYMENT_MANIFEST.namespaces if ns.name == "profiles").exact)
+EXPECTED_RUNNER_FILES = frozenset(next(ns for ns in _DEPLOYMENT_MANIFEST.namespaces if ns.name == "runners").exact)
+EXPECTED_DIRECTORIES = {spec.target.removeprefix("/"): spec.mode for spec in _DEPLOYMENT_MANIFEST.directories}
+EXPECTED_SYMLINKS = {spec.target.removeprefix("/"): spec.link_target for spec in _DEPLOYMENT_MANIFEST.symlinks}
+LEGACY_TARGET_FILES = frozenset(_DEPLOYMENT_MANIFEST.retired.names)
 LEGACY_STRINGS = ("crafty", "pzuser", "/opt/pzserver", "/home/pzuser")
 EXPECTED_STATE_TABLES = {
     "events",
@@ -403,6 +353,31 @@ def _check_target_package(checks: Checks) -> None:
             "ok" if ok else "directory_mode_or_presence_invalid",
             expected=oct(expected_mode),
         )
+    file_problems: list[str] = []
+    for spec in _DEPLOYMENT_MANIFEST.files:
+        path = TARGET_ROOT / spec.target.lstrip("/")
+        value = _file_mode(path)
+        if value is None:
+            file_problems.append(f"missing:{spec.target}")
+            continue
+        info, actual_mode = value
+        try:
+            expected_uid = pwd.getpwnam(spec.owner).pw_uid
+            expected_gid = grp.getgrnam(spec.group).gr_gid
+        except KeyError:
+            file_problems.append(f"owner-unavailable:{spec.target}")
+            continue
+        if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1:
+            file_problems.append(f"type-or-links:{spec.target}")
+        elif actual_mode != spec.mode or info.st_uid != expected_uid or info.st_gid != expected_gid:
+            file_problems.append(f"metadata:{spec.target}")
+    checks.add(
+        "target.files.manifest",
+        not file_problems,
+        "ok" if not file_problems else "file_manifest_mismatch",
+        expected=len(_DEPLOYMENT_MANIFEST.files),
+        actual=None if not file_problems else file_problems[:10],
+    )
     for relative, expected_target in EXPECTED_SYMLINKS.items():
         path = TARGET_ROOT / relative
         try:
