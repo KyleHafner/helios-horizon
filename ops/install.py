@@ -454,15 +454,17 @@ class Installer:
                 continue
             if stat.S_IMODE(directory_stat.st_mode) != mode:
                 problems.append(f"mode drift {path}")
-            if self.root == Path("/") or (user, group) == ("root", "root"):
-                try:
-                    expected_uid = self._lookup(user)
-                    expected_gid = self._lookup(group, group=True)
-                except KeyError:
+            try:
+                expected_uid = self._lookup(user)
+                expected_gid = self._lookup(group, group=True)
+            except KeyError:
+                if self.root == Path("/"):
                     problems.append(f"ownership unavailable {path}")
+                    expected_uid = expected_gid = -1
                 else:
-                    if directory_stat.st_uid != expected_uid or directory_stat.st_gid != expected_gid:
-                        problems.append(f"ownership drift {path}")
+                    expected_uid = expected_gid = 0
+            if directory_stat.st_uid != expected_uid or directory_stat.st_gid != expected_gid:
+                problems.append(f"ownership drift {path}")
         for destination, (source, mode) in self.expected_files().items():
             try:
                 destination_stat = destination.lstat()

@@ -1420,3 +1420,13 @@ def test_installer_static_and_runtime_projections_match_canonical_manifest(tmp_p
     }
     assert set(installer.expected_links()) == {spec.target_path(root) for spec in manifest.symlinks}
     assert len(installer.directories()) == len(manifest.directories)
+
+
+def test_installer_drift_reports_alternate_root_directory_ownership(tmp_path: Path) -> None:
+    from ops.install import Installer
+
+    root = tmp_path / "root"
+    installer = Installer(root, skip_systemd_verify=True)
+    installer.apply()
+    os.chown(root / "var/lib/game-control-web", 65534, 65534)
+    assert any("ownership drift" in problem for problem in installer.drift())

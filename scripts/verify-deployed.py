@@ -86,6 +86,10 @@ HORIZON_UNIT_PREFIXES = _SYSTEMD_NAMESPACE.prefixes
 EXPECTED_PROFILE_FILES = frozenset(next(ns for ns in _DEPLOYMENT_MANIFEST.namespaces if ns.name == "profiles").exact)
 EXPECTED_RUNNER_FILES = frozenset(next(ns for ns in _DEPLOYMENT_MANIFEST.namespaces if ns.name == "runners").exact)
 EXPECTED_DIRECTORIES = {spec.target.removeprefix("/"): spec.mode for spec in _DEPLOYMENT_MANIFEST.directories}
+EXPECTED_DIRECTORY_NLINKS = {
+    spec.target: 2 + sum(Path(child.target).parent == Path(spec.target) for child in _DEPLOYMENT_MANIFEST.directories)
+    for spec in _DEPLOYMENT_MANIFEST.directories
+}
 EXPECTED_SYMLINKS = {spec.target.removeprefix("/"): spec.link_target for spec in _DEPLOYMENT_MANIFEST.symlinks}
 LEGACY_TARGET_FILES = frozenset(_DEPLOYMENT_MANIFEST.retired.names)
 LEGACY_STRINGS = ("crafty", "pzuser", "/opt/pzserver", "/home/pzuser")
@@ -359,7 +363,20 @@ def _check_target_package(checks: Checks) -> None:
     for relative, expected_mode in EXPECTED_DIRECTORIES.items():
         path = TARGET_ROOT / relative
         value = _file_mode(path)
-        ok = bool(value and stat.S_ISDIR(value[0].st_mode) and value[1] == expected_mode)
+        expected_spec = next(spec for spec in _DEPLOYMENT_MANIFEST.directories if spec.target.removeprefix("/") == relative)
+        try:
+            expected_uid = pwd.getpwnam(expected_spec.owner).pw_uid
+            expected_gid = grp.getgrnam(expected_spec.group).gr_gid
+        except KeyError:
+            expected_uid = expected_gid = 0 if TARGET_ROOT != Path("/") else -1
+        ok = bool(
+            value
+            and stat.S_ISDIR(value[0].st_mode)
+            and value[1] == expected_mode
+            and value[0].st_nlink == EXPECTED_DIRECTORY_NLINKS[expected_spec.target]
+            and value[0].st_uid == expected_uid
+            and value[0].st_gid == expected_gid
+        )
         checks.add(
             "target.directory." + relative.replace("/", "."),
             ok,

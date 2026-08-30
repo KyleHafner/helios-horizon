@@ -1,13 +1,16 @@
 from __future__ import annotations
 
-from dataclasses import FrozenInstanceError
+from dataclasses import FrozenInstanceError, replace
 from pathlib import Path
 
 import pytest
 
 from game_control.deployment_manifest import (
     DeploymentManifest,
+    DirectorySpec,
     FileSpec,
+    NamespaceSpec,
+    SymlinkSpec,
     get_manifest,
     manifest_digest,
 )
@@ -43,3 +46,49 @@ def test_manifest_validation_checks_real_sources_without_import_side_effects() -
 def test_file_spec_rejects_unsafe_source(source: str) -> None:
     with pytest.raises(ValueError):
         FileSpec(source, "/opt/example", 0o644)
+
+
+def test_schema_rejects_bool_modes_and_mutable_namespace_fields() -> None:
+    with pytest.raises(ValueError):
+        FileSpec("a", "/opt/example", True)  # type: ignore[arg-type]
+    with pytest.raises(ValueError):
+        NamespaceSpec("example", "/opt/example", ["one"])  # type: ignore[arg-type]
+    with pytest.raises(ValueError):
+        NamespaceSpec("example", "/opt/example", (), ["prefix-"])  # type: ignore[arg-type]
+
+
+@pytest.mark.parametrize(
+    ("files", "directories", "symlinks"),
+    (
+        ((FileSpec("a", "/x", 0o644),), (DirectorySpec("/x/y", 0o755),), ()),
+        ((FileSpec("a", "/x/y", 0o644),), (DirectorySpec("/x", 0o755),), ()),
+        ((FileSpec("a", "/x", 0o644),), (), (SymlinkSpec("/x/y", "/target"),)),
+        ((FileSpec("a", "/x/y", 0o644),), (), (SymlinkSpec("/x", "/target"),)),
+    ),
+)
+def test_schema_rejects_parent_collisions(files, directories, symlinks) -> None:
+    manifest = get_manifest()
+    with pytest.raises(ValueError, match="parent collision"):
+        DeploymentManifest(
+            manifest.schema_version,
+            manifest.profiles,
+            manifest.files + files,
+            manifest.directories + directories,
+            manifest.symlinks + symlinks,
+            manifest.namespaces,
+            manifest.retired,
+            manifest.secrets,
+            manifest.databases,
+            manifest.runtime_manifest,
+            manifest.relay_modes,
+            manifest.runtime_sources,
+            manifest.runtime_support,
+        )
+
+
+def test_schema_rejects_mutable_manifest_collections_and_empty_profile() -> None:
+    manifest = get_manifest()
+    with pytest.raises(ValueError, match="immutable tuple"):
+        replace(manifest, files=list(manifest.files))  # type: ignore[arg-type]
+    with pytest.raises(ValueError):
+        replace(manifest.profiles[0], id="", profile_source="config/profiles/.toml", runner_source="config/runner/.json", unit=".service")

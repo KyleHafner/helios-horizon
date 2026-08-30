@@ -14,10 +14,13 @@ from pathlib import Path
 import stat
 from typing import Iterable
 
+_CANONICAL_ALLOWED_DIRECTORY_PARENTS: frozenset[str] = frozenset()
 
 def _relative(value: str, label: str) -> None:
+    if not isinstance(value, str) or not value or value in {".", ".."} or "\\" in value:
+        raise ValueError(f"invalid {label} path")
     path = Path(value)
-    if not isinstance(value, str) or not value or value in {".", ".."} or path.is_absolute() or "\\" in value:
+    if path.is_absolute() or str(path) != value:
         raise ValueError(f"invalid {label} path")
     if any(part in {"", ".", ".."} for part in path.parts):
         raise ValueError(f"invalid {label} path")
@@ -26,13 +29,25 @@ def _relative(value: str, label: str) -> None:
 def _target(value: str, label: str = "target") -> None:
     if not isinstance(value, str) or not value.startswith("/") or "\\" in value:
         raise ValueError(f"invalid {label} path")
-    if any(part in {"", ".", ".."} for part in Path(value).parts):
+    path = Path(value)
+    if value == "/" or str(path) != value or any(part in {"", ".", ".."} for part in path.parts):
         raise ValueError(f"invalid {label} path")
 
 
 def _mode(value: int) -> None:
-    if not isinstance(value, int) or value < 0 or value & ~0o7777:
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0 or value & ~0o7777:
         raise ValueError("invalid mode")
+
+
+def _tuple(value: object, label: str) -> tuple:
+    if not isinstance(value, tuple):
+        raise ValueError(f"{label} must be an immutable tuple")
+    return value
+
+
+def _text(value: object, label: str) -> None:
+    if not isinstance(value, str) or not value:
+        raise ValueError(f"invalid {label}")
 
 
 @dataclass(frozen=True, slots=True)
@@ -41,6 +56,12 @@ class ProfileSpec:
     profile_source: str
     runner_source: str
     unit: str
+
+    def __post_init__(self) -> None:
+        _text(self.id, "profile id")
+        _relative(self.profile_source, "profile source")
+        _relative(self.runner_source, "runner source")
+        _text(self.unit, "profile unit")
 
 
 @dataclass(frozen=True, slots=True)
@@ -56,8 +77,10 @@ class FileSpec:
         _relative(self.source, "source")
         _target(self.target)
         _mode(self.mode)
-        if not self.owner or not self.group:
-            raise ValueError("file owner/group must be non-empty")
+        _text(self.owner, "file owner")
+        _text(self.group, "file group")
+        if self.category not in {"static", "runtime"}:
+            raise ValueError("invalid file category")
 
     def source_path(self, package_root: Path) -> Path:
         return package_root / self.source
@@ -76,8 +99,8 @@ class DirectorySpec:
     def __post_init__(self) -> None:
         _target(self.target)
         _mode(self.mode)
-        if not self.owner or not self.group:
-            raise ValueError("directory owner/group must be non-empty")
+        _text(self.owner, "directory owner")
+        _text(self.group, "directory group")
 
     def target_path(self, root: Path = Path("/")) -> Path:
         return _under_root(root, self.target)
@@ -104,8 +127,13 @@ class NamespaceSpec:
     prefixes: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
+        _text(self.name, "namespace name")
         _target(self.path)
-        if not self.name or len(set(self.exact)) != len(self.exact):
+        _tuple(self.exact, "namespace exact")
+        _tuple(self.prefixes, "namespace prefixes")
+        if any(not isinstance(value, str) or not value for value in (*self.exact, *self.prefixes)):
+            raise ValueError("invalid namespace entry")
+        if len(set(self.exact)) != len(self.exact) or len(set(self.prefixes)) != len(self.prefixes):
             raise ValueError("invalid namespace")
 
 
@@ -115,10 +143,14 @@ class RetiredSpec:
     names: tuple[str, ...]
 
     def __post_init__(self) -> None:
+        _tuple(self.paths, "retired paths")
+        _tuple(self.names, "retired names")
         if len(set(self.paths)) != len(self.paths) or len(set(self.names)) != len(self.names):
             raise ValueError("duplicate retired artifact")
         for path in self.paths:
             _target(path)
+        if any(not isinstance(name, str) or not name for name in self.names):
+            raise ValueError("invalid retired name")
 
 
 @dataclass(frozen=True, slots=True)
@@ -130,8 +162,11 @@ class SecretSpec:
     group: str = "root"
 
     def __post_init__(self) -> None:
+        _text(self.name, "secret name")
         _target(self.target)
         _mode(self.mode)
+        _text(self.owner, "secret owner")
+        _text(self.group, "secret group")
 
 
 @dataclass(frozen=True, slots=True)
@@ -141,7 +176,10 @@ class DatabaseSpec:
     read_only: bool = True
 
     def __post_init__(self) -> None:
+        _text(self.name, "database name")
         _target(self.target)
+        if not isinstance(self.read_only, bool):
+            raise ValueError("database read_only must be bool")
 
 
 @dataclass(frozen=True, slots=True)
@@ -154,13 +192,23 @@ class RuntimeManifestSpec:
 
     def __post_init__(self) -> None:
         _target(self.target)
+        _text(self.version, "runtime manifest version")
         _mode(self.mode)
+        _text(self.owner, "runtime manifest owner")
+        _text(self.group, "runtime manifest group")
 
 
 @dataclass(frozen=True, slots=True)
 class RelayModeSpec:
     name: str
     expectations: tuple[tuple[str, bool], ...]
+
+    def __post_init__(self) -> None:
+        _text(self.name, "relay mode name")
+        _tuple(self.expectations, "relay expectations")
+        for item in self.expectations:
+            if not isinstance(item, tuple) or len(item) != 2 or not isinstance(item[0], str) or not item[0] or not isinstance(item[1], bool):
+                raise ValueError("invalid relay expectation")
 
 
 @dataclass(frozen=True, slots=True)
@@ -180,8 +228,26 @@ class DeploymentManifest:
     runtime_support: tuple[FileSpec, ...]
 
     def __post_init__(self) -> None:
+        if isinstance(self.schema_version, bool) or not isinstance(self.schema_version, int):
+            raise ValueError("invalid schema version")
         if self.schema_version != 1:
             raise ValueError("unsupported manifest schema")
+        for value, label in ((self.profiles, "profiles"), (self.files, "files"), (self.directories, "directories"), (self.symlinks, "symlinks"), (self.namespaces, "namespaces"), (self.secrets, "secrets"), (self.databases, "databases"), (self.relay_modes, "relay modes"), (self.runtime_sources, "runtime sources"), (self.runtime_support, "runtime support")):
+            _tuple(value, label)
+        if not all(isinstance(item, ProfileSpec) for item in self.profiles):
+            raise ValueError("profiles must contain ProfileSpec records")
+        if not all(isinstance(item, FileSpec) for item in self.files + self.runtime_support):
+            raise ValueError("files must contain FileSpec records")
+        if not all(isinstance(item, DirectorySpec) for item in self.directories):
+            raise ValueError("directories must contain DirectorySpec records")
+        if not all(isinstance(item, SymlinkSpec) for item in self.symlinks):
+            raise ValueError("symlinks must contain SymlinkSpec records")
+        if not all(isinstance(item, NamespaceSpec) for item in self.namespaces):
+            raise ValueError("namespaces must contain NamespaceSpec records")
+        if not isinstance(self.retired, RetiredSpec) or not isinstance(self.runtime_manifest, RuntimeManifestSpec):
+            raise ValueError("invalid manifest metadata record")
+        if not all(isinstance(item, SecretSpec) for item in self.secrets) or not all(isinstance(item, DatabaseSpec) for item in self.databases) or not all(isinstance(item, RelayModeSpec) for item in self.relay_modes):
+            raise ValueError("invalid manifest metadata records")
         if len({p.id for p in self.profiles}) != len(self.profiles):
             raise ValueError("duplicate profile id")
         if len({f.target for f in self.files}) != len(self.files):
@@ -190,9 +256,22 @@ class DeploymentManifest:
             raise ValueError("duplicate directory target")
         if len({s.target for s in self.symlinks}) != len(self.symlinks):
             raise ValueError("duplicate symlink target")
-        all_targets = {f.target for f in self.files} | {d.target for d in self.directories} | {s.target for s in self.symlinks}
-        if len(all_targets) != len(self.files) + len(self.directories) + len(self.symlinks):
-            raise ValueError("deployment target collision")
+        declarations = [(f.target, "file") for f in self.files] + [(d.target, "directory") for d in self.directories] + [(s.target, "symlink") for s in self.symlinks]
+        runtime_targets = [spec.target for spec in self.runtime_files_for()]
+        declarations.extend((target, "runtime") for target in runtime_targets)
+        for index, (target, kind) in enumerate(declarations):
+            for other, other_kind in declarations[index + 1:]:
+                if target == other:
+                    if {kind, other_kind} <= {"file", "runtime"}:
+                        continue
+                    raise ValueError("deployment target collision")
+                target_path, other_path = Path(target), Path(other)
+                if target_path in other_path.parents or other_path in target_path.parents:
+                    ancestor_kind = kind if target_path in other_path.parents else other_kind
+                    if ancestor_kind != "directory":
+                        raise ValueError("deployment target parent collision")
+                    if _CANONICAL_ALLOWED_DIRECTORY_PARENTS and target not in _CANONICAL_ALLOWED_DIRECTORY_PARENTS and other not in _CANONICAL_ALLOWED_DIRECTORY_PARENTS:
+                        raise ValueError("deployment target parent collision")
         for profile in self.profiles:
             if profile.profile_source != f"config/profiles/{profile.id}.toml":
                 raise ValueError("profile source mismatch")
@@ -341,6 +420,7 @@ _MANIFEST = DeploymentManifest(
     _RUNTIME_SOURCES,
     (FileSpec("pyproject.toml", "/opt/game-control/pyproject.toml", 0o644, category="runtime"), FileSpec("ops/install.py", "/opt/game-control/ops/install.py", 0o755, category="runtime")),
 )
+_CANONICAL_ALLOWED_DIRECTORY_PARENTS = frozenset(directory.target for directory in _MANIFEST.directories)
 
 
 def get_manifest() -> DeploymentManifest:

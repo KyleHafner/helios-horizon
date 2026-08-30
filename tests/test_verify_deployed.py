@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import importlib.util
+import os
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -598,6 +599,30 @@ def test_static_verifier_reports_manifest_file_metadata_drift(tmp_path, capsys):
     assert VERIFY.main(["--root", str(root), "--static"]) == 1
     payload = json.loads(capsys.readouterr().out)
     check = next(item for item in payload["checks"] if item["id"] == "target.files.manifest")
+    assert check["ok"] is False
+
+
+@pytest.mark.parametrize("mutation", ("mode", "owner", "group", "nlink", "symlink", "type"))
+def test_static_verifier_rejects_directory_metadata_drift(tmp_path, capsys, mutation):
+    root = _staged_root(tmp_path)
+    target = root / "etc/game-control/arm"
+    if mutation == "mode":
+        target.chmod(0o755)
+    elif mutation == "owner":
+        os.chown(target, 65534, target.stat().st_gid)
+    elif mutation == "group":
+        os.chown(target, target.stat().st_uid, 65534)
+    elif mutation == "nlink":
+        (target / "unexpected-child").mkdir()
+    elif mutation == "symlink":
+        target.rmdir()
+        target.symlink_to("elsewhere", target_is_directory=True)
+    else:
+        target.rmdir()
+        target.write_text("not a directory", encoding="utf-8")
+    assert VERIFY.main(["--root", str(root), "--static"]) == 1
+    payload = json.loads(capsys.readouterr().out)
+    check = next(item for item in payload["checks"] if item["id"] == "target.directory.etc.game-control.arm")
     assert check["ok"] is False
 
 
