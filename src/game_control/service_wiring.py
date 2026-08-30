@@ -201,11 +201,19 @@ class _StatusFacade:
     def telemetry_health(self) -> dict[str, Any]:
         return self.service.telemetry_health()
 
-    async def benchmark_eligibility(self, *, maintenance_window: bool, rollback_safe: bool, public_wake_policy: str):
+    async def benchmark_eligibility(
+        self,
+        *,
+        maintenance_window: bool,
+        rollback_safe: bool,
+        public_wake_policy: str,
+        snapshot: Any = None,
+    ):
         return await self.service.benchmark_eligibility(
             maintenance_window=maintenance_window,
             rollback_safe=rollback_safe,
             public_wake_policy=public_wake_policy,
+            snapshot=snapshot,
         )
 
 

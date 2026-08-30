@@ -197,9 +197,21 @@ class StatusService:
         )
         return StatusSnapshot(generation=int(generation), observed_at=now, profiles=profiles)
 
-    async def benchmark_eligibility(self, *, maintenance_window: bool, rollback_safe: bool, public_wake_policy: str) -> dict[str, bool]:
+    async def benchmark_eligibility(
+        self,
+        *,
+        maintenance_window: bool,
+        rollback_safe: bool,
+        public_wake_policy: str,
+        snapshot: StatusSnapshot | None = None,
+    ) -> dict[str, bool]:
         """Bounded, secret-free evidence for scheduled benchmark execution."""
-        snapshot = await self.cached_snapshot()
+        # Benchmark safety cannot be satisfied by a stopped projection cached
+        # before a profile starts.  Maintenance already owns a fresh,
+        # non-persisting sample; callers pass it through to avoid a duplicate
+        # sampler probe.  Direct callers force the same non-persisting probe.
+        if snapshot is None:
+            snapshot = await self.snapshot(persist=False, force=True)
         stopped = all(getattr(item.state, "value", item.state) == "stopped" and item.players_online == 0 and item.active_job_id is None for item in snapshot.profiles)
         storage_results = await asyncio.gather(*(self._call(shutil.disk_usage, path) for path in self.storage_paths), return_exceptions=True)
         storage_ok = all(not isinstance(result, BaseException) and result.free >= 5 * 1024**3 for result in storage_results)

@@ -55,7 +55,7 @@ def _summary(path: Path) -> None:
                 "schemaVersion": 2,
                 "driverSha256": "d" * 64,
                 "configSha256": "c" * 64,
-                "presetDigests": {"current": "p" * 64, "candidate": "q" * 64},
+                "presetDigests": {"current": "1" * 64, "candidate": "2" * 64},
                 "presetArgvDigests": {"current": "a" * 64, "candidate": "b" * 64},
                 "statisticsImplementation": {"name": "fixture", "fixtures": "fixture-v1"},
                 "pairPlan": {"minimumCompletePairs": 1, "maximumPairs": 1},
@@ -118,6 +118,26 @@ def _service(tmp_path: Path, runner):
         runner=runner,
     )
     return service, reports
+
+
+def _frozen_provenance() -> dict[str, object]:
+    return {
+        "version": 2,
+        "driverSha256": "d" * 64,
+        "configSha256": "c" * 64,
+        "presetDigests": {"current": "1" * 64, "candidate": "2" * 64},
+        "preflight": {
+            "schemaVersion": 2,
+            "driverSha256": "d" * 64,
+            "configSha256": "c" * 64,
+            "presetDigests": {"current": "1" * 64, "candidate": "2" * 64},
+            "presetArgvDigests": {"current": "a" * 64, "candidate": "b" * 64},
+            "pairPlan": {"minimumCompletePairs": 1, "maximumPairs": 1},
+            "primaryEndpoints": [{"name": "tick.p95Nanos", "effectThreshold": 0.1}],
+            "thresholds": {"tick.p95Nanos": 0.1},
+            "statisticsImplementation": {"name": "fixture", "fixtures": "fixture-v1"},
+        },
+    }
 
 
 def test_process_group_translates_run_capture_output_for_maintenance_popen(monkeypatch):
@@ -241,6 +261,34 @@ async def test_benchmark_service_runs_only_configured_presets_and_persists_safe_
     assert overview.available is True
     assert [preset.id for preset in overview.presets] == ["current", "candidate"]
     assert overview.runs[0].id == "job1"
+
+
+@pytest.mark.parametrize("mutation", [
+    lambda value: value.update(extra="unexpected"),
+    lambda value: value.update(driverSha256="x"),
+    lambda value: value.update(configSha256=None),
+    lambda value: value["presetDigests"].update(other="3" * 64),
+    lambda value: value["preflight"].update(pairPlan={}),
+    lambda value: value["preflight"].update(primaryEndpoints=[{"name": 7}]),
+    lambda value: value["preflight"].update(unexpected=True),
+])
+def test_prepare_frozen_rejects_malformed_provenance_before_running_row_insert(tmp_path: Path, mutation):
+    service, _reports = _service(tmp_path, lambda *_args, **_kwargs: pytest.fail("preflight must not run"))
+    action = RunBenchmark(
+        kind="run_benchmark",
+        profile_id=ProfileId.MINECRAFT_SUNLIT_COBBLEMON,
+        baseline_preset="current",
+        candidate_preset="candidate",
+    )
+    provenance = _frozen_provenance()
+    mutation(provenance)
+
+    with pytest.raises(SafeError, match="benchmark"):
+        service.prepare_frozen(action, "malformed", provenance)
+
+    assert service.database.execute(
+        "SELECT COUNT(*) FROM benchmark_runs WHERE id=?", ("malformed",)
+    ).fetchone() == (0,)
 
 
 @pytest.mark.asyncio

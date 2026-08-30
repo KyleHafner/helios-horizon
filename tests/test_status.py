@@ -1,6 +1,7 @@
 from pathlib import Path
 from types import SimpleNamespace
 import asyncio
+import sqlite3
 import threading
 import time
 
@@ -512,6 +513,46 @@ async def test_cached_snapshot_does_not_resample_the_status_pipeline():
 
     assert cached is fresh
     assert calls == 1
+
+
+@pytest.mark.asyncio
+async def test_benchmark_eligibility_forces_fresh_projection_instead_of_cached_stopped_status(tmp_path):
+    observed = {"running": False}
+    calls = 0
+
+    class Adapter:
+        async def observe(self, _profile):
+            nonlocal calls
+            calls += 1
+            return SimpleNamespace(running=observed["running"], healthy=True)
+
+    class Health:
+        def check(self, *_args, **_kwargs):
+            return SimpleNamespace(process_alive=observed["running"], state="healthy")
+
+    sessions = sqlite3.connect(":memory:")
+    sessions.execute("CREATE TABLE player_sessions (ended_at TEXT)")
+    service = StatusService(
+        [SimpleNamespace(id="minecraft")],
+        adapter=Adapter(),
+        health_checker=Health(),
+        session_store=SimpleNamespace(connection=sessions),
+        ups_health=lambda: True,
+        storage_paths=(str(tmp_path),),
+    )
+
+    cached_stopped = await service.snapshot(persist=False, force=True)
+    assert cached_stopped.profiles[0].state is ObservedState.STOPPED
+    observed["running"] = True
+
+    evidence = await service.benchmark_eligibility(
+        maintenance_window=True,
+        rollback_safe=True,
+        public_wake_policy="safe",
+    )
+
+    assert calls == 2
+    assert evidence["no_conflicting_jobs"] is False
 
 
 @pytest.mark.asyncio

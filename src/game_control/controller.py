@@ -1724,6 +1724,7 @@ class Controller:
                         maintenance_window=policy_entry.maintenance_window,
                         rollback_safe=policy_entry.rollback_safe,
                         public_wake_policy=policy_entry.public_wake_policy,
+                        snapshot=snapshot,
                     )
                     if inspect.isawaitable(evidence):
                         evidence = await evidence

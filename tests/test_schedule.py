@@ -3,15 +3,18 @@ from __future__ import annotations
 from datetime import datetime, timezone
 from types import SimpleNamespace
 from uuid import uuid4
+import asyncio
 import logging
 
 import pytest
 
 from game_control.controller import Controller
-from game_control.models import ProfileId
-from game_control.protocol import ErrorCode, GetSchedules, SetSchedules, StatusSnapshot, RpcRequest
+from game_control.controller import _ControllerFailure
+from game_control.models import OperationName, ProfileId
+from game_control.protocol import ErrorCode, GetSchedules, SetSchedules, Start, StatusSnapshot, RpcRequest
 from game_control.schedule import ScheduleBook, parse_schedule
 from game_control.errors import SafeError
+from game_control.slot import OperationLock, ReservationStore
 
 
 def test_disabled_schedule_is_backward_compatible_and_never_due():
@@ -178,6 +181,87 @@ def test_running_scheduled_backup_is_deferred_durable_and_never_stops(caplog, tm
     assert len(controller._db().execute(
         "SELECT id FROM jobs WHERE operation='scheduled_backup'"
     ).fetchall()) == 2
+
+
+@pytest.mark.asyncio
+async def test_scheduled_backup_lease_fences_direct_runner_and_start_without_side_effects(tmp_path):
+    operation = tmp_path / "operation.lock"
+    operation.touch(mode=0o600)
+    reservation = tmp_path / "reservation.json"
+    store = ReservationStore(operation, reservation)
+    controller = Controller.for_testing(tmp_path)
+    controller.reservation_store = store
+    controller._operation_lock_factory = lambda: OperationLock(operation)
+    controller.profiles = {
+        ProfileId.MINECRAFT: SimpleNamespace(
+            id=ProfileId.MINECRAFT,
+            operations=frozenset({OperationName.BACKUP}),
+        ),
+        ProfileId.PZ_RISING: SimpleNamespace(
+            id=ProfileId.PZ_RISING,
+            operations=frozenset({OperationName.START}),
+            stop_timeout_seconds=5,
+            health_timeout_seconds=5,
+        ),
+    }
+    controller._schedule = ScheduleBook(parse_schedule([
+        {"cron": "* * * * *", "profile": "minecraft", "backup_destination": "local"},
+    ]))
+    entered = asyncio.Event()
+    release = asyncio.Event()
+    backup_calls = []
+    start_calls = []
+
+    async def create(action, lease_check=None):
+        backup_calls.append(action)
+        assert lease_check is not None and lease_check()
+        current = store.read()
+        assert current is not None and current.profile_id is ProfileId.MINECRAFT
+        entered.set()
+        await release.wait()
+        assert lease_check()
+        return SimpleNamespace(job_id="backup", state="succeeded")
+
+    async def start(_profile):
+        start_calls.append("start")
+
+    controller.services = SimpleNamespace(backups=SimpleNamespace(create=create))
+    controller.adapters = {ProfileId.PZ_RISING: SimpleNamespace(start=start)}
+    snapshot = StatusSnapshot(
+        generation=1,
+        observed_at=datetime(2026, 7, 17, 20, 0, tzinfo=timezone.utc),
+        profiles=(),
+    )
+    scheduled = asyncio.create_task(controller._apply_schedules(snapshot, uuid4()))
+    await asyncio.wait_for(entered.wait(), timeout=1)
+
+    current = store.read()
+    assert current is not None and current.profile_id is ProfileId.MINECRAFT
+    with pytest.raises(BlockingIOError):
+        store.reserve_if_available(
+            ProfileId.PZ_RISING, "direct-runner", 30.0,
+            state_generation=current.state_generation,
+        )
+    with pytest.raises(_ControllerFailure) as error:
+        await controller._start(
+            Start(kind="start", profile_id=ProfileId.PZ_RISING),
+            "operator",
+            uuid4(),
+        )
+    assert error.value.code is ErrorCode.SLOT_CONFLICT
+    assert start_calls == []
+    assert backup_calls
+    assert controller._db().execute(
+        "SELECT COUNT(*) FROM jobs WHERE operation='start'"
+    ).fetchone() == (0,)
+
+    release.set()
+    result = await asyncio.wait_for(scheduled, timeout=2)
+    assert result is None
+    assert store.read() is None
+    assert controller._db().execute(
+        "SELECT operation,state FROM jobs WHERE operation='scheduled_backup'"
+    ).fetchone() == ("scheduled_backup", "succeeded")
 
 
 def test_schedule_rejects_non_boolean_enabled():
