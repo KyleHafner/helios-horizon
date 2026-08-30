@@ -10,11 +10,10 @@ from pathlib import Path
 from typing import Any, Awaitable, Callable, Iterable, Mapping
 
 import psutil
-import shutil
 
 from .adapters.base import AdapterError
 from .adapters.crafty import parse_version_text
-from .capability_evidence import WakeSafetyEvidence
+from .benchmark_safety import BenchmarkPreflight
 from .models import HealthState, ObservedState
 from .introspection import signature_parameters
 from .protocol import ProfileStatus, StatusSnapshot
@@ -80,6 +79,7 @@ class StatusService:
         telemetry_sampler: Any | None = None,
         capability_evidence: Callable[[], bool] | None = None,
         ups_health: Callable[[], bool] | None = None,
+        benchmark_safety: BenchmarkPreflight | None = None,
         storage_paths: Iterable[str] = ("/srv/game-servers", "/var/lib/game-control"),
     ):
         self.profiles = tuple(profiles)
@@ -104,6 +104,13 @@ class StatusService:
         self.telemetry_sampler = telemetry_sampler
         self.capability_evidence = capability_evidence
         self.ups_health = ups_health
+        self.benchmark_safety = benchmark_safety or BenchmarkPreflight(
+            storage_paths=tuple(storage_paths),
+            ups_health=ups_health,
+            session_store=session_store,
+            wake_evidence=capability_evidence,
+            clock=self.clock,
+        )
         self.storage_paths = tuple(storage_paths)
         # Production maintenance is fixed at a 30-second target. Keep this
         # contract non-configurable so callers cannot create 60-second aliasing
@@ -213,25 +220,13 @@ class StatusService:
         # sampler probe.  Direct callers force the same non-persisting probe.
         if snapshot is None:
             snapshot = await self.snapshot(persist=False, force=True)
-        stopped = all(getattr(item.state, "value", item.state) == "stopped" and item.players_online == 0 and item.active_job_id is None for item in snapshot.profiles)
-        storage_results = await asyncio.gather(*(self._call(shutil.disk_usage, path) for path in self.storage_paths), return_exceptions=True)
-        storage_ok = all(not isinstance(result, BaseException) and result.free >= 5 * 1024**3 for result in storage_results)
-        ups_ok = bool(self.ups_health and await self._call(self.ups_health))
-        quiet = False
-        connection = getattr(self.session_store, "connection", None)
-        no_wake = False
-        if connection is not None:
-            latest = connection.execute("SELECT ended_at FROM player_sessions WHERE ended_at IS NOT NULL ORDER BY ended_at DESC LIMIT 1").fetchone()
-            quiet = latest is None or datetime.fromisoformat(latest[0].replace("Z", "+00:00")).timestamp() <= self.clock().timestamp() - 900
-            no_wake = connection.execute("SELECT 1 FROM player_sessions WHERE ended_at IS NULL LIMIT 1").fetchone() is None
-        wake_evidence = await self._call(self.capability_evidence) if self.capability_evidence else None
-        wake_clear = (
-            isinstance(wake_evidence, WakeSafetyEvidence)
-            and wake_evidence.available is True
-            and wake_evidence.clear is True
+        evidence = await self.benchmark_safety.evaluate(
+            snapshot=snapshot,
+            maintenance_window=maintenance_window,
+            rollback_safe=rollback_safe,
+            public_wake_policy=public_wake_policy,
         )
-        no_wake = no_wake and wake_clear
-        return {"maintenance_window": maintenance_window, "storage_acceptable": storage_ok, "ups_acceptable": ups_ok, "quiet_period": quiet, "no_wake_session": no_wake, "no_conflicting_jobs": stopped, "rollback_safe_public_wake": rollback_safe and public_wake_policy == "safe"}
+        return evidence.legacy_mapping()
 
     async def _sample(self, *, persist: bool = False) -> StatusSnapshot:
         now = self.clock()

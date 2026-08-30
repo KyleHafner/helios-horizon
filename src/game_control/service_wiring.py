@@ -29,6 +29,7 @@ from uuid import uuid4
 
 from .backups import B2CommandTransport, B2ProtectionService, BackupService, RestoreService
 from .alert_policy import PerformanceAlertEvaluator
+from .benchmark_safety import BenchmarkPreflight, prometheus_ups_provider
 from .benchmarks import BenchmarkService, parse_benchmark_plans
 from .capability_evidence import RootWakeSafetyEvidence
 from .errors import SafeError
@@ -121,43 +122,7 @@ def _close_database(database: Any | None) -> None:
         database.close()
 
 
-def _prometheus_ups_provider(config: Mapping[str, Any] | None) -> Callable[[], bool]:
-    settings = config if isinstance(config, Mapping) else {}
-    origin = settings.get("url")
-    metric = settings.get("metric")
-    try:
-        parsed = urllib.parse.urlsplit(origin)
-        if parsed.scheme not in {"http", "https"} or not parsed.hostname or parsed.username or parsed.password or parsed.query or parsed.fragment or len(origin) > 256 or (parsed.port is not None and not 1 <= parsed.port <= 65535):
-            raise ValueError
-    except (ValueError, TypeError):
-        return lambda: False
-    if not isinstance(metric, str) or not metric or len(metric) > 128:
-        return lambda: False
-    endpoint = origin.rstrip("/") + "/api/v1/query?query=" + urllib.parse.quote(metric, safe="")
-    def check() -> bool:
-        try:
-            request = urllib.request.Request(endpoint, headers={"Accept": "application/json"})
-            class _NoRedirect(urllib.request.HTTPRedirectHandler):
-                def redirect_request(self, *args, **kwargs): return None
-            opener = urllib.request.build_opener(_NoRedirect)
-            with opener.open(request, timeout=1.0) as response:
-                if response.geturl() != endpoint or response.status != 200:
-                    return False
-                body = response.read(128 * 1024 + 1)
-            if len(body) > 128 * 1024:
-                return False
-            payload = json.loads(body)
-            results = payload.get("data", {}).get("result", [])
-            if payload.get("status") != "success" or not isinstance(results, list) or len(results) != 1:
-                return False
-            value = results[0].get("value")
-            if not isinstance(value, list) or len(value) != 2:
-                return False
-            timestamp, state = float(value[0]), float(value[1])
-            return math.isfinite(timestamp) and math.isfinite(state) and abs(time.time() - timestamp) <= 120 and state == 0.0
-        except (OSError, ValueError, TypeError, KeyError, json.JSONDecodeError):
-            return False
-    return check
+_prometheus_ups_provider = prometheus_ups_provider
 
 
 class _StatusFacade:
@@ -1209,6 +1174,7 @@ def _build_service_seams_impl(
     session_store = SessionStore(connection) if connection is not None else None
     root_jobs = RootActiveJobsReader(state_db)
     root_generation = RootGenerationReader(state_db)
+    root_wake = RootWakeSafetyEvidence(root_jobs, reservation_store)
     stats = stats_config if isinstance(stats_config, Mapping) else {}
     tick_profile_id = next(
         (
@@ -1270,8 +1236,14 @@ def _build_service_seams_impl(
         session_store=session_store,
         generation=root_generation,
         telemetry_db=telemetry_db,
-        capability_evidence=RootWakeSafetyEvidence(root_jobs, reservation_store),
+        capability_evidence=root_wake,
         ups_health=_prometheus_ups_provider(stats.get("benchmark_ups")),
+        benchmark_safety=BenchmarkPreflight(
+            storage_paths=("/srv/game-servers", "/var/lib/game-control"),
+            ups_health=_prometheus_ups_provider(stats.get("benchmark_ups")),
+            session_store=session_store,
+            wake_evidence=root_wake,
+        ),
         storage_paths=("/srv/game-servers", "/var/lib/game-control"),
     )
     collector = _BoundTelemetryCollectors(

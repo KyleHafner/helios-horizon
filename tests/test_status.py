@@ -575,7 +575,7 @@ async def test_benchmark_eligibility_rejects_bool_wake_evidence():
     )
     assert rejected["no_wake_session"] is False
 
-    service.capability_evidence = lambda: WakeSafetyEvidence(True, True)
+    service.benchmark_safety.wake_evidence = lambda: WakeSafetyEvidence(True, True)
     accepted = await service.benchmark_eligibility(
         maintenance_window=True,
         rollback_safe=True,
