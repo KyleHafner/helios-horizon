@@ -3,13 +3,18 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import threading
 from pathlib import Path
 from types import SimpleNamespace
+
+import pytest
 
 from game_control import sunlit_promote as MODULE
 
 
 ROOT = Path(__file__).parents[1]
+
+
 def _write_json(path: Path, value: dict) -> None:
     path.write_text(json.dumps(value), encoding="utf-8")
     path.chmod(0o600)
@@ -88,6 +93,94 @@ def test_promotes_exact_inactive_candidate_into_fixed_layout(tmp_path: Path, mon
     assert not (candidate / "runtime").exists()
     assert not (candidate / "state").exists()
     assert MODULE.promote() == report
+
+
+def test_promote_candidate_keeps_contexts_isolated_under_concurrency(tmp_path: Path, monkeypatch) -> None:
+    barrier = threading.Barrier(2)
+    observed: list[MODULE.PromotionContext] = []
+    def fake_promote(context: MODULE.PromotionContext) -> dict:
+        barrier.wait(timeout=2)
+        observed.append(context)
+        return {
+            "active": True,
+            "version": context.version,
+            "manifest_sha256": context.manifest_sha256,
+            "release": str(context.release),
+            "active_link": str(context.active_link),
+        }
+
+    monkeypatch.setattr(MODULE, "_promote", fake_promote)
+    monkeypatch.setattr(MODULE, "RELEASE_ROOT", tmp_path / "releases")
+    monkeypatch.setattr(MODULE, "STATE_ROOT", tmp_path / "state")
+    monkeypatch.setattr(MODULE, "ACTIVE_LINK", tmp_path / "current")
+    monkeypatch.setattr(MODULE, "SLOT", tmp_path / "slot")
+    monkeypatch.setattr(MODULE, "LIBRARIES", tmp_path / "libraries")
+    original = (
+        MODULE.VERSION,
+        MODULE.MANIFEST_SHA256,
+        MODULE.STAGING_ROOT,
+        MODULE.CANDIDATE,
+        MODULE.MANIFEST,
+        MODULE.RELEASE,
+    )
+
+    import concurrent.futures
+
+    calls = (
+        ("v1", tmp_path / "s1/manifest.json", tmp_path / "s1/candidate", "a" * 64),
+        ("v2", tmp_path / "s2/manifest.json", tmp_path / "s2/candidate", "b" * 64),
+    )
+    with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
+        results = list(pool.map(lambda args: MODULE.promote_candidate(
+            version=args[0], manifest=args[1], candidate_root=args[2], manifest_sha256=args[3]
+        ), calls))
+
+    assert [result["version"] for result in results] == ["v1", "v2"]
+    assert [result["manifest_sha256"] for result in results] == ["a" * 64, "b" * 64]
+    assert [result["release"] for result in results] == [str(tmp_path / "releases/v1"), str(tmp_path / "releases/v2")]
+    assert [result["active_link"] for result in results] == [str(tmp_path / "current")] * 2
+    assert {(context.version, context.manifest_sha256, context.candidate) for context in observed} == {
+        ("v1", "a" * 64, tmp_path / "s1/candidate"),
+        ("v2", "b" * 64, tmp_path / "s2/candidate"),
+    }
+    assert (
+        MODULE.VERSION,
+        MODULE.MANIFEST_SHA256,
+        MODULE.STAGING_ROOT,
+        MODULE.CANDIDATE,
+        MODULE.MANIFEST,
+        MODULE.RELEASE,
+    ) == original
+
+
+def test_promote_candidate_exception_does_not_contaminate_repeated_call(tmp_path: Path, monkeypatch) -> None:
+    calls: list[str] = []
+
+    def fake_promote(context: MODULE.PromotionContext) -> dict:
+        calls.append(context.version)
+        if context.version == "bad":
+            raise MODULE.PromotionError("synthetic failure")
+        return {"active": True, "version": context.version, "release": str(context.release)}
+
+    monkeypatch.setattr(MODULE, "_promote", fake_promote)
+    monkeypatch.setattr(MODULE, "RELEASE_ROOT", tmp_path / "releases")
+    with pytest.raises(MODULE.PromotionError):
+        MODULE.promote_candidate(
+            version="bad", manifest=tmp_path / "bad.json", candidate_root=tmp_path / "bad/candidate"
+        )
+    result = MODULE.promote_candidate(
+        version="good", manifest=tmp_path / "good.json", candidate_root=tmp_path / "good/candidate"
+    )
+
+    assert calls == ["bad", "good"]
+    assert result == {"active": True, "version": "good", "release": str(tmp_path / "releases/good")}
+
+
+def test_historical_main_rejects_caller_selected_roots(monkeypatch, tmp_path: Path) -> None:
+    monkeypatch.setattr(MODULE, "MANIFEST", tmp_path / "fixed-manifest.json")
+    monkeypatch.setattr(MODULE, "CANDIDATE", tmp_path / "fixed-candidate")
+    assert MODULE.main(["--candidate-root", str(tmp_path / "other")]) == 2
+    assert MODULE.main(["--manifest", str(tmp_path / "other-manifest.json")]) == 2
 
 
 def test_upgrades_existing_release_without_replacing_stable_state(tmp_path: Path, monkeypatch) -> None:

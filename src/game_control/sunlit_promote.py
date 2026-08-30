@@ -10,6 +10,7 @@ import shutil
 import stat
 import subprocess
 import sys
+from dataclasses import dataclass
 from pathlib import Path
 
 from game_control.modpack_update import AssemblyError, activate_release
@@ -32,6 +33,54 @@ class PromotionError(ValueError):
     pass
 
 
+@dataclass(frozen=True, slots=True)
+class PromotionContext:
+    """Immutable policy and paths for one promotion operation.
+
+    A promotion is also a public in-process API used by the updater.  Keeping
+    its complete path/version identity in a value object prevents concurrent
+    calls from borrowing one another's module state.
+    """
+
+    version: str
+    manifest_sha256: str | None
+    staging_root: Path
+    candidate: Path
+    manifest: Path
+    release_root: Path
+    release: Path
+    state_root: Path
+    active_link: Path
+    slot: Path
+    libraries: Path
+
+
+def _validate_version(version: str) -> str:
+    if not isinstance(version, str) or not version or "/" in version or version in {".", ".."}:
+        raise PromotionError("promotion version is unsafe")
+    return version
+
+
+def _default_context() -> PromotionContext:
+    """Snapshot compatibility defaults without mutating module globals."""
+    version = _validate_version(VERSION)
+    release_root = Path(RELEASE_ROOT)
+    candidate = Path(CANDIDATE)
+    return PromotionContext(
+        version=version,
+        manifest_sha256=MANIFEST_SHA256,
+        staging_root=Path(STAGING_ROOT),
+        candidate=candidate,
+        manifest=Path(MANIFEST),
+        release_root=release_root,
+        release=release_root / version,
+        state_root=Path(STATE_ROOT),
+        active_link=Path(ACTIVE_LINK),
+        slot=Path(SLOT),
+        libraries=Path(LIBRARIES),
+    )
+
+
 def promote_candidate(
     *,
     version: str,
@@ -45,18 +94,23 @@ def promote_candidate(
     updater calls this typed entry point directly, so promotion does not rely
     on an installed checkout helper or a subprocess boundary.
     """
-    global VERSION, MANIFEST, MANIFEST_SHA256, CANDIDATE, STAGING_ROOT, RELEASE
-    previous = VERSION, MANIFEST, MANIFEST_SHA256, CANDIDATE, STAGING_ROOT, RELEASE
-    VERSION = version
-    MANIFEST = Path(manifest)
-    MANIFEST_SHA256 = manifest_sha256
-    CANDIDATE = Path(candidate_root)
-    STAGING_ROOT = CANDIDATE.parent
-    RELEASE = RELEASE_ROOT / VERSION
-    try:
-        return promote()
-    finally:
-        VERSION, MANIFEST, MANIFEST_SHA256, CANDIDATE, STAGING_ROOT, RELEASE = previous
+    version = _validate_version(version)
+    candidate = Path(candidate_root)
+    release_root = Path(RELEASE_ROOT)
+    context = PromotionContext(
+        version=version,
+        manifest_sha256=manifest_sha256,
+        staging_root=candidate.parent,
+        candidate=candidate,
+        manifest=Path(manifest),
+        release_root=release_root,
+        release=release_root / version,
+        state_root=Path(STATE_ROOT),
+        active_link=Path(ACTIVE_LINK),
+        slot=Path(SLOT),
+        libraries=Path(LIBRARIES),
+    )
+    return promote(context)
 
 
 def _fsync_dir(path: Path) -> None:
@@ -92,23 +146,23 @@ def _regular_json(
     return value
 
 
-def _manifest() -> dict:
-    document = _regular_json(MANIFEST, maximum=8 * 1024 * 1024)
+def _manifest(context: PromotionContext) -> dict:
+    document = _regular_json(context.manifest, maximum=8 * 1024 * 1024)
     supplied = document.pop("manifest_sha256", None)
     encoded = json.dumps(document, sort_keys=True, separators=(",", ":"), ensure_ascii=True).encode()
     calculated = hashlib.sha256(encoded).hexdigest()
     document["manifest_sha256"] = supplied
     if (
         supplied != calculated
-        or (MANIFEST_SHA256 is not None and supplied != MANIFEST_SHA256)
+        or (context.manifest_sha256 is not None and supplied != context.manifest_sha256)
         or document.get("profile_id") != "minecraft-sunlit-cobblemon"
-        or document.get("artifact", {}).get("version") != VERSION
+        or document.get("artifact", {}).get("version") != context.version
     ):
         raise PromotionError("promotion manifest identity mismatch")
     return document
 
 
-def _inactive() -> None:
+def _inactive(context: PromotionContext) -> None:
     result = subprocess.run(
         ["/usr/bin/systemctl", "is-active", "minecraft-sunlit-cobblemon.service"],
         check=False,
@@ -116,7 +170,7 @@ def _inactive() -> None:
         stderr=subprocess.DEVNULL,
         text=True,
     )
-    if result.stdout.strip() != "inactive" or SLOT.exists() or SLOT.is_symlink():
+    if result.stdout.strip() != "inactive" or context.slot.exists() or context.slot.is_symlink():
         raise PromotionError("Sunlit is not in the required inactive state")
 
 
@@ -136,7 +190,7 @@ def _trusted_directory(
     return info
 
 
-def _expected_links(document: dict) -> dict[str, str]:
+def _expected_links(document: dict, context: PromotionContext) -> dict[str, str]:
     try:
         policy = document["runtime_policy"]
         state_paths = (
@@ -153,10 +207,10 @@ def _expected_links(document: dict) -> dict[str, str]:
     for relative in state_paths:
         if not isinstance(relative, str) or not relative or "/" in relative or relative in expected:
             raise PromotionError("promotion runtime policy is unsafe")
-        target = STATE_ROOT / (Path(".versions") / VERSION / relative if relative in versioned else relative)
+        target = context.state_root / (Path(".versions") / context.version / relative if relative in versioned else relative)
         expected[relative] = str(target)
     for relative, target in fixed.items():
-        if relative in expected or relative != "libraries" or target != str(LIBRARIES):
+        if relative in expected or relative != "libraries" or target != str(context.libraries):
             raise PromotionError("promotion fixed-link policy is unsafe")
         expected[relative] = target
     return expected
@@ -174,8 +228,8 @@ def _replace_link(path: Path, target: str) -> None:
         temporary.unlink(missing_ok=True)
 
 
-def _bind_candidate_links(runtime: Path, document: dict) -> None:
-    expected = _expected_links(document)
+def _bind_candidate_links(runtime: Path, document: dict, context: PromotionContext) -> None:
+    expected = _expected_links(document, context)
     actual: dict[str, str] = {}
     for path in runtime.rglob("*"):
         if path.is_symlink():
@@ -185,7 +239,7 @@ def _bind_candidate_links(runtime: Path, document: dict) -> None:
             actual[relative] = os.readlink(path)
     if set(actual) != set(expected):
         raise PromotionError("candidate symlink set is not exact")
-    staging_state = str(CANDIDATE / "state")
+    staging_state = str(context.candidate / "state")
     for relative, target in expected.items():
         current = actual[relative]
         if relative == "libraries":
@@ -197,7 +251,7 @@ def _bind_candidate_links(runtime: Path, document: dict) -> None:
             _replace_link(runtime / relative, target)
 
 
-def _write_metadata(state: Path, document: dict) -> None:
+def _write_metadata(state: Path, document: dict, context: PromotionContext) -> None:
     metadata = state / ".horizon"
     if metadata.exists() or metadata.is_symlink():
         if metadata.is_symlink() or not metadata.is_dir():
@@ -208,12 +262,12 @@ def _write_metadata(state: Path, document: dict) -> None:
         metadata.mkdir(mode=0o700)
     manifest_target = metadata / "manifest.json"
     manifest_temporary = metadata / ".manifest.json.promote"
-    shutil.copyfile(MANIFEST, manifest_temporary, follow_symlinks=False)
+    shutil.copyfile(context.manifest, manifest_temporary, follow_symlinks=False)
     os.replace(manifest_temporary, manifest_target)
     os.chmod(manifest_target, 0o600)
     release = {
         "profile_id": "minecraft-sunlit-cobblemon",
-        "version": VERSION,
+        "version": context.version,
         "manifest_sha256": document["manifest_sha256"],
         "archive_sha256": document["artifact"]["archive"]["sha256"],
     }
@@ -317,71 +371,73 @@ def _tree_digest(root: Path, *, include_mode: bool = True) -> str:
     return digest.hexdigest()
 
 
-def _report() -> dict:
+def _report(context: PromotionContext, document: dict | None = None) -> dict:
+    if document is None:
+        document = _manifest(context)
     return {
         "active": True,
         "profile_id": "minecraft-sunlit-cobblemon",
-        "version": VERSION,
-        "manifest_sha256": _manifest()["manifest_sha256"],
-        "release": str(RELEASE),
-        "state": str(STATE_ROOT),
-        "active_link": str(ACTIVE_LINK),
+        "version": context.version,
+        "manifest_sha256": document["manifest_sha256"],
+        "release": str(context.release),
+        "state": str(context.state_root),
+        "active_link": str(context.active_link),
     }
 
 
-def _publish_report() -> dict:
-    report = _report()
-    record = CANDIDATE / "promotion.json"
+def _publish_report(context: PromotionContext, document: dict | None = None) -> dict:
+    report = _report(context, document)
+    record = context.candidate / "promotion.json"
     record.write_text(json.dumps(report, sort_keys=True, separators=(",", ":")) + "\n", encoding="ascii")
     os.chmod(record, 0o600)
     with record.open("rb") as stream:
         os.fsync(stream.fileno())
-    _fsync_dir(CANDIDATE)
+    _fsync_dir(context.candidate)
     return report
 
 
-def _already_promoted(sunlit_owner: tuple[int, int]) -> dict | None:
-    expected_target = os.path.relpath(RELEASE, ACTIVE_LINK.parent)
-    if not ACTIVE_LINK.is_symlink() or os.readlink(ACTIVE_LINK) != expected_target:
+def _already_promoted(context: PromotionContext, document: dict, sunlit_owner: tuple[int, int]) -> dict | None:
+    expected_target = os.path.relpath(context.release, context.active_link.parent)
+    if not context.active_link.is_symlink() or os.readlink(context.active_link) != expected_target:
         return None
-    if (CANDIDATE / "runtime").exists() or (CANDIDATE / "runtime").is_symlink() or (CANDIDATE / "state").exists() or (CANDIDATE / "state").is_symlink():
+    if (context.candidate / "runtime").exists() or (context.candidate / "runtime").is_symlink() or (context.candidate / "state").exists() or (context.candidate / "state").is_symlink():
         raise PromotionError("active promotion retained candidate payload")
-    _trusted_directory(RELEASE)
-    _trusted_directory(STATE_ROOT, owners=(sunlit_owner,))
-    record_path = CANDIDATE / "promotion.json"
+    _trusted_directory(context.release)
+    _trusted_directory(context.state_root, owners=(sunlit_owner,))
+    record_path = context.candidate / "promotion.json"
     if not record_path.exists() and not record_path.is_symlink():
-        return _publish_report()
+        return _publish_report(context, document)
     record = _regular_json(record_path, maximum=64 * 1024)
-    if record != _report():
+    if record != _report(context, document):
         raise PromotionError("active promotion record mismatch")
     return record
 
 
-def _resume_published_release(runtime: Path, document: dict, sunlit_owner: tuple[int, int]) -> dict | None:
+def _resume_published_release(context: PromotionContext, runtime: Path, document: dict, sunlit_owner: tuple[int, int]) -> dict | None:
     if not (
-        RELEASE.is_dir()
-        and not RELEASE.is_symlink()
-        and STATE_ROOT.is_dir()
-        and not STATE_ROOT.is_symlink()
+        context.release.is_dir()
+        and not context.release.is_symlink()
+        and context.state_root.is_dir()
+        and not context.state_root.is_symlink()
         and runtime.is_dir()
         and not runtime.is_symlink()
-        and not (CANDIDATE / "state").exists()
-        and not ACTIVE_LINK.exists()
-        and not ACTIVE_LINK.is_symlink()
+        and not (context.candidate / "state").exists()
+        and not context.active_link.exists()
+        and not context.active_link.is_symlink()
     ):
         return None
-    _trusted_directory(STATE_ROOT, owners=(sunlit_owner,))
-    _verify_release_ownership(RELEASE)
-    _bind_candidate_links(runtime, document)
-    if _tree_digest(runtime) != _tree_digest(RELEASE):
+    _trusted_directory(context.state_root, owners=(sunlit_owner,))
+    _verify_release_ownership(context.release)
+    _bind_candidate_links(runtime, document, context)
+    if _tree_digest(runtime) != _tree_digest(context.release):
         raise PromotionError("published release does not match the reviewed candidate")
-    activate_release(ACTIVE_LINK, RELEASE_ROOT, RELEASE, expected_prior=None)
+    activate_release(context.active_link, context.release_root, context.release, expected_prior=None)
     shutil.rmtree(runtime)
-    _fsync_dir(CANDIDATE)
-    return _publish_report()
+    _fsync_dir(context.candidate)
+    return _publish_report(context, document)
 
 
-def _candidate_matches_existing_state(state: Path, document: dict) -> Path:
+def _candidate_matches_existing_state(context: PromotionContext, state: Path, document: dict) -> Path:
     """Prove the staged copy did not alter stable state; return only new version state."""
     try:
         policy = document["runtime_policy"]
@@ -391,7 +447,7 @@ def _candidate_matches_existing_state(state: Path, document: dict) -> Path:
     expected_top = {
         Path(relative).parts[0]
         for relative in stable
-        if (STATE_ROOT / relative).exists()
+        if (context.state_root / relative).exists()
     } | {".versions"}
     actual_top = {path.name for path in state.iterdir()}
     if actual_top != expected_top:
@@ -400,7 +456,7 @@ def _candidate_matches_existing_state(state: Path, document: dict) -> Path:
         if not isinstance(relative, str) or not relative or "/" in relative:
             raise PromotionError("promotion runtime policy is unsafe")
         candidate_path = state / relative
-        current_path = STATE_ROOT / relative
+        current_path = context.state_root / relative
         if candidate_path.exists() != current_path.exists():
             raise PromotionError("candidate stable state is incomplete")
         if not candidate_path.exists():
@@ -417,13 +473,13 @@ def _candidate_matches_existing_state(state: Path, document: dict) -> Path:
     if candidate_versions.is_symlink() or not candidate_versions.is_dir():
         raise PromotionError("candidate version state is unsafe")
     members = list(candidate_versions.iterdir())
-    if len(members) != 1 or members[0].name != VERSION or members[0].is_symlink() or not members[0].is_dir():
+    if len(members) != 1 or members[0].name != context.version or members[0].is_symlink() or not members[0].is_dir():
         raise PromotionError("candidate version state is not exact")
     return members[0]
 
 
-def _metadata_backup(sunlit_owner: tuple[int, int]) -> dict[str, tuple[bytes, int, int, int] | None]:
-    metadata = STATE_ROOT / ".horizon"
+def _metadata_backup(context: PromotionContext, sunlit_owner: tuple[int, int]) -> dict[str, tuple[bytes, int, int, int] | None]:
+    metadata = context.state_root / ".horizon"
     if metadata.exists() or metadata.is_symlink():
         _trusted_directory(metadata, owners=((0, 0), sunlit_owner))
     result: dict[str, tuple[bytes, int, int, int] | None] = {}
@@ -438,8 +494,8 @@ def _metadata_backup(sunlit_owner: tuple[int, int]) -> dict[str, tuple[bytes, in
     return result
 
 
-def _restore_metadata(backup: dict[str, tuple[bytes, int, int, int] | None]) -> None:
-    metadata = STATE_ROOT / ".horizon"
+def _restore_metadata(context: PromotionContext, backup: dict[str, tuple[bytes, int, int, int] | None]) -> None:
+    metadata = context.state_root / ".horizon"
     metadata.mkdir(mode=0o700, exist_ok=True)
     for name, value in backup.items():
         path = metadata / name
@@ -454,28 +510,28 @@ def _restore_metadata(backup: dict[str, tuple[bytes, int, int, int] | None]) -> 
     _fsync_dir(metadata)
 
 
-def _promote_upgrade(runtime: Path, state: Path, document: dict, sunlit_owner: tuple[int, int]) -> dict:
-    _trusted_directory(STATE_ROOT, owners=(sunlit_owner,))
-    if not ACTIVE_LINK.is_symlink() or RELEASE.exists() or RELEASE.is_symlink():
+def _promote_upgrade(context: PromotionContext, runtime: Path, state: Path, document: dict, sunlit_owner: tuple[int, int]) -> dict:
+    _trusted_directory(context.state_root, owners=(sunlit_owner,))
+    if not context.active_link.is_symlink() or context.release.exists() or context.release.is_symlink():
         raise PromotionError("existing deployment is not eligible for an upgrade")
-    prior_target = os.readlink(ACTIVE_LINK)
-    prior_release = (ACTIVE_LINK.parent / prior_target).resolve()
-    release_root = RELEASE_ROOT.resolve()
+    prior_target = os.readlink(context.active_link)
+    prior_release = (context.active_link.parent / prior_target).resolve()
+    release_root = context.release_root.resolve()
     if prior_release.parent != release_root or prior_release.is_symlink() or not prior_release.is_dir():
         raise PromotionError("active release target is unsafe")
-    version_state = _candidate_matches_existing_state(state, document)
-    versions_root = STATE_ROOT / ".versions"
+    version_state = _candidate_matches_existing_state(context, state, document)
+    versions_root = context.state_root / ".versions"
     _trusted_directory(versions_root, owners=(sunlit_owner,))
-    production_version_state = versions_root / VERSION
+    production_version_state = versions_root / context.version
     if production_version_state.exists() or production_version_state.is_symlink():
         raise PromotionError("production version state already exists")
     if version_state.stat().st_dev != versions_root.stat().st_dev:
         raise PromotionError("version state promotion requires one filesystem")
-    _bind_candidate_links(runtime, document)
+    _bind_candidate_links(runtime, document, context)
     _normalize_release_permissions(runtime)
     _verify_release_ownership(runtime)
-    metadata_backup = _metadata_backup(sunlit_owner)
-    release_stage = RELEASE_ROOT / f".{VERSION}.promote.{os.getpid()}"
+    metadata_backup = _metadata_backup(context, sunlit_owner)
+    release_stage = context.release_root / f".{context.version}.promote.{os.getpid()}"
     release_published = False
     version_state_moved = False
     activated = False
@@ -485,117 +541,124 @@ def _promote_upgrade(runtime: Path, state: Path, document: dict, sunlit_owner: t
         shutil.copytree(runtime, release_stage, symlinks=True)
         _verify_release_ownership(release_stage)
         _fsync_tree(release_stage)
-        os.replace(release_stage, RELEASE)
+        os.replace(release_stage, context.release)
         release_published = True
-        _fsync_dir(RELEASE_ROOT)
+        _fsync_dir(context.release_root)
         os.replace(version_state, production_version_state)
         version_state_moved = True
         _prepare_state_ownership(production_version_state)
         _fsync_dir(versions_root)
-        _write_metadata(STATE_ROOT, document)
-        _prepare_state_ownership(STATE_ROOT / ".horizon")
-        activate_release(ACTIVE_LINK, RELEASE_ROOT, RELEASE, expected_prior=prior_target)
+        _write_metadata(context.state_root, document, context)
+        _prepare_state_ownership(context.state_root / ".horizon")
+        activate_release(context.active_link, context.release_root, context.release, expected_prior=prior_target)
         activated = True
     except BaseException:
-        if activated and ACTIVE_LINK.is_symlink():
-            activate_release(ACTIVE_LINK, RELEASE_ROOT, prior_release, expected_prior=os.readlink(ACTIVE_LINK))
-        _restore_metadata(metadata_backup)
+        if activated and context.active_link.is_symlink():
+            activate_release(context.active_link, context.release_root, prior_release, expected_prior=os.readlink(context.active_link))
+        _restore_metadata(context, metadata_backup)
         if version_state_moved and production_version_state.exists() and not version_state.exists():
             os.replace(production_version_state, version_state)
-        if release_published and RELEASE.exists():
-            shutil.rmtree(RELEASE)
+        if release_published and context.release.exists():
+            shutil.rmtree(context.release)
         if release_stage.exists():
             shutil.rmtree(release_stage)
         raise
     shutil.rmtree(runtime)
     shutil.rmtree(state)
-    _fsync_dir(CANDIDATE)
-    return _publish_report()
+    _fsync_dir(context.candidate)
+    return _publish_report(context, document)
 
 
-def promote() -> dict:
+def _promote(context: PromotionContext) -> dict:
     if os.geteuid() != 0:
         raise PromotionError("promotion requires root")
-    _inactive()
-    document = _manifest()
-    _trusted_directory(CANDIDATE)
-    candidate = _regular_json(CANDIDATE / "candidate.json", maximum=64 * 1024)
-    if candidate.get("active") is not False or candidate.get("version") != VERSION or candidate.get("manifest_sha256") != document["manifest_sha256"]:
+    _inactive(context)
+    document = _manifest(context)
+    _trusted_directory(context.candidate)
+    candidate = _regular_json(context.candidate / "candidate.json", maximum=64 * 1024)
+    if candidate.get("active") is not False or candidate.get("version") != context.version or candidate.get("manifest_sha256") != document["manifest_sha256"]:
         raise PromotionError("candidate record identity mismatch")
-    _trusted_directory(RELEASE_ROOT)
-    _trusted_directory(STATE_ROOT.parent)
-    _trusted_directory(ACTIVE_LINK.parent)
+    _trusted_directory(context.release_root)
+    _trusted_directory(context.state_root.parent)
+    _trusted_directory(context.active_link.parent)
     sunlit_owner = _sunlit_ids()
-    completed = _already_promoted(sunlit_owner)
+    completed = _already_promoted(context, document, sunlit_owner)
     if completed is not None:
         return completed
-    runtime = CANDIDATE / "runtime"
-    state = CANDIDATE / "state"
+    runtime = context.candidate / "runtime"
+    state = context.candidate / "state"
     _trusted_directory(runtime)
     _trusted_directory(state, owners=((0, 0), sunlit_owner))
-    resumed = _resume_published_release(runtime, document, sunlit_owner)
+    resumed = _resume_published_release(context, runtime, document, sunlit_owner)
     if resumed is not None:
         return resumed
-    if STATE_ROOT.exists() and ACTIVE_LINK.is_symlink():
-        return _promote_upgrade(runtime, state, document, sunlit_owner)
-    if any(path.exists() or path.is_symlink() for path in (RELEASE, STATE_ROOT, ACTIVE_LINK)):
+    if context.state_root.exists() and context.active_link.is_symlink():
+        return _promote_upgrade(context, runtime, state, document, sunlit_owner)
+    if any(path.exists() or path.is_symlink() for path in (context.release, context.state_root, context.active_link)):
         raise PromotionError("production candidate destination already exists")
-    if state.stat().st_dev != STATE_ROOT.parent.stat().st_dev:
+    if state.stat().st_dev != context.state_root.parent.stat().st_dev:
         raise PromotionError("state promotion requires one filesystem")
-    _bind_candidate_links(runtime, document)
+    _bind_candidate_links(runtime, document, context)
     _normalize_release_permissions(runtime)
-    _write_metadata(state, document)
+    _write_metadata(state, document, context)
     _prepare_state_ownership(state)
     _verify_release_ownership(runtime)
     state_moved = False
     release_published = False
-    release_stage = RELEASE_ROOT / f".{VERSION}.promote.{os.getpid()}"
+    release_stage = context.release_root / f".{context.version}.promote.{os.getpid()}"
     if release_stage.exists() or release_stage.is_symlink():
         raise PromotionError("release staging path already exists")
     try:
-        os.replace(state, STATE_ROOT)
+        os.replace(state, context.state_root)
         state_moved = True
-        _fsync_dir(STATE_ROOT.parent)
+        _fsync_dir(context.state_root.parent)
         shutil.copytree(runtime, release_stage, symlinks=True)
         _verify_release_ownership(release_stage)
         _fsync_tree(release_stage)
-        os.replace(release_stage, RELEASE)
+        os.replace(release_stage, context.release)
         release_published = True
-        _fsync_dir(RELEASE_ROOT)
-        activate_release(ACTIVE_LINK, RELEASE_ROOT, RELEASE, expected_prior=None)
+        _fsync_dir(context.release_root)
+        activate_release(context.active_link, context.release_root, context.release, expected_prior=None)
     except BaseException:
-        if ACTIVE_LINK.is_symlink():
-            ACTIVE_LINK.unlink(missing_ok=True)
-        if release_published and RELEASE.exists():
-            shutil.rmtree(RELEASE)
+        if context.active_link.is_symlink():
+            context.active_link.unlink(missing_ok=True)
+        if release_published and context.release.exists():
+            shutil.rmtree(context.release)
         if release_stage.exists():
             shutil.rmtree(release_stage)
-        if state_moved and STATE_ROOT.exists() and not state.exists():
-            os.replace(STATE_ROOT, state)
+        if state_moved and context.state_root.exists() and not state.exists():
+            os.replace(context.state_root, state)
         raise
     shutil.rmtree(runtime)
-    _fsync_dir(CANDIDATE)
-    return _publish_report()
+    _fsync_dir(context.candidate)
+    return _publish_report(context, document)
+
+
+def promote(context: PromotionContext | None = None) -> dict:
+    """Promote one candidate; compatibility callers get a fresh default context."""
+    return _promote(_default_context() if context is None else context)
 
 
 def main(argv: list[str] | None = None) -> int:
-    global VERSION, MANIFEST, MANIFEST_SHA256, CANDIDATE, STAGING_ROOT, RELEASE
     parser = argparse.ArgumentParser()
     parser.add_argument("--version", default=VERSION)
     parser.add_argument("--manifest", type=Path, default=MANIFEST)
     parser.add_argument("--candidate-root", type=Path, default=CANDIDATE)
     parser.add_argument("--manifest-sha256")
     args = parser.parse_args(argv)
-    if not args.version or "/" in args.version or args.version in {".", ".."}:
+    # These source-only compatibility names are historical fixed-policy front
+    # doors.  The normal updater uses promote_candidate() and may supply its
+    # reviewed staging root; this CLI must never turn arbitrary caller paths
+    # into a promotion authority.
+    if (
+        args.version != VERSION
+        or args.manifest != Path(MANIFEST)
+        or args.candidate_root != Path(CANDIDATE)
+        or (args.manifest_sha256 is not None and args.manifest_sha256 != MANIFEST_SHA256)
+    ):
         return 2
-    VERSION = args.version
-    MANIFEST = args.manifest
-    CANDIDATE = args.candidate_root
-    STAGING_ROOT = CANDIDATE.parent
-    RELEASE = RELEASE_ROOT / VERSION
-    MANIFEST_SHA256 = args.manifest_sha256
     try:
-        print(json.dumps(promote(), sort_keys=True))
+        print(json.dumps(promote(_default_context()), sort_keys=True))
     except (AssemblyError, OSError, PromotionError, KeyError, TypeError, ValueError) as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 2
