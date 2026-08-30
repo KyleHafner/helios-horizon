@@ -1,15 +1,16 @@
 from pathlib import Path
 import os
 import stat
+from datetime import datetime, timezone
 from types import SimpleNamespace
 from uuid import uuid4
 
 import pytest
 
-from game_control.models import ProfileId
+from game_control.models import HealthState, ObservedState, ProfileId
 from game_control.profile_config import ConfigValidationError, get_profile_config, set_profile_config
 from game_control.controller import Controller
-from game_control.protocol import GetProfileConfig, RpcRequest, RpcSuccess, SetProfileConfig
+from game_control.protocol import GetProfileConfig, ProfileStatus, RpcRequest, RpcSuccess, SetProfileConfig, StatusSnapshot
 
 
 def profile(tmp_path: Path, profile_id: ProfileId):
@@ -100,6 +101,17 @@ async def test_controller_config_rpc_audits_and_reports_restart(tmp_path: Path):
     item = profile(tmp_path, ProfileId.MINECRAFT)
     controller = Controller.for_testing(tmp_path)
     controller.profiles = {ProfileId.MINECRAFT: item}
+    controller.services = SimpleNamespace(status=SimpleNamespace(snapshot=lambda *_args, **_kwargs: StatusSnapshot(
+        generation=0,
+        observed_at=datetime.now(timezone.utc),
+        profiles=(ProfileStatus(
+            profile_id=ProfileId.MINECRAFT, state=ObservedState.STOPPED,
+            health=HealthState.UNKNOWN, slot_owner=None, active_job_id=None,
+            pid=None, started_at=None, uptime_seconds=None, cpu_percent=None,
+            rss_bytes=None, players_online=0, installed_version=None,
+            restart_required=False, required_ports_ready=False,
+        ),),
+    )))
 
     response = await controller.execute(RpcRequest(request_id=uuid4(), actor="operator", action=SetProfileConfig(kind="set_profile_config", profile_id=ProfileId.MINECRAFT, changes={"motd": "After"})))
 

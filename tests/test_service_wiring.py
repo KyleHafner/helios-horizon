@@ -80,7 +80,7 @@ async def test_status_facade_coalesces_demand_but_forces_maintenance_refresh():
 
     service = StatusService([SimpleNamespace(id="minecraft")], adapter=Adapter())
     facade = _StatusFacade(service)
-    action = GetStatus(kind="get_status", refresh=True)
+    action = GetStatus(kind="get_status")
 
     first, second = await asyncio.gather(
         facade.snapshot(action), facade.snapshot(action)
@@ -88,9 +88,13 @@ async def test_status_facade_coalesces_demand_but_forces_maintenance_refresh():
     assert first is second
     assert calls == ["observe"]
 
-    forced = await facade.snapshot(action, maintenance=True)
+    forced = await facade.snapshot(GetStatus(kind="get_status", refresh=True))
     assert forced is not first
     assert calls == ["observe", "observe"]
+
+    maintenance = await facade.snapshot(action, maintenance=True)
+    assert maintenance is not forced
+    assert calls == ["observe", "observe", "observe"]
 
 
 def _profile(profile_id: ProfileId, adapter: AdapterKind):

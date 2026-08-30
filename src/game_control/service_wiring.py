@@ -190,7 +190,10 @@ class _StatusFacade:
         # The dedicated slotd sampler owns the 5-second persistence cadence.
         # Maintenance still needs a fresh projection for controller decisions,
         # but must never become a second telemetry writer.
-        return await self.service.snapshot(persist=False, force=maintenance)
+        return await self.service.snapshot(
+            persist=False,
+            force=bool(maintenance or getattr(action, "refresh", False)),
+        )
 
     async def cached_snapshot(self, action: Any = None, actor: str | None = None, request_id: Any = None):
         return await self.service.cached_snapshot()

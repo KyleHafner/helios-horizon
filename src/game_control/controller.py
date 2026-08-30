@@ -2204,10 +2204,14 @@ class Controller:
         async with self._operation_lease(profile, "set_profile_config", request_id, actor=actor) as (_lease, renewal):
             status_service = getattr(self.services, "status", None)
             if status_service is not None:
-                snapshot = status_service.cached_snapshot()
-                if inspect.isawaitable(snapshot):
-                    snapshot = await snapshot
+                snapshot = await self._authoritative_status_snapshot(actor, request_id)
                 current = next((item for item in snapshot.profiles if item.profile_id == profile.id), None)
+                if current is None:
+                    raise _ControllerFailure(
+                        ErrorCode.HEALTH_FAILED,
+                        "profile status is unavailable",
+                        retryable=True,
+                    )
                 state = getattr(getattr(current, "state", None), "value", getattr(current, "state", None))
                 if state in {"starting", "stopping"}:
                     raise _ControllerFailure(ErrorCode.INVALID_STATE, "profile config cannot change while the profile is transitioning")
@@ -2231,6 +2235,38 @@ class Controller:
             await self._record_event(profile.id, "config_changed", f"config changed: {', '.join(changed) or 'no changes'}")
             await self._record_audit(actor, "set_profile_config", profile.id, "succeeded", None, f"changed keys: {', '.join(changed) or 'none'}; restart required: {', '.join(restart_required) or 'none'}")
             return ProfileConfigResponse(profile_id=profile.id, settings=settings, changed=changed, restart_required=restart_required)
+
+    async def _authoritative_status_snapshot(self, actor: str, request_id: UUID) -> StatusSnapshot:
+        """Read a fresh status projection for a safety decision."""
+        service_group = getattr(self.services, "status", None)
+        snapshot_method = getattr(service_group, "snapshot", None)
+        if snapshot_method is None:
+            raise _ControllerFailure(ErrorCode.HEALTH_FAILED, "status is unavailable", retryable=True)
+        action = GetStatus(kind="get_status", refresh=True)
+        try:
+            parameters = signature_parameters(snapshot_method)
+        except (TypeError, ValueError):
+            parameters = ()
+        supports_maintenance = any(
+            parameter.kind is inspect.Parameter.VAR_KEYWORD or parameter.name == "maintenance"
+            for parameter in parameters
+        )
+        try:
+            if not parameters:
+                fresh = snapshot_method()
+            elif supports_maintenance:
+                fresh = snapshot_method(action, actor, request_id, maintenance=True)
+            elif len(parameters) == 1:
+                fresh = snapshot_method(action)
+            else:
+                fresh = snapshot_method(action, actor, request_id)
+            if inspect.isawaitable(fresh):
+                fresh = await fresh
+        except Exception as exc:
+            raise _ControllerFailure(ErrorCode.HEALTH_FAILED, "status is unavailable", retryable=True) from exc
+        if not isinstance(fresh, StatusSnapshot):
+            raise _ControllerFailure(ErrorCode.HEALTH_FAILED, "status is unavailable", retryable=True)
+        return fresh
 
     def _schedule_response(self) -> ScheduleResponse:
         now = self._clock()
