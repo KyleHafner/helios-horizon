@@ -81,7 +81,7 @@ class PerformanceTracker:
             raise ValueError("performance ring bound out of range")
         self.cycle = _Window(maxlen=maxlen)
         self.rpc = _Window(maxlen=maxlen)
-        # Keep the response bounded. The Phase2 collector uses the monotonic
+        # Keep the response bounded. The performance collector uses the monotonic
         # sequence below to consume unseen values and rejects an overwrite.
         self.event_loop_lag = _Window(maxlen=maxlen)
         self.maintenance = _Window(maxlen=maxlen)

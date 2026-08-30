@@ -74,7 +74,7 @@ def _secure_db_path(path: Path) -> None:
 
 def validate_slice_policy(horizon: str, maintenance: str, games_slice: str, sunlit_service: str) -> None:
     if "MemoryHigh=1G" not in horizon or "MemoryMax=2G" not in horizon:
-        raise ManagedTuningError("Phase 4 slice ceilings are not the approved bounded policy")
+        raise ManagedTuningError("slice ceilings are not the approved bounded policy")
     if "MemoryHigh=2G" not in maintenance or "MemoryMax=3G" not in maintenance:
         raise ManagedTuningError("maintenance.slice policy is not the approved 2G/3G ceiling")
     if "MemoryHigh=9G" not in games_slice or "MemoryMax=10G" not in games_slice:
@@ -206,11 +206,11 @@ def activate_managed_argfile(
     candidate_preset: str | None = None,
     rollback_path: Path | None = None,
 ) -> ManagedJvmArgfile:
-    """Atomically activate only an accepted Phase 3 campaign's generated args."""
+    """Atomically activate only an accepted tuning campaign's generated args."""
     verdict = campaign.get("overallVerdict")
     required = ("profileId", "baselinePreset", "candidatePreset", "driverSha256", "configSha256")
     if verdict != "better" or campaign.get("schemaVersion") not in {2, "2"} or any(not campaign.get(key) for key in required):
-        raise ManagedTuningError("managed tuning requires an accepted Phase 3 campaign")
+        raise ManagedTuningError("managed tuning requires an accepted tuning campaign")
     if campaign.get("profileId") != profile_id or (baseline_preset is not None and campaign.get("baselinePreset") != baseline_preset) or (candidate_preset is not None and campaign.get("candidatePreset") != candidate_preset):
         raise ManagedTuningError("campaign profile or preset provenance mismatch")
     digest = _campaign_digest(campaign)

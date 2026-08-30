@@ -1,29 +1,22 @@
-# Retained SwagBench history import
+# Historical SwagBench history-import design
 
-`horizon-benchmark-import` imports one reviewed campaign envelope into the
-`benchmark_runs` table. It is an operator-run, maintenance-window operation:
-the controller/UI services must be stopped or prevented from writing while the
-import transaction runs. It does not restart services.
+This page records an unsupported design explored for importing one reviewed
+campaign envelope into the `benchmark_runs` table. Horizon does not ship or
+install a SwagBench history importer, and there is no supported command or
+operator procedure for performing this import.
 
-The input has exactly these keys: `schemaVersion`, `campaignId`, `profileId`,
-`baselinePreset`, `candidatePreset`, `createdAt`, `finishedAt`,
-`overallVerdict`, and `summary`. Only the retained
+The proposed envelope had exactly these keys: `schemaVersion`, `campaignId`,
+`profileId`, `baselinePreset`, `candidatePreset`, `createdAt`, `finishedAt`,
+`overallVerdict`, and `summary`. The design limited imports to the retained
 `minecraft-sunlit-cobblemon` campaign, `current`/`balanced-g1` presets, and
-safe summary schema version 1 are accepted. Report paths, individual logs, JVM
-arguments, seeds, player identities, and arbitrary extra fields are rejected.
+safe summary schema version 1. Report paths, individual logs, JVM arguments,
+seeds, player identities, and arbitrary extra fields were excluded.
 
-The database and envelope paths must be absolute regular non-symlink files. The
-tool validates the exact Horizon schema, writes `artifact_path` and
-`error_code` as NULL, and uses `swagbench-import-<campaignId>` as a deterministic
-ID. Re-running the identical envelope returns `already_present`; changed data
-for an existing campaign ID fails closed.
+The unimplemented design also required absolute regular non-symlink database
+and envelope paths, exact Horizon schema validation, deterministic IDs, and
+idempotent replay. It retained only a bounded summary while leaving full
+reports and logs protected.
 
-After staging the reviewed envelope and stopping the two Horizon control
-services, run:
-
-```text
-/usr/local/libexec/horizon-benchmark-import --input /absolute/campaign.json --database /absolute/state.db
-```
-
-The tool registers only the bounded summary; full reports and logs remain
-protected and are never copied or exposed through Horizon.
+Any future importer requires a separately approved offline-tool and schema
+plan, implementation, adversarial review, packaging proof, and maintenance
+procedure. This historical note is not execution guidance.
