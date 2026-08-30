@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 from dataclasses import dataclass
 import ipaddress
+import os
 from pathlib import Path, PurePosixPath
 import re
 import stat
@@ -49,7 +50,7 @@ IPV4_CANDIDATE = re.compile(r"(?<![0-9])(?:[0-9]{1,3}[.]){3}[0-9]{1,3}(?![0-9])"
 PRIVATE_DNS = re.compile(
     r"(?<![A-Za-z0-9_.-])[A-Za-z0-9](?:[A-Za-z0-9-]{0,62}[A-Za-z0-9])?"
     r"(?:[.][A-Za-z0-9](?:[A-Za-z0-9-]{0,62}[A-Za-z0-9])?)*"
-    r"[.](?:local|lan|internal|home)(?![A-Za-z0-9_.-])",
+    r"[.](?:local|lan|internal|home)(?:[.](?![A-Za-z0-9-]))?(?![A-Za-z0-9_.-])",
     re.IGNORECASE,
 )
 ABSOLUTE_PATH = re.compile(r"(?<![A-Za-z0-9_.:/-])/(?:[A-Za-z0-9_.~!$&'()*+,;=:@%+-]+/?)+")
@@ -147,6 +148,62 @@ def _is_example_surface(relative: str) -> bool:
     return relative.startswith("config/examples/") or relative.startswith("deploy/example/")
 
 
+def _file_identity(metadata: os.stat_result) -> tuple[int, int, int, int, int, int]:
+    return (
+        metadata.st_dev,
+        metadata.st_ino,
+        stat.S_IFMT(metadata.st_mode),
+        metadata.st_size,
+        metadata.st_mtime_ns,
+        metadata.st_ctime_ns,
+    )
+
+
+def _read_tracked_text(path: Path, relative: str, expected: os.stat_result) -> str:
+    no_follow = getattr(os, "O_NOFOLLOW", None)
+    if no_follow is None:
+        raise ScanError("no-follow-open-unavailable")
+    try:
+        descriptor = os.open(path, os.O_RDONLY | os.O_CLOEXEC | no_follow)
+    except OSError as exc:
+        raise ScanError(f"tracked-text-unreadable:{relative}") from exc
+    try:
+        opened = os.fstat(descriptor)
+        if not stat.S_ISREG(opened.st_mode) or _file_identity(opened) != _file_identity(expected):
+            raise ScanError(f"tracked-file-changed:{relative}")
+        if opened.st_size > MAX_TEXT_FILE_BYTES:
+            raise ScanError(f"tracked-text-too-large:{relative}")
+        remaining = opened.st_size
+        chunks: list[bytes] = []
+        while remaining:
+            chunk = os.read(descriptor, min(remaining, 128 * 1024))
+            if not chunk:
+                raise ScanError(f"tracked-file-changed:{relative}")
+            chunks.append(chunk)
+            remaining -= len(chunk)
+        if os.read(descriptor, 1):
+            raise ScanError(f"tracked-file-changed:{relative}")
+        final_descriptor = os.fstat(descriptor)
+        try:
+            final_path = path.lstat()
+        except OSError as exc:
+            raise ScanError(f"tracked-file-changed:{relative}") from exc
+        expected_identity = _file_identity(expected)
+        if (
+            _file_identity(final_descriptor) != expected_identity
+            or _file_identity(final_path) != expected_identity
+        ):
+            raise ScanError(f"tracked-file-changed:{relative}")
+    except OSError as exc:
+        raise ScanError(f"tracked-text-unreadable:{relative}") from exc
+    finally:
+        os.close(descriptor)
+    try:
+        return b"".join(chunks).decode("utf-8", errors="strict")
+    except UnicodeDecodeError as exc:
+        raise ScanError(f"tracked-text-unreadable:{relative}") from exc
+
+
 def _allowed_example_path(value: str) -> bool:
     if "\\" in value or "//" in value:
         return False
@@ -212,8 +269,6 @@ def scan_repository(root: Path) -> tuple[Finding, ...]:
 
     findings: set[Finding] = set()
     for relative in _tracked_paths(repository):
-        if _is_binary_asset(relative):
-            continue
         path = repository / relative
         try:
             metadata = path.lstat()
@@ -221,12 +276,11 @@ def scan_repository(root: Path) -> tuple[Finding, ...]:
             raise ScanError(f"tracked-file-unreadable:{relative}") from exc
         if not stat.S_ISREG(metadata.st_mode):
             raise ScanError(f"tracked-file-not-regular:{relative}")
+        if _is_binary_asset(relative):
+            continue
         if metadata.st_size > MAX_TEXT_FILE_BYTES:
             raise ScanError(f"tracked-text-too-large:{relative}")
-        try:
-            text = path.read_text(encoding="utf-8", errors="strict")
-        except (OSError, UnicodeDecodeError) as exc:
-            raise ScanError(f"tracked-text-unreadable:{relative}") from exc
+        text = _read_tracked_text(path, relative, metadata)
         for line_number, line in enumerate(text.splitlines(), start=1):
             findings.update(_line_findings(relative, line_number, line))
     return tuple(sorted(findings))

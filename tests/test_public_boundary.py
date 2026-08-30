@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 from pathlib import Path
+import os
+from types import SimpleNamespace
 import subprocess
 
 import pytest
@@ -60,6 +62,7 @@ def test_clean_tracked_reference_uses_documentation_networks_and_example_namespa
         (".".join(("192", "168", "2", "3")), "private-address"),
         (".".join(("100", "100", "2", "3")), "private-address"),
         (".".join(("server", "internal")), "private-dns"),
+        (".".join(("server", "internal", "")), "private-dns"),
     ],
 )
 def test_global_private_topology_is_refused_without_echoing_content(
@@ -104,6 +107,12 @@ def test_non_dns_programming_tokens_are_narrowly_exempt(tmp_path: Path) -> None:
     assert boundary.scan_repository(root) == ()
 
 
+def test_public_name_below_internal_label_is_not_private_dns(tmp_path: Path) -> None:
+    root = _repository(tmp_path, {"README.md": "server.internal.example\n"})
+
+    assert boundary.scan_repository(root) == ()
+
+
 def test_untracked_content_is_not_scanned(tmp_path: Path) -> None:
     root = _repository(tmp_path, {"README.md": "example.com\n"})
     private_address = ".".join(("10", "2", "3", "4"))
@@ -125,6 +134,43 @@ def test_known_binary_asset_is_skipped(tmp_path: Path) -> None:
     assert boundary.scan_repository(root) == ()
 
 
+def test_binary_suffix_does_not_exempt_a_replaced_symlink(tmp_path: Path) -> None:
+    root = _repository(tmp_path, {"docs/diagram.png": "tracked\n", "target.txt": "safe\n"})
+    asset = root / "docs/diagram.png"
+    asset.unlink()
+    asset.symlink_to(root / "target.txt")
+
+    with pytest.raises(boundary.ScanError, match="tracked-file-not-regular:docs/diagram.png"):
+        boundary.scan_repository(root)
+
+
+def test_binary_suffix_does_not_exempt_a_replaced_fifo(tmp_path: Path) -> None:
+    root = _repository(tmp_path, {"docs/archive.jar": "tracked\n"})
+    asset = root / "docs/archive.jar"
+    asset.unlink()
+    os.mkfifo(asset)
+
+    with pytest.raises(boundary.ScanError, match="tracked-file-not-regular:docs/archive.jar"):
+        boundary.scan_repository(root)
+
+
+def test_binary_suffix_does_not_exempt_a_device_shape(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = _repository(tmp_path, {"docs/diagram.png": "tracked\n"})
+    asset = root / "docs/diagram.png"
+    original_lstat = Path.lstat
+
+    def fake_lstat(path: Path):
+        if path == asset:
+            return SimpleNamespace(st_mode=boundary.stat.S_IFCHR | 0o600)
+        return original_lstat(path)
+
+    monkeypatch.setattr(Path, "lstat", fake_lstat)
+    with pytest.raises(boundary.ScanError, match="tracked-file-not-regular:docs/diagram.png"):
+        boundary.scan_repository(root)
+
+
 def test_tracked_symlink_fails_closed(tmp_path: Path) -> None:
     root = _repository(tmp_path, {"target.txt": "safe\n"})
     link = root / "tracked-link"
@@ -132,6 +178,28 @@ def test_tracked_symlink_fails_closed(tmp_path: Path) -> None:
     subprocess.run(["git", "-C", str(root), "add", "tracked-link"], check=True)
 
     with pytest.raises(boundary.ScanError, match="tracked-file-not-regular:tracked-link"):
+        boundary.scan_repository(root)
+
+
+def test_path_replacement_between_lstat_and_open_fails_closed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = _repository(tmp_path, {"README.md": "safe\n"})
+    target = root / "README.md"
+    replacement = root / "replacement"
+    replacement.write_text("also safe\n", encoding="utf-8")
+    original_open = os.open
+    replaced = False
+
+    def swapping_open(path: str | os.PathLike[str], flags: int, *args: object) -> int:
+        nonlocal replaced
+        if Path(path) == target and not replaced:
+            replaced = True
+            replacement.replace(target)
+        return original_open(path, flags, *args)
+
+    monkeypatch.setattr(os, "open", swapping_open)
+    with pytest.raises(boundary.ScanError, match="tracked-file-changed:README.md"):
         boundary.scan_repository(root)
 
 
