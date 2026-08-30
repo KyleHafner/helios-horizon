@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import argparse
 import re
+import sys
 from collections.abc import Sequence
 from pathlib import Path
 from typing import Any
@@ -159,11 +160,13 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def main(argv: Sequence[str] | None = None) -> int:
-    values = list(argv) if argv is not None else None
+    # Normalize both programmatic and console entry points to the same token
+    # list.  Validation must happen before argparse and, more importantly,
+    # before any command handler can be selected or invoked.
+    values = list(argv) if argv is not None else list(sys.argv[1:])
     try:
-        if values is not None:
-            _reject_duplicate_options(values)
-            _reject_unsafe_values(values)
+        _reject_duplicate_options(values)
+        _reject_unsafe_values(values)
         args = _parser().parse_args(values)
     except ValueError as exc:
         raise SystemExit(f"horizon: error: {exc}") from exc
