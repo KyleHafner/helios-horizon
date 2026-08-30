@@ -231,48 +231,162 @@ class Installer:
         return entries
 
     def _ensure_runtime_parent(self, path: Path) -> None:
-        self._validate_runtime_boundary()
-        root = self.target("/opt/game-control")
-        if root.is_symlink():
-            raise RuntimeError("runtime root is symlinked")
-        root.mkdir(parents=True, exist_ok=True)
-        current = root
-        for part in path.relative_to(root).parts:
-            current /= part
-            if current.is_symlink():
-                raise RuntimeError("runtime path contains symlink")
-            if current.exists() and not current.is_dir():
-                raise RuntimeError("runtime path contains non-directory")
-            current.mkdir(exist_ok=True)
+        try:
+            self._validate_runtime_boundary()
+            root = self.target("/opt/game-control")
+            self._ensure_directory_chain(root, "runtime root")
+            self._ensure_directory_chain(path, "runtime path")
+        except RuntimeError as exc:
+            if "symlinked" in str(exc):
+                raise RuntimeError("runtime path contains symlink") from exc
+            if "not a directory" in str(exc):
+                raise RuntimeError("runtime path contains non-directory") from exc
+            raise
 
     def _validate_runtime_boundary(self) -> None:
-        for ancestor in reversed(self.root.parents):
-            if ancestor.is_symlink():
-                raise RuntimeError("install root ancestor is symlinked")
-        if self.root.is_symlink():
-            raise RuntimeError("install root is symlinked")
-        if self.root.exists() and not self.root.is_dir():
-            raise RuntimeError("install root is not a directory")
+        self._validate_existing_chain(self.root, "install root")
         current = self.root
         for part in ("opt", "game-control"):
             current /= part
-            if current.is_symlink():
-                raise RuntimeError("runtime path contains symlink")
-            if current.exists() and not current.is_dir():
-                raise RuntimeError("runtime path contains non-directory")
+            self._validate_existing_chain(current, "runtime path")
 
     def _validate_runtime_parent(self, path: Path) -> None:
         self._validate_runtime_boundary()
-        root = self.target("/opt/game-control")
-        current = root
-        for part in path.relative_to(root).parts:
-            current /= part
-            if current.is_symlink():
-                raise RuntimeError("runtime path contains symlink")
-            if current.exists() and not current.is_dir():
-                raise RuntimeError("runtime path contains non-directory")
+        self._validate_existing_chain(path, "runtime path")
 
-    def _remove_stale_runtime_files(self, current: dict[Path, tuple[Path, int]]) -> None:
+    @staticmethod
+    def _absolute_lexical(path: Path) -> Path:
+        """Return an absolute path without resolving symlinks."""
+        return path if path.is_absolute() else Path.cwd() / path
+
+    def _validate_existing_chain(self, path: Path, label: str) -> None:
+        candidate = self._absolute_lexical(Path(path))
+        current = Path(candidate.anchor)
+        for part in candidate.parts[1:]:
+            current /= part
+            try:
+                info = current.lstat()
+            except FileNotFoundError:
+                return
+            except OSError as exc:
+                raise RuntimeError(f"{label} is unreadable: {current}") from exc
+            if stat.S_ISLNK(info.st_mode):
+                raise RuntimeError(f"{label} is symlinked: {current}")
+            if not stat.S_ISDIR(info.st_mode):
+                raise RuntimeError(f"{label} is not a directory: {current}")
+
+    def _ensure_directory_chain(self, path: Path, label: str) -> None:
+        candidate = self._absolute_lexical(Path(path))
+        current = Path(candidate.anchor)
+        for part in candidate.parts[1:]:
+            current /= part
+            try:
+                info = current.lstat()
+            except FileNotFoundError:
+                try:
+                    current.mkdir()
+                except FileExistsError:
+                    pass
+                try:
+                    info = current.lstat()
+                except OSError as exc:
+                    raise RuntimeError(f"{label} is unreadable: {current}") from exc
+            except OSError as exc:
+                raise RuntimeError(f"{label} is unreadable: {current}") from exc
+            if stat.S_ISLNK(info.st_mode):
+                raise RuntimeError(f"{label} is symlinked: {current}")
+            if not stat.S_ISDIR(info.st_mode):
+                raise RuntimeError(f"{label} is not a directory: {current}")
+
+    def _managed_parent_paths(
+        self,
+        expected_files: dict[Path, tuple[Path, int]],
+        runtime_files: dict[Path, tuple[Path, int]],
+    ) -> set[Path]:
+        parents = {self.root}
+        parents.update(path.parent for path in expected_files)
+        parents.update(path.parent for path in runtime_files)
+        parents.update(path for path, _mode, _user, _group in self.directories())
+        parents.update(path.parent for path in self.expected_links())
+        parents.update(
+            self.target(path).parent
+            for path in (
+                "/srv/game-servers/terraria-vanilla/logs/server.log",
+                "/srv/game-servers/terraria-tmod/logs/server.log",
+                "/srv/game-servers/terraria-tmod/logs/tModLoader-Logs/.horizon-restore-anchor",
+                FIXED_B2_SECRET_PATH,
+                FIXED_RCON_SECRET_PATH,
+                RUNTIME_MANIFEST_PATH,
+            )
+        )
+        return parents
+
+    def _validate_managed_destination(self, path: Path, label: str) -> None:
+        try:
+            info = path.lstat()
+        except FileNotFoundError:
+            return
+        except OSError as exc:
+            raise RuntimeError(f"{label} is unreadable: {path}") from exc
+        if stat.S_ISLNK(info.st_mode):
+            raise RuntimeError(f"{label} is symlinked: {path}")
+        if not stat.S_ISREG(info.st_mode):
+            raise RuntimeError(f"{label} is not a regular file: {path}")
+        if info.st_nlink != 1:
+            raise RuntimeError(f"{label} has unexpected link count: {path}")
+
+    def _validate_secret_destination(self, path: Path, label: str) -> None:
+        self._validate_managed_destination(path, label)
+
+    def _validate_link_destination(self, path: Path, target: str) -> None:
+        try:
+            info = path.lstat()
+        except FileNotFoundError:
+            return
+        except OSError as exc:
+            raise RuntimeError(f"managed link is unreadable: {path}") from exc
+        if not stat.S_ISLNK(info.st_mode):
+            raise RuntimeError(f"managed link destination is not a symlink: {path}")
+        try:
+            actual = os.readlink(path)
+        except OSError as exc:
+            raise RuntimeError(f"managed link is unreadable: {path}") from exc
+        if actual != target:
+            raise RuntimeError(f"refusing to replace unexpected symlink {path}")
+
+    def _validate_boundaries(
+        self,
+        expected_files: dict[Path, tuple[Path, int]],
+        runtime_files: dict[Path, tuple[Path, int]],
+    ) -> None:
+        for path in sorted(self._managed_parent_paths(expected_files, runtime_files), key=str):
+            self._validate_existing_chain(path, "managed parent")
+
+    def _preflight_install(
+        self,
+        expected_files: dict[Path, tuple[Path, int]],
+        runtime_files: dict[Path, tuple[Path, int]],
+    ) -> None:
+        self._validate_existing_chain(self.root, "install root")
+        self._validate_boundaries(expected_files, runtime_files)
+        for destination in sorted(expected_files, key=str):
+            self._validate_managed_destination(destination, "managed destination")
+        self._validate_managed_destination(self._runtime_manifest(), "runtime manifest")
+        self._read_runtime_manifest()
+        self._validate_secret_destination(self.target(FIXED_B2_SECRET_PATH), "fixed B2 secret")
+        self._validate_secret_destination(self.target(FIXED_RCON_SECRET_PATH), "generated RCON secret")
+        for destination, target in self.expected_links().items():
+            self._validate_link_destination(destination, target)
+        for path in (
+            self.target("/srv/game-servers/terraria-vanilla/logs/server.log"),
+            self.target("/srv/game-servers/terraria-tmod/logs/server.log"),
+            self.target("/srv/game-servers/terraria-tmod/logs/tModLoader-Logs/.horizon-restore-anchor"),
+        ):
+            self._validate_managed_destination(path, "managed anchor")
+        self._stale_runtime_removals(runtime_files)
+        self._preflight_sources(expected_files)
+
+    def _stale_runtime_removals(self, current: dict[Path, tuple[Path, int]]) -> list[Path]:
         previous = self._read_runtime_manifest()
         managed = {self._runtime_relative(path, self.target("/opt/game-control")) for path in current}
         removable: list[Path] = []
@@ -287,11 +401,23 @@ class Installer:
                 continue
             if not destination.is_file():
                 raise RuntimeError(f"stale managed runtime path requires manual review: {relative}")
+            try:
+                destination_stat = destination.lstat()
+            except OSError as exc:
+                raise RuntimeError(f"stale managed runtime path requires manual review: {relative}") from exc
+            if destination_stat.st_nlink != 1:
+                raise RuntimeError(f"stale managed runtime path has unexpected link count: {relative}")
             actual = hashlib.sha256(destination.read_bytes()).hexdigest()
             if actual != digest:
                 raise RuntimeError(f"stale managed runtime path changed: {relative}")
             removable.append(destination)
+        return removable
+
+    def _remove_stale_runtime_files(self, current: dict[Path, tuple[Path, int]]) -> None:
+        removable = self._stale_runtime_removals(current)
         for destination in removable:
+            self._validate_runtime_parent(destination.parent)
+            self._validate_managed_destination(destination, "stale managed runtime path")
             destination.unlink()
 
     def _write_runtime_manifest(self, current: dict[Path, tuple[Path, int]]) -> None:
@@ -358,6 +484,8 @@ class Installer:
                 source_stat = source.lstat()
                 if not stat.S_ISREG(source_stat.st_mode):
                     raise RuntimeError(f"package source is not regular: {source}")
+                if source_stat.st_nlink != 1:
+                    raise RuntimeError(f"package source has unexpected link count: {source}")
                 hashlib.sha256(source.read_bytes()).digest()
             except OSError as exc:
                 raise RuntimeError(f"package source is unreadable: {source}") from exc
@@ -422,6 +550,12 @@ class Installer:
 
     def drift(self) -> list[str]:
         problems: list[str] = []
+        try:
+            expected_files = self.expected_files()
+            runtime_files = self.runtime_files()
+            self._validate_boundaries(expected_files, runtime_files)
+        except RuntimeError as exc:
+            return [str(exc)]
         for path, mode, user, group in self.directories():
             try:
                 directory_stat = path.lstat()
@@ -543,13 +677,14 @@ class Installer:
             return
 
     def _mkdir(self, path: Path, mode: int, user: str, group: str) -> None:
-        path.mkdir(parents=True, exist_ok=True)
+        self._ensure_directory_chain(path, "managed directory")
         os.chmod(path, mode)
         self._chown(path, user, group)
 
-    @staticmethod
-    def _atomic_copy(source: Path, destination: Path, mode: int) -> None:
-        destination.parent.mkdir(parents=True, exist_ok=True)
+    def _atomic_copy(self, source: Path, destination: Path, mode: int) -> None:
+        self._validate_existing_chain(destination.parent, "managed parent")
+        self._validate_managed_destination(destination, "managed destination")
+        self._ensure_directory_chain(destination.parent, "managed parent")
         fd, temporary = tempfile.mkstemp(prefix=f".{destination.name}.", dir=destination.parent)
         temporary_path = Path(temporary)
         try:
@@ -559,15 +694,30 @@ class Installer:
                 stream.flush()
                 os.fsync(stream.fileno())
             os.chmod(temporary_path, mode)
+            self._validate_existing_chain(destination.parent, "managed parent")
+            self._validate_managed_destination(destination, "managed destination")
             os.replace(temporary_path, destination)
         finally:
             temporary_path.unlink(missing_ok=True)
 
     def _ensure_generated_rcon_secret(self) -> None:
         destination = self.target(FIXED_RCON_SECRET_PATH)
-        destination.parent.mkdir(parents=True, exist_ok=True)
-        if destination.is_symlink() or destination.exists():
+        self._validate_existing_chain(destination.parent, "secret parent")
+        try:
+            destination_stat = destination.lstat()
+        except FileNotFoundError:
+            destination_stat = None
+        except OSError as exc:
+            raise RuntimeError(f"generated RCON secret is unreadable: {destination}") from exc
+        if destination_stat is not None:
+            if stat.S_ISLNK(destination_stat.st_mode):
+                raise RuntimeError(f"generated RCON secret is symlinked: {destination}")
+            if not stat.S_ISREG(destination_stat.st_mode):
+                raise RuntimeError(f"generated RCON secret is not a regular file: {destination}")
+            if destination_stat.st_nlink != 1:
+                raise RuntimeError(f"generated RCON secret has unexpected link count: {destination}")
             return
+        self._ensure_directory_chain(destination.parent, "secret parent")
         flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0)
         fd = os.open(destination, flags, 0o600)
         try:
@@ -582,23 +732,41 @@ class Installer:
         self._chown(destination, "root", "root")
         os.chmod(destination, 0o600)
 
-    @staticmethod
-    def _create_link(destination: Path, target: str) -> None:
+    def _create_link(self, destination: Path, target: str) -> None:
+        self._validate_existing_chain(destination.parent, "link parent")
+        self._validate_link_destination(destination, target)
         if destination.is_symlink():
-            if os.readlink(destination) == target:
-                return
-            raise RuntimeError(f"refusing to replace unexpected symlink {destination}")
-        if destination.exists():
-            raise RuntimeError(f"refusing to replace non-symlink {destination}")
+            return
+        self._ensure_directory_chain(destination.parent, "link parent")
         fd, temporary = tempfile.mkstemp(prefix=f".{destination.name}.", dir=destination.parent)
         temporary_path = Path(temporary)
         try:
             os.close(fd)
             temporary_path.unlink()
             os.symlink(target, temporary_path)
+            self._validate_existing_chain(destination.parent, "link parent")
+            self._validate_link_destination(destination, target)
             os.replace(temporary_path, destination)
         finally:
             temporary_path.unlink(missing_ok=True)
+
+    def _ensure_managed_file(self, destination: Path, mode: int, user: str, group: str) -> None:
+        self._validate_existing_chain(destination.parent, "managed parent")
+        try:
+            info = destination.lstat()
+        except FileNotFoundError:
+            info = None
+        except OSError as exc:
+            raise RuntimeError(f"managed file is unreadable: {destination}") from exc
+        if info is None:
+            self._ensure_directory_chain(destination.parent, "managed parent")
+            flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0)
+            fd = os.open(destination, flags, mode)
+            os.close(fd)
+        else:
+            self._validate_managed_destination(destination, "managed file")
+        os.chmod(destination, mode)
+        self._chown(destination, user, group)
 
     def _accounts(self) -> None:
         if self.root != Path("/"):
@@ -631,11 +799,11 @@ class Installer:
 
     def apply(self) -> None:
         expected_files = self.expected_files()
-        self._preflight_sources(expected_files)
+        runtime_files = self.runtime_files()
+        self._preflight_install(expected_files, runtime_files)
         self._accounts()
         for path, mode, user, group in self.directories():
             self._mkdir(path, mode, user, group)
-        runtime_files = self.runtime_files()
         self._remove_stale_runtime_files(runtime_files)
         for destination in runtime_files:
             self._ensure_runtime_parent(destination.parent)
@@ -647,18 +815,14 @@ class Installer:
             ("terraria-tmod", "tmodloader"),
         ):
             log = self.target(f"/srv/game-servers/{profile}/logs/server.log")
-            log.touch(exist_ok=True)
-            os.chmod(log, 0o600)
-            self._chown(log, user, user)
+            self._ensure_managed_file(log, 0o600, user, user)
         # Application archives contain regular files, not empty directories.
         # Keep the tModLoader bind source represented so restore extraction
         # recreates it before systemd evaluates BindPaths.
         tmod_log_anchor = self.target(
             "/srv/game-servers/terraria-tmod/logs/tModLoader-Logs/.horizon-restore-anchor"
         )
-        tmod_log_anchor.touch(exist_ok=True)
-        os.chmod(tmod_log_anchor, 0o600)
-        self._chown(tmod_log_anchor, "tmodloader", "tmodloader")
+        self._ensure_managed_file(tmod_log_anchor, 0o600, "tmodloader", "tmodloader")
         for destination, (source, mode) in expected_files.items():
             # Managed systemd units and slices are authoritative package
             # inputs.  Deliberately replace them atomically; preserving an

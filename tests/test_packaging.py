@@ -1080,6 +1080,259 @@ def test_runtime_stale_dangling_symlink_requires_manual_review(tmp_path: Path) -
     assert symlink.is_symlink()
 
 
+def _filesystem_fingerprint(root: Path) -> dict[str, tuple[object, ...]]:
+    fingerprint: dict[str, tuple[object, ...]] = {}
+    for path in sorted(root.rglob("*")):
+        relative = path.relative_to(root).as_posix()
+        info = path.lstat()
+        if stat.S_ISLNK(info.st_mode):
+            fingerprint[relative] = ("symlink", os.readlink(path), stat.S_IMODE(info.st_mode), info.st_nlink)
+        elif stat.S_ISDIR(info.st_mode):
+            fingerprint[relative] = ("directory", stat.S_IMODE(info.st_mode), info.st_nlink)
+        elif stat.S_ISREG(info.st_mode):
+            fingerprint[relative] = ("file", path.read_bytes(), stat.S_IMODE(info.st_mode), info.st_nlink)
+        else:
+            fingerprint[relative] = ("other", info.st_mode, info.st_nlink)
+    return fingerprint
+
+
+def test_installer_rejects_symlinked_root_and_ancestor_before_any_mutation(tmp_path: Path) -> None:
+    from ops.install import Installer
+
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    sentinel = outside / "sentinel"
+    sentinel.write_bytes(b"outside-preserved\n")
+
+    root = tmp_path / "root-link"
+    root.symlink_to(outside, target_is_directory=True)
+    with pytest.raises(RuntimeError, match="install root is symlinked"):
+        Installer(root, skip_systemd_verify=True).apply()
+    assert sentinel.read_bytes() == b"outside-preserved\n"
+    assert root.is_symlink()
+
+    parent_link = tmp_path / "parent-link"
+    parent_link.symlink_to(outside, target_is_directory=True)
+    selected = parent_link / "alternate-root"
+    before = _filesystem_fingerprint(tmp_path)
+    with pytest.raises(RuntimeError, match="install root is symlinked"):
+        Installer(selected, skip_systemd_verify=True).apply()
+    assert _filesystem_fingerprint(tmp_path) == before
+    assert sentinel.read_bytes() == b"outside-preserved\n"
+
+
+@pytest.mark.parametrize(
+    "relative",
+    (
+        "opt",
+        "opt/game-control",
+        "etc",
+        "etc/game-control",
+        "etc/systemd/system",
+        "usr/local/libexec",
+        "var/lib/game-control",
+        "srv/game-servers",
+    ),
+)
+def test_installer_rejects_non_directory_managed_ancestor_before_any_mutation(
+    tmp_path: Path, relative: str
+) -> None:
+    from ops.install import Installer
+
+    root = tmp_path / "root"
+    root.mkdir()
+    ancestor = root / relative
+    ancestor.parent.mkdir(parents=True, exist_ok=True)
+    ancestor.write_bytes(b"not-a-directory\n")
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (outside / "sentinel").write_bytes(b"outside-preserved\n")
+    before = _filesystem_fingerprint(tmp_path)
+
+    with pytest.raises(RuntimeError, match="managed parent is not a directory"):
+        Installer(root, skip_systemd_verify=True).apply()
+
+    assert _filesystem_fingerprint(tmp_path) == before
+
+
+@pytest.mark.parametrize(
+    "relative",
+    (
+        "etc/game-control/profiles.d",
+        "etc/systemd/system",
+        "opt/game-control",
+        "opt/game-control/web",
+        "etc/game-control/secrets.d",
+        "usr/local/libexec",
+        "usr/lib/tmpfiles.d",
+        "usr/local/share/horizon",
+        "srv/game-servers/minecraft-sunlit-cobblemon",
+    ),
+)
+def test_installer_rejects_symlinked_managed_parent_before_any_mutation(
+    tmp_path: Path, relative: str
+) -> None:
+    from ops.install import Installer
+
+    root = tmp_path / "root"
+    root.mkdir()
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (outside / "sentinel").write_bytes(b"outside-preserved\n")
+    parent = root / relative
+    parent.parent.mkdir(parents=True)
+    parent.symlink_to(outside, target_is_directory=True)
+    before = _filesystem_fingerprint(tmp_path)
+
+    with pytest.raises(RuntimeError, match="managed parent is symlinked"):
+        Installer(root, skip_systemd_verify=True).apply()
+
+    assert _filesystem_fingerprint(tmp_path) == before
+    assert (outside / "sentinel").read_bytes() == b"outside-preserved\n"
+
+
+@pytest.mark.parametrize(
+    "relative",
+    (
+        "etc/systemd/system/game-slotd.service",
+        "opt/game-control/src/game_control/introspection.py",
+        "srv/game-servers/terraria-vanilla/logs/server.log",
+        "srv/game-servers/terraria-tmod/logs/tModLoader-Logs/.horizon-restore-anchor",
+        "opt/game-control/.horizon-runtime-manifest",
+    ),
+)
+@pytest.mark.parametrize("kind", ("symlink", "hardlink", "directory"))
+def test_installer_rejects_unsafe_managed_destination_before_replacement(
+    tmp_path: Path, relative: str, kind: str
+) -> None:
+    from ops.install import Installer
+
+    root = tmp_path / "root"
+    installer = Installer(root, skip_systemd_verify=True)
+    installer.apply()
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    outside_sentinel = outside / "sentinel"
+    outside_sentinel.write_bytes(b"outside-preserved\n")
+    destination = root / relative
+    destination.unlink()
+    if kind == "symlink":
+        destination.symlink_to(outside_sentinel)
+    elif kind == "hardlink":
+        os.link(outside_sentinel, destination)
+    else:
+        destination.mkdir()
+    managed = root / "etc/systemd/system/game-control-web.service"
+    managed.write_bytes(b"managed-before-preflight\n")
+    before = _filesystem_fingerprint(root)
+    outside_before = _filesystem_fingerprint(outside)
+
+    with pytest.raises(RuntimeError, match="managed destination|managed anchor|runtime manifest"):
+        installer.apply()
+
+    assert _filesystem_fingerprint(root) == before
+    assert _filesystem_fingerprint(outside) == outside_before
+
+
+@pytest.mark.parametrize(
+    ("relative", "kind"),
+    (
+        ("etc/game-control/secrets.d/minecraft-rcon-password", "symlink"),
+        ("etc/game-control/secrets.d/minecraft-rcon-password", "hardlink"),
+        ("etc/game-control/secrets.d/minecraft-rcon-password", "directory"),
+        ("etc/game-control/secrets.d/horizon-b2-rclone.conf", "symlink"),
+        ("srv/game-servers/minecraft-sunlit-cobblemon/libraries", "wrong-link"),
+        ("srv/game-servers/minecraft-sunlit-cobblemon/libraries", "hardlink"),
+    ),
+)
+def test_installer_rejects_unsafe_secret_or_link_destination_before_mutation(
+    tmp_path: Path, relative: str, kind: str
+) -> None:
+    from ops.install import Installer
+
+    root = tmp_path / "root"
+    installer = Installer(root, skip_systemd_verify=True)
+    installer.apply()
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    outside_sentinel = outside / "sentinel"
+    outside_sentinel.write_bytes(b"outside-preserved\n")
+    destination = root / relative
+    if destination.is_dir() and not destination.is_symlink():
+        destination.rmdir()
+    else:
+        destination.unlink(missing_ok=True)
+    if kind == "symlink":
+        destination.symlink_to(outside_sentinel)
+    elif kind == "wrong-link":
+        destination.symlink_to("wrong-target")
+    elif kind == "hardlink":
+        os.link(outside_sentinel, destination)
+    else:
+        destination.mkdir()
+    before = _filesystem_fingerprint(root)
+    outside_before = _filesystem_fingerprint(outside)
+
+    with pytest.raises(RuntimeError, match="secret|managed link|symlink"):
+        installer.apply()
+
+    assert _filesystem_fingerprint(root) == before
+    assert _filesystem_fingerprint(outside) == outside_before
+
+
+def test_installer_rejects_stale_runtime_hardlink_before_removal_or_copy(tmp_path: Path) -> None:
+    from ops.install import Installer
+
+    root = tmp_path / "root"
+    installer = Installer(root, skip_systemd_verify=True)
+    installer.apply()
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    outside_alias = outside / "stale-alias"
+    stale = root / "opt/game-control/src/game_control/removed.py"
+    stale.write_bytes(b"unchanged-stale\n")
+    os.link(stale, outside_alias)
+    digest = hashlib.sha256(stale.read_bytes()).hexdigest()
+    with installer._runtime_manifest().open("a", encoding="ascii") as stream:
+        stream.write("1" + chr(9) + "src/game_control/removed.py" + chr(9) + digest + chr(9) + "0644" + chr(10))
+    managed = root / "etc/systemd/system/game-control-web.service"
+    managed.write_bytes(b"managed-before-preflight\n")
+    before = _filesystem_fingerprint(root)
+    outside_before = _filesystem_fingerprint(outside)
+
+    with pytest.raises(RuntimeError, match="unexpected link count"):
+        installer.apply()
+
+    assert _filesystem_fingerprint(root) == before
+    assert _filesystem_fingerprint(outside) == outside_before
+    assert stale.exists()
+    assert outside_alias.exists()
+
+
+@pytest.mark.parametrize("kind", ("symlink", "hardlink"))
+def test_preflight_sources_rejects_source_links_without_target_mutation(tmp_path: Path, kind: str) -> None:
+    from ops.install import Installer
+
+    source_root = tmp_path / "sources"
+    source_root.mkdir()
+    source = source_root / "source"
+    source.write_bytes(b"source\n")
+    if kind == "symlink":
+        linked_source = source_root / "linked-source"
+        linked_source.symlink_to(source)
+    else:
+        linked_source = source_root / "linked-source"
+        os.link(source, linked_source)
+    destination = tmp_path / "destination"
+    destination.write_bytes(b"destination-preserved\n")
+
+    with pytest.raises(RuntimeError, match="package source"):
+        Installer._preflight_sources({destination: (linked_source, 0o644)})
+
+    assert destination.read_bytes() == b"destination-preserved\n"
+    assert source.read_bytes() == b"source\n"
+
+
 def test_installer_secret_drift_checks_fail_closed_without_reading_content(tmp_path: Path) -> None:
     from ops.install import Installer
 
