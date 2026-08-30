@@ -622,6 +622,17 @@ def test_release_digest_flows_through_profile_into_update_service_without_public
     assert "sha256" not in public.model_dump()
 
 
+def test_legacy_telemetry_config_keeps_no_tick_when_no_approved_profile_exists():
+    config = wiring._legacy_telemetry_config(
+        {
+            "exporter_url": "http://127.0.0.1:19565/metrics",
+            "legacy_tps_mode": "disabled",
+        },
+        ("other",),
+    )
+    assert config.exporters == ()
+
+
 @pytest.mark.asyncio
 async def test_rcon_collector_uses_one_performance_request_for_tps_and_mspt():
     calls = []

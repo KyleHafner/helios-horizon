@@ -1,8 +1,9 @@
-"""Frozen root configuration and source contracts for telemetry runtime work.
+"""Configuration and runtime ownership for bounded telemetry collection.
 
-This commit intentionally defines no collector loops and performs no wiring.
-The later runtime extraction consumes these records without accepting values
-from RPC or browser requests.
+The runtime consumes one status snapshot per cycle and delegates every
+telemetry write to the injected bounded database writer. Construction remains
+outside this module; the temporary service-wiring adapter is the only legacy
+call-shape bridge.
 """
 
 from __future__ import annotations
@@ -289,8 +290,10 @@ def _resource(value: Any) -> ResourceRef[Any] | None:
     return ResourceRef.borrowed(value)
 
 
-async def _await_cleanup(awaitable: Awaitable[Any]) -> bool:
-    """Drain one cleanup operation even when its caller is cancelled."""
+async def _await_cleanup(
+    awaitable: Awaitable[Any],
+) -> tuple[bool, Any, BaseException | None]:
+    """Drain cleanup, preserving caller cancellation and cleanup failures."""
 
     task = asyncio.ensure_future(awaitable)
     cancelled = False
@@ -300,12 +303,17 @@ async def _await_cleanup(awaitable: Awaitable[Any]) -> bool:
         except asyncio.CancelledError:
             if task.done():
                 if cancelled:
-                    return True
-                raise
+                    try:
+                        return True, task.result(), None
+                    except BaseException as error:
+                        return True, None, error
+                return False, None, asyncio.CancelledError()
             cancelled = True
             continue
+        except BaseException as error:
+            return cancelled, None, error
         break
-    return cancelled
+    return cancelled, task.result(), None
 
 
 class TelemetryCollector:
@@ -346,6 +354,8 @@ class TelemetryCollector:
         self._failures: dict[str, int] = {}
         self._host = HostTelemetrySource()
         self._closed = False
+        self._rcon_closed = False
+        self._database_closed = False
 
         specs = {
             binding.profile_id: ExporterSpec(binding.profile_id, binding.url, PrometheusTickParser())
@@ -554,20 +564,51 @@ class TelemetryCollector:
     async def close(self) -> None:
         if self._closed:
             return
-        self._closed = True
         cancelled = False
-        if self._rcon_ref is not None and self._rcon_ref.owns_value:
-            close = getattr(self.rcon, "close", None)
-            if callable(close):
-                cancelled = (await _await_cleanup(close())) or cancelled
-        if self._database_ref is not None:
+        errors: list[BaseException] = []
+        database_drained = self._database_ref is None or self._database_closed
+        if self._database_ref is not None and not self._database_closed:
             drain = getattr(self.database, "drain", None)
             if callable(drain):
-                cancelled = (await _await_cleanup(asyncio.to_thread(drain, 10.0))) or cancelled
-            if self._database_ref.owns_value:
-                close = getattr(self.database, "close", None)
-                if callable(close):
-                    cancelled = (await _await_cleanup(asyncio.to_thread(close))) or cancelled
+                was_cancelled, result, error = await _await_cleanup(asyncio.to_thread(drain, 10.0))
+                cancelled = was_cancelled or cancelled
+                if error is None:
+                    if result is True:
+                        database_drained = True
+                    else:
+                        errors.append(RuntimeError("telemetry database drain failed"))
+                else:
+                    errors.append(error)
+            else:
+                errors.append(RuntimeError("telemetry database drain is unavailable"))
+        if self._rcon_ref is not None and self._rcon_ref.owns_value and not self._rcon_closed:
+            close = getattr(self.rcon, "close", None)
+            if callable(close):
+                was_cancelled, _result, error = await _await_cleanup(close())
+                cancelled = was_cancelled or cancelled
+                if error is None:
+                    self._rcon_closed = True
+                else:
+                    errors.append(error)
+            else:
+                errors.append(RuntimeError("owned RCON close is unavailable"))
+        if self._database_ref is not None and database_drained and self._database_ref.owns_value and not self._database_closed:
+            close = getattr(self.database, "close", None)
+            if callable(close):
+                was_cancelled, _result, error = await _await_cleanup(asyncio.to_thread(close))
+                cancelled = was_cancelled or cancelled
+                if error is None:
+                    self._database_closed = True
+                else:
+                    errors.append(error)
+            else:
+                errors.append(RuntimeError("owned telemetry database close is unavailable"))
+        if errors:
+            self._failures["close"] = self._failures.get("close", 0) + len(errors)
+        if errors and not cancelled:
+            raise errors[0]
+        if not errors:
+            self._closed = True
         if cancelled:
             raise asyncio.CancelledError
 
@@ -586,6 +627,7 @@ class TelemetryRuntime:
         self._cycle_lock = asyncio.Lock()
         self._closing = False
         self._closed = False
+        self._cleanup_failures: dict[str, int] = {}
 
     @property
     def sampler(self) -> TelemetrySampler:
@@ -601,12 +643,6 @@ class TelemetryRuntime:
             if self._closing:
                 return
             await self.collector.collect(snapshot)
-
-    async def _drain(self, task: asyncio.Task[Any]) -> Any:
-        try:
-            return await task
-        except BaseException:
-            raise
 
     async def sample_once(self) -> None:
         if self._closing:
@@ -645,25 +681,39 @@ class TelemetryRuntime:
             return
         self._closing = True
         cancelled = False
+        errors: list[BaseException] = []
         sampler = self.sampler
         if self._sampler_ref.owns_value:
-            cancelled = (await _await_cleanup(sampler.shutdown())) or cancelled
-            cancelled = (await _await_cleanup(sampler.wait_closed())) or cancelled
+            was_cancelled, _result, error = await _await_cleanup(sampler.shutdown())
+            cancelled = was_cancelled or cancelled
+            if error is not None:
+                errors.append(error)
+            was_cancelled, _result, error = await _await_cleanup(sampler.wait_closed())
+            cancelled = was_cancelled or cancelled
+            if error is not None:
+                errors.append(error)
         pending = tuple(self._inflight)
         if pending:
             drain = asyncio.gather(*pending, return_exceptions=True)
-            try:
-                await asyncio.shield(drain)
-            except asyncio.CancelledError:
-                await asyncio.shield(drain)
-                cancelled = True
-        cancelled = (await _await_cleanup(self.collector.close())) or cancelled
-        self._closed = True
+            was_cancelled, _result, error = await _await_cleanup(drain)
+            cancelled = was_cancelled or cancelled
+            if error is not None:
+                errors.append(error)
+        was_cancelled, _result, error = await _await_cleanup(self.collector.close())
+        cancelled = was_cancelled or cancelled
+        if error is not None:
+            errors.append(error)
+        if errors:
+            self._cleanup_failures["close"] = self._cleanup_failures.get("close", 0) + len(errors)
+        if errors and not cancelled:
+            raise errors[0]
+        if not errors:
+            self._closed = True
         if cancelled:
             raise asyncio.CancelledError
 
     def health(self) -> Mapping[str, Any]:
-        result = {"closed": self._closed, "closing": self._closing, "sampler": self.sampler.health() if hasattr(self.sampler, "health") else {}}
+        result = {"closed": self._closed, "closing": self._closing, "cleanup_failures": dict(self._cleanup_failures), "sampler": self.sampler.health() if hasattr(self.sampler, "health") else {}}
         result["collector"] = dict(self.collector.health())
         return result
 

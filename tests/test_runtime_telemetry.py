@@ -353,8 +353,111 @@ async def test_runtime_close_drains_owned_cleanup_before_reraising_cancellation(
     await started.wait()
     closing.cancel()
     await asyncio.sleep(0)
+    closing.cancel()
+    await asyncio.sleep(0)
     assert not closing.done()
     release.set()
     with pytest.raises(asyncio.CancelledError):
         await closing
     assert runtime.health()["closed"] is True
+
+
+@pytest.mark.asyncio
+async def test_runtime_close_preserves_cancellation_when_cleanup_fails_then_retries():
+    started = asyncio.Event()
+    release = asyncio.Event()
+    attempts = 0
+
+    class Collector:
+        async def collect(self, _snapshot):
+            return None
+
+        async def close(self):
+            nonlocal attempts
+            attempts += 1
+            started.set()
+            await release.wait()
+            if attempts == 1:
+                raise RuntimeError("cleanup boom")
+
+        def health(self):
+            return {}
+
+    runtime = TelemetryRuntime(SimpleNamespace(snapshot=lambda **_: None), Collector())
+    closing = asyncio.create_task(runtime.close())
+    await started.wait()
+    closing.cancel()
+    release.set()
+    with pytest.raises(asyncio.CancelledError):
+        await closing
+    assert runtime.health()["closed"] is False
+    assert runtime.health()["cleanup_failures"]["close"] == 1
+    await runtime.close()
+    assert attempts == 2
+    assert runtime.health()["closed"] is True
+
+
+@pytest.mark.asyncio
+async def test_collector_drains_before_owned_closes_and_retries_failed_steps():
+    events = []
+
+    class Database:
+        def __init__(self, drain_result=True):
+            self.drain_result = drain_result
+            self.closes = 0
+
+        def drain(self, _timeout=None):
+            events.append("drain")
+            return self.drain_result
+
+        def close(self):
+            events.append("dbclose")
+            self.closes += 1
+
+    class Rcon:
+        profile_id = "minecraft"
+
+        @property
+        def health(self):
+            return SimpleNamespace()
+
+        def __init__(self, fail_once=False):
+            self.fail_once = fail_once
+            self.closes = 0
+
+        async def close(self):
+            events.append("rconclose")
+            self.closes += 1
+            if self.fail_once and self.closes == 1:
+                raise RuntimeError("rcon cleanup boom")
+
+    config = TelemetryRuntimeConfig(
+        host_metrics=("host_psi_io_some_avg10",), legacy_tps_mode="disabled"
+    )
+    database = Database()
+    rcon = Rcon(fail_once=True)
+    collector = RuntimeTelemetryCollector(
+        profiles=(), config=config, database=ResourceRef.owned(database),
+        rcon=ResourceRef.owned(rcon), player_tracker=SimpleNamespace(),
+    )
+    with pytest.raises(RuntimeError, match="rcon cleanup boom"):
+        await collector.close()
+    assert events == ["drain", "rconclose", "dbclose"]
+    assert collector.health()["closed"] is False
+    await collector.close()
+    assert events == ["drain", "rconclose", "dbclose", "rconclose"]
+    assert database.closes == 1 and rcon.closes == 2
+
+    events.clear()
+    database = Database(drain_result=False)
+    collector = RuntimeTelemetryCollector(
+        profiles=(), config=config, database=ResourceRef.owned(database),
+        rcon=None, player_tracker=SimpleNamespace(),
+    )
+    with pytest.raises(RuntimeError, match="drain failed"):
+        await collector.close()
+    assert events == ["drain"]
+    assert database.closes == 0 and collector.health()["closed"] is False
+    database.drain_result = True
+    await collector.close()
+    assert events == ["drain", "drain", "dbclose"]

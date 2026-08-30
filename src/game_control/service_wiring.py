@@ -189,13 +189,16 @@ def _legacy_telemetry_config(stats: Mapping[str, Any], approved_profile_ids: tup
         settings["legacy_tps_interval_seconds"] = stats["tps_interval_seconds"]
     exporter_url = stats.get("exporter_url")
     if exporter_url is not None:
-        tick_profile = stats.get("tick_profile")
+        explicit_tick_profile = stats.get("tick_profile")
+        tick_profile = explicit_tick_profile
         if tick_profile is None and ProfileId.MINECRAFT_SUNLIT_COBBLEMON.value in approved:
             tick_profile = ProfileId.MINECRAFT_SUNLIT_COBBLEMON.value
-        tick_profile = str(getattr(tick_profile, "value", tick_profile))
-        if tick_profile not in approved:
+        if tick_profile is not None:
+            tick_profile = str(getattr(tick_profile, "value", tick_profile))
+        if explicit_tick_profile is not None and tick_profile not in approved:
             raise ValueError("legacy tick profile is not in the approved root registry")
-        settings.update(exporter_url=exporter_url, tick_profile=tick_profile)
+        if tick_profile in approved:
+            settings.update(exporter_url=exporter_url, tick_profile=tick_profile)
     gc_profile = stats.get("gc_profile_id")
     gc_path = stats.get("gc_log_path")
     if gc_profile is None and gc_path is None and stats.get("log_checkpoint_dir") and ProfileId.MINECRAFT_SUNLIT_COBBLEMON.value in approved:
