@@ -9,6 +9,7 @@ call-shape bridge.
 from __future__ import annotations
 
 import asyncio
+import inspect
 import math
 import time
 import urllib.request
@@ -314,6 +315,13 @@ async def _await_cleanup(
             return cancelled, None, error
         break
     return cancelled, task.result(), None
+
+
+async def _call_close(close: Callable[[], Any]) -> Any:
+    result = close()
+    if inspect.isawaitable(result):
+        return await result
+    return result
 
 
 class TelemetryCollector:
@@ -727,7 +735,11 @@ class TelemetryRuntime:
         if self._database_ref is not None and database_drained and self._database_ref.owns_value and not self._database_closed:
             close = getattr(self._database_ref.value, "close", None)
             if callable(close):
-                was_cancelled, _result, error = await _await_cleanup(asyncio.to_thread(close))
+                # TelemetryDatabase owns a main-thread SQLite connection even
+                # though its writer has a dedicated worker connection.  Close
+                # it in this task; moving the call to a worker violates
+                # sqlite's thread-affinity contract.
+                was_cancelled, _result, error = await _await_cleanup(_call_close(close))
                 cancelled = was_cancelled or cancelled
                 if error is None:
                     self._database_closed = True

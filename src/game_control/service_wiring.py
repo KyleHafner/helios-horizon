@@ -32,6 +32,10 @@ from .protocol import (
 from .redaction import Redactor, SecretRegistry
 from .root_state import RootActiveJobsReader, RootGenerationReader
 from .runtime.alerts import AlertRuntime
+from .runtime.compatibility import (
+    BoundTelemetryCollectors as _BoundTelemetryCollectors,
+    legacy_telemetry_config as _legacy_telemetry_config,
+)
 from .runtime.protocols import AlertObservation
 from .runtime.telemetry import (
     DEFAULT_HOST_METRICS, LegacyTpsMode, ResourceRef, TelemetryCollector,
@@ -84,8 +88,9 @@ def _close_database(database: Any | None) -> None:
 
 
 class _StatusFacade:
-    def __init__(self, service: StatusService):
+    def __init__(self, service: StatusService, *, telemetry_health_reason: str | None = None):
         self.service = service
+        self.telemetry_health_reason = telemetry_health_reason
 
     async def snapshot(self, action: Any = None, actor: str | None = None, request_id: Any = None, *, maintenance: bool = False):
         return await self.service.snapshot(persist=False, force=bool(maintenance or getattr(action, "refresh", False)))
@@ -94,113 +99,13 @@ class _StatusFacade:
         return await self.service.cached_snapshot()
 
     def telemetry_health(self) -> dict[str, Any]:
-        return self.service.telemetry_health()
+        health = self.service.telemetry_health()
+        if self.telemetry_health_reason is not None:
+            health["reason"] = self.telemetry_health_reason
+        return health
 
     async def benchmark_eligibility(self, *, maintenance_window: bool, rollback_safe: bool, public_wake_policy: str, snapshot: Any = None):
         return await self.service.benchmark_eligibility(maintenance_window=maintenance_window, rollback_safe=rollback_safe, public_wake_policy=public_wake_policy, snapshot=snapshot)
-
-
-def _legacy_telemetry_config(stats: Mapping[str, Any], approved_profile_ids: tuple[str, ...]):
-    """Translate the pre-runtime root section at this one compatibility edge."""
-    if not isinstance(stats, Mapping):
-        raise ValueError("legacy telemetry settings are invalid")
-    allowed = {"exporter_url", "tick_profile", "log_checkpoint_dir", "gc_log_path", "gc_profile_id", "host_metrics", "legacy_tps_mode", "legacy_tps_interval_seconds", "tps_interval_seconds"}
-    if set(stats) - allowed:
-        raise ValueError("legacy telemetry settings contain unknown keys")
-    approved = tuple(str(getattr(item, "value", item)) for item in approved_profile_ids)
-    settings: dict[str, Any] = {"legacy_tps_mode": stats.get("legacy_tps_mode", "disabled")}
-    for key in ("log_checkpoint_dir", "host_metrics", "legacy_tps_interval_seconds"):
-        if key in stats:
-            settings[key] = stats[key]
-    if "legacy_tps_interval_seconds" not in settings and "tps_interval_seconds" in stats:
-        settings["legacy_tps_interval_seconds"] = stats["tps_interval_seconds"]
-    if stats.get("exporter_url") is not None and str(stats.get("legacy_tps_mode", "disabled")) != LegacyTpsMode.ENABLED.value:
-        tick_profile = stats.get("tick_profile")
-        if tick_profile is None and ProfileId.MINECRAFT_SUNLIT_COBBLEMON.value in approved:
-            tick_profile = ProfileId.MINECRAFT_SUNLIT_COBBLEMON.value
-        tick_profile = None if tick_profile is None else str(getattr(tick_profile, "value", tick_profile))
-        if tick_profile is not None and tick_profile not in approved:
-            raise ValueError("legacy tick profile is not in the approved root registry")
-        if tick_profile is not None:
-            settings.update(exporter_url=stats["exporter_url"], tick_profile=tick_profile)
-    gc_profile, gc_path = stats.get("gc_profile_id"), stats.get("gc_log_path")
-    if gc_profile is not None or gc_path is not None:
-        settings.update(gc_profile_id=str(getattr(gc_profile, "value", gc_profile)), gc_log_path=gc_path)
-    return TelemetryRuntimeConfig.from_root_config(settings, approved_profile_ids=approved)
-
-
-class _LegacyAlertSink:
-    def __init__(self, target: Any):
-        self.target = target
-
-    def observe(self, observation: Any) -> None:
-        if isinstance(observation, AlertObservation):
-            self.target.observe(observation)
-
-
-class _BoundTelemetryCollectors(TelemetryCollector):
-    """Bounded compatibility call-shape adapter for pre-composition tests."""
-    def __init__(self, *, profiles: tuple[Any, ...], database: Any, stats: Mapping[str, Any], rcon: Any, player_tracker: Any, alerts: Any | None = None):
-        self._legacy_database = database.value if isinstance(database, ResourceRef) else database
-        self._legacy_rcon = rcon.value if isinstance(rcon, ResourceRef) else rcon
-        self._legacy_rcon_ref = rcon if isinstance(rcon, ResourceRef) else (None if rcon is None else ResourceRef.borrowed(rcon))
-        self._legacy_alerts = alerts
-        super().__init__(profiles=profiles, config=_legacy_telemetry_config(stats, tuple(_key(item) for item in profiles)), database=database, rcon=rcon, player_tracker=player_tracker, alert_sink=None if alerts is None else _LegacyAlertSink(alerts))
-
-    @property
-    def alerts(self) -> Any | None:
-        return self._legacy_alerts
-
-    @alerts.setter
-    def alerts(self, value: Any | None) -> None:
-        self._legacy_alerts = value
-        self.alert_sink = None if value is None else _LegacyAlertSink(value)
-
-    async def collect(self, *, running: Mapping[str, Any]) -> None:
-        statuses = []
-        for profile in self.profiles:
-            value = running.get(_key(profile), False)
-            statuses.append(value if not isinstance(value, bool) else type("LegacyStatus", (), {"profile_id": _key(profile), "state": "running" if value else "stopped", "pid": None, "rss_bytes": None})())
-        await super().collect(type("LegacySnapshot", (), {"profiles": tuple(statuses)})())
-
-    async def close(self) -> None:
-        await self.aclose()
-        drain = getattr(self._legacy_database, "drain", None)
-        cleanup_error: BaseException | None = None
-        cancelled = False
-        if callable(drain):
-            operation = asyncio.ensure_future(asyncio.to_thread(drain, 10.0))
-            while not operation.done():
-                try:
-                    await asyncio.shield(operation)
-                except asyncio.CancelledError:
-                    cancelled = True
-                    continue
-            try:
-                if operation.result() is not True:
-                    cleanup_error = RuntimeError("legacy telemetry database drain failed")
-            except BaseException as exc:
-                cleanup_error = exc
-        elif self._legacy_database is not None:
-            cleanup_error = RuntimeError("legacy telemetry database drain is unavailable")
-        if self._legacy_rcon_ref is not None and self._legacy_rcon_ref.owns_value:
-            close = getattr(self._legacy_rcon, "close", None)
-            if callable(close):
-                try:
-                    result = close()
-                    if inspect.isawaitable(result):
-                        await result
-                except asyncio.CancelledError:
-                    cancelled = True
-                except BaseException as exc:
-                    if cleanup_error is None:
-                        cleanup_error = exc
-            elif cleanup_error is None:
-                cleanup_error = RuntimeError("legacy telemetry RCON close is unavailable")
-        if cancelled:
-            raise asyncio.CancelledError
-        if cleanup_error is not None:
-            raise cleanup_error
 
 
 class _PerformanceAlerts:
@@ -333,7 +238,11 @@ class ServiceSeams:
             await result
 
 
-def build_service_seams(profiles: Any, adapters: Mapping[Any, Any], state_db: Any, slot_inspector: Any, *, secret_dir: str | Path = DEFAULT_SECRET_DIR, secret_values: tuple[str, ...] = (), stats_config: Mapping[str, Any] | None = None, b2_transport: Any | None = None, sunlit_online_backup: Any | None = None, benchmark_config: Any = None, telemetry_db: Any | None = None, rcon_telemetry: Any | None = None, reservation_store: Any | None = None, telemetry_runtime: TelemetryRuntime | None = None, alert_runtime: AlertRuntime | None = None, history_queries: HistoryQueryService | None = None, container_slot: _ContainerSlot | None = None, crafty_adapters: tuple[Any, ...] = (), own_telemetry_resources: bool = False, register_owned: Callable[[Any, Any], Any] | None = None) -> ServiceSeams:
+def build_service_seams(profiles: Any, adapters: Mapping[Any, Any], state_db: Any, slot_inspector: Any, *, secret_dir: str | Path = DEFAULT_SECRET_DIR, secret_values: tuple[str, ...] = (), stats_config: Mapping[str, Any] | None = None, b2_transport: Any | None = None, sunlit_online_backup: Any | None = None, benchmark_config: Any = None, telemetry_db: Any | None = None, rcon_telemetry: Any | None = None, reservation_store: Any | None = None, telemetry_runtime: TelemetryRuntime | None = None, alert_runtime: AlertRuntime | None = None, history_queries: HistoryQueryService | None = None, container_slot: _ContainerSlot | None = None, crafty_adapters: tuple[Any, ...] = (), own_telemetry_resources: bool = False, register_owned: Callable[[Any, Any], Any] | None = None, _boundary_hook: Callable[[str], None] | None = None) -> ServiceSeams:
+    def boundary(label: str) -> None:
+        if _boundary_hook is not None:
+            _boundary_hook(label)
+
     profile_items = tuple(profiles)
     profile_map = {_key(profile): profile for profile in profile_items}
     adapter_map = {_key(profile): adapters.get(getattr(profile, "id", None), adapters.get(_key(profile))) for profile in profile_items}
@@ -349,13 +258,17 @@ def build_service_seams(profiles: Any, adapters: Mapping[Any, Any], state_db: An
         telemetry_db = TelemetryDatabase.open(Path(state_db.path).with_name("telemetry.db"))
         if register_owned is not None:
             register_owned(telemetry_db, telemetry_db.close)
+        boundary("telemetry_db")
     notification_service = NotificationService(profile_map, secret_dir=secret_dir, database=state_db, redactor=Redactor(SecretRegistry(secret_values)))
     if register_owned is not None:
         register_owned(notification_service, notification_service.close)
+    boundary("notification")
     alert_was_injected = alert_runtime is not None
     alert_runtime = alert_runtime or AlertRuntime(profile_map, notification_service)
     if register_owned is not None and not alert_was_injected:
         register_owned(alert_runtime, alert_runtime.close)
+    if not alert_was_injected:
+        boundary("alert")
     collector = TelemetryCollector(profiles=profile_items, config=config, database=telemetry_db, rcon=rcon_telemetry, player_tracker=player_tracker, alert_sink=alert_runtime)
     def process_checker(current_profile: Any, observation: Any, *, connections: Mapping[str, list[Any]] | None = None, process_metrics: Any | None = None) -> bool:
         pid = getattr(observation, "pid", None)
@@ -372,6 +285,8 @@ def build_service_seams(profiles: Any, adapters: Mapping[Any, Any], state_db: An
     telemetry_runtime = telemetry_runtime or TelemetryRuntime(status_service, collector, database=(ResourceRef.owned(telemetry_db) if own_telemetry_resources else ResourceRef.borrowed(telemetry_db)) if telemetry_db is not None else None, rcon=(ResourceRef.owned(rcon_telemetry) if own_telemetry_resources else ResourceRef.borrowed(rcon_telemetry)) if rcon_telemetry is not None else None)
     if register_owned is not None and not runtime_was_injected:
         register_owned(telemetry_runtime, telemetry_runtime.close)
+    if not runtime_was_injected:
+        boundary("telemetry_runtime")
     status_service.telemetry_collectors, status_service.telemetry_sampler = collector, telemetry_runtime.sampler
     logs = _LogsFacade(profile_map, adapter_map, Redactor(SecretRegistry(secret_values)))
     backups = BackupRpcFacade(profile_map, adapter_map, state_db, b2_transport=b2_transport, sunlit_online_backup=sunlit_online_backup, telemetry_db=telemetry_db)
@@ -381,17 +296,23 @@ def build_service_seams(profiles: Any, adapters: Mapping[Any, Any], state_db: An
         update_services[key] = update
         if register_owned is not None:
             register_owned(update, update.aclose)
+        boundary(f"update:{key}")
     worlds = WorldService(profile_map.get(ProfileId.TERRARIA_VANILLA.value), profile_map.get(ProfileId.TERRARIA_TMOD.value), backup_service=backups.services.get(ProfileId.TERRARIA_VANILLA.value), stopped_check=lambda *_: True)
     benchmark_service = BenchmarkService(parse_benchmark_plans(benchmark_config), database=state_db, adapters=adapter_map, profiles=profile_map, slot_inspector=slot_inspector)
     history_was_injected = history_queries is not None
     history_queries = history_queries or HistoryQueryService(state_db, telemetry_db, approved_state_path=_AUDIT_STATE_DB_PATH, approved_telemetry_path=Path(_AUDIT_STATE_DB_PATH).with_name("telemetry.db"))
     if register_owned is not None and not history_was_injected:
         register_owned(history_queries, history_queries.aclose)
+    if not history_was_injected:
+        boundary("history")
     legacy_sampler = None
     if config.legacy_tps_mode is LegacyTpsMode.ENABLED and connection is not None:
         legacy_profile = ProfileId.MINECRAFT_SUNLIT_COBBLEMON.value if ProfileId.MINECRAFT_SUNLIT_COBBLEMON.value in profile_map else next(iter(profile_map), "minecraft")
         legacy_sampler = TpsSampler(connection, url=FIXED_EXPORTER_URL, profile_id=legacy_profile, interval_seconds=config.legacy_tps_interval_seconds)
-    return ServiceSeams(status=_StatusFacade(status_service), logs=logs, backups=backups, worlds=WorldRpcFacade(worlds, profile_map, adapter_map), updates=UpdateRpcFacade(update_services, profile_map, adapter_map), notifications=NotificationRpcFacade(notification_service), audit=_AuditFacade(state_db, history_queries), profiles=_ProfilesFacade(profile_map), benchmarks=benchmark_service, session_store=session_store, tps_sampler=legacy_sampler, telemetry_db=telemetry_db, telemetry_sampler=telemetry_runtime.sampler, telemetry_runtime=telemetry_runtime, telemetry_collectors=collector, stats=_StatsFacade(state_db, telemetry_db, history_queries), alerts=alert_runtime, container_slot=container_slot, crafty_adapters=crafty_adapters)
+    health_reason = "legacy_tps_override" if config.legacy_tps_mode is LegacyTpsMode.ENABLED and stats.get("exporter_url") is not None else None
+    services = ServiceSeams(status=_StatusFacade(status_service, telemetry_health_reason=health_reason), logs=logs, backups=backups, worlds=WorldRpcFacade(worlds, profile_map, adapter_map), updates=UpdateRpcFacade(update_services, profile_map, adapter_map), notifications=NotificationRpcFacade(notification_service), audit=_AuditFacade(state_db, history_queries), profiles=_ProfilesFacade(profile_map), benchmarks=benchmark_service, session_store=session_store, tps_sampler=legacy_sampler, telemetry_db=telemetry_db, telemetry_sampler=telemetry_runtime.sampler, telemetry_runtime=telemetry_runtime, telemetry_collectors=collector, stats=_StatsFacade(state_db, telemetry_db, history_queries), alerts=alert_runtime, container_slot=container_slot, crafty_adapters=crafty_adapters)
+    boundary("service_seams")
+    return services
 
 
 StatsCompatibilityFacade = _StatsFacade

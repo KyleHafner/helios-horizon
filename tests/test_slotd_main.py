@@ -4,6 +4,7 @@ import asyncio
 import stat
 import logging
 import socket
+import warnings
 from types import SimpleNamespace
 from uuid import uuid4
 
@@ -24,7 +25,19 @@ from game_control.protocol import (
 )
 from game_control.push import WatchProtocolError
 from game_control.slot import SlotObservation
+from game_control.models import AdapterKind, OperationName, ProfileId
+from game_control.adapters.crafty import CraftyAdapter
+from game_control.controller import Controller
+from game_control.history_queries import HistoryQueryService
+from game_control.notifications import NotificationService
+from game_control.rcon_telemetry import PersistentRconTelemetry
+from game_control.runtime.alerts import AlertRuntime
+from game_control.runtime.telemetry import TelemetryRuntime
+from game_control.telemetry_db import TelemetryDatabase
+from game_control.updates import UpdateService
 import game_control.slotd_main as slotd_main
+import game_control.state_db as state_db_module
+import game_control.service_wiring as service_wiring
 from game_control.slotd_main import UnixRpcServer, _await_free_slot, _await_systemd_profile_ready, _maintenance_loop
 
 
@@ -67,6 +80,143 @@ async def test_provisional_owner_closes_registered_resources_once_in_reverse_ord
     await owner.aclose()
 
     assert events == ["service", "state"]
+
+
+@pytest.mark.asyncio
+async def test_assembly_cancellation_keeps_primary_error_when_cleanup_fails(monkeypatch):
+    events = []
+
+    class Owned:
+        def close(self):
+            events.append("close")
+            raise RuntimeError("cleanup failed")
+
+    def fail_build(_config, *, provisional):
+        resource = Owned()
+        provisional.register(resource, resource.close)
+        raise asyncio.CancelledError
+
+    monkeypatch.setattr(slotd_main, "_build_controller_unmanaged", fail_build)
+    with pytest.raises(asyncio.CancelledError):
+        await slotd_main.build_controller_assembly()
+    assert events == ["close"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "failure_boundary, cancellation",
+    [
+        (boundary, cancellation)
+        for boundary in (
+            "state_db", "crafty", "one_shot_rcon", "persistent_rcon",
+            "telemetry_db", "notification", "alert", "telemetry_runtime",
+            "update:terraria-vanilla", "update:minecraft-sunlit-cobblemon",
+            "history", "service_seams", "service_seams_return", "session_recovery",
+            "controller", "container", "finalizer",
+        )
+        for cancellation in (False, True)
+    ],
+)
+async def test_production_assembly_failure_matrix_closes_each_acquisition_once(
+    monkeypatch, tmp_path, failure_boundary, cancellation
+):
+    """Fault every real root seam and verify provisional ownership is exact."""
+    class Registry:
+        def __iter__(self):
+            return iter((terraria, sunlit))
+
+    terraria = SimpleNamespace(
+        id=ProfileId.TERRARIA_VANILLA, display_name="Terraria", adapter=AdapterKind.CRAFTY,
+        crafty_server_id=1, process=SimpleNamespace(executable="/usr/bin/game", argv_contains=()),
+        ports=(SimpleNamespace(protocol="tcp", port=7777, required=True),),
+        paths=SimpleNamespace(data_roots=("/var/lib/game",), mutable_root="/var/lib/game", log_files=(),
+                              backup_root="/var/backups/game", install_root="/opt/game", version_file="/var/lib/game/version"),
+        operations=frozenset(OperationName), update=SimpleNamespace(kind="manual"),
+        notification_events=frozenset(), health_timeout_seconds=5,
+    )
+    sunlit = SimpleNamespace(
+        id=ProfileId.MINECRAFT_SUNLIT_COBBLEMON, display_name="Sunlit", adapter=AdapterKind.SYSTEMD,
+        process=SimpleNamespace(executable="/usr/bin/game", argv_contains=()),
+        ports=(SimpleNamespace(protocol="tcp", port=25565, required=True),),
+        paths=SimpleNamespace(data_roots=("/var/lib/game",), mutable_root="/var/lib/game", log_files=(),
+                              backup_root="/var/backups/game", install_root="/opt/game", version_file="/var/lib/game/version"),
+        operations=frozenset(OperationName), update=SimpleNamespace(kind="manual"),
+        notification_events=frozenset(), health_timeout_seconds=5,
+    )
+    config = tmp_path / "root.toml"
+    token = tmp_path / "crafty-token"
+    token.write_text("test-token", encoding="utf-8")
+    config.write_text(
+        f'profiles_dir = "{tmp_path}"\nstate_db = "{tmp_path / "state.db"}"\n'
+        f'reservation_path = "{tmp_path / "reservation.json"}"\n'
+        f'[crafty]\nbase_url = "http://127.0.0.1:8000"\ntoken_path = "{token}"\n',
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(slotd_main.ProfileRegistry, "load", staticmethod(lambda _path: Registry()))
+    monkeypatch.setattr(state_db_module, "STATE_DB_PATH", tmp_path / "state.db")
+    monkeypatch.setattr(slotd_main, "STATE_DB_PATH", tmp_path / "state.db")
+    monkeypatch.setattr(service_wiring, "_AUDIT_STATE_DB_PATH", tmp_path / "state.db")
+
+    events = []
+    def wrap_sync(cls, method, label):
+        original = getattr(cls, method)
+        def wrapped(self, *args, **kwargs):
+            events.append(label)
+            if cancellation and label == "state_db":
+                raise RuntimeError("injected cleanup failure")
+            return original(self, *args, **kwargs)
+        monkeypatch.setattr(cls, method, wrapped)
+
+    def wrap_async(cls, method, label):
+        original = getattr(cls, method)
+        async def wrapped(self, *args, **kwargs):
+            events.append(label)
+            return await original(self, *args, **kwargs)
+        monkeypatch.setattr(cls, method, wrapped)
+
+    wrap_sync(state_db_module.StateDatabase, "close", "state_db")
+    wrap_async(CraftyAdapter, "aclose", "crafty")
+    wrap_async(PersistentRconTelemetry, "close", "persistent_rcon")
+    wrap_sync(TelemetryDatabase, "close", "telemetry_db")
+    wrap_sync(NotificationService, "close", "notification")
+    wrap_async(AlertRuntime, "close", "alert")
+    wrap_async(TelemetryRuntime, "close", "telemetry_runtime")
+    wrap_async(UpdateService, "aclose", "update")
+    wrap_async(HistoryQueryService, "aclose", "history")
+    wrap_async(Controller, "aclose", "controller")
+
+    acquired = []
+    def fail_at(label):
+        acquired.append(label)
+        if label == failure_boundary:
+            if cancellation:
+                raise asyncio.CancelledError
+            raise RuntimeError(f"injected boundary failure: {label}")
+
+    expected_exception = asyncio.CancelledError if cancellation else RuntimeError
+    with pytest.raises(expected_exception, match=None if cancellation else "injected boundary failure"):
+        await slotd_main.build_controller_assembly(config, _boundary_hook=fail_at)
+
+    # A one-shot RCON has no persistent close operation; its explicit owner
+    # hook is still exercised, while persistent RCON is closed exactly once.
+    expected = []
+    for label in reversed(acquired):
+        if label in {"service_seams", "service_seams_return", "session_recovery", "container", "finalizer"}:
+            continue
+        if label == "one_shot_rcon":
+            continue
+        if label == "telemetry_db" and "telemetry_runtime" in acquired:
+            continue  # TelemetryRuntime is the sole delegated database owner.
+        if label == "persistent_rcon" and "telemetry_runtime" in acquired:
+            continue  # TelemetryRuntime is also the sole delegated RCON owner.
+        if label.startswith("update:"):
+            label = "update"
+        expected.append(label)
+        if label == "telemetry_runtime" and "telemetry_db" in acquired:
+            if "persistent_rcon" in acquired:
+                expected.append("persistent_rcon")
+            expected.append("telemetry_db")
+    assert events == expected
 
 
 @pytest.mark.asyncio
@@ -128,6 +278,151 @@ async def test_serve_closes_partial_task_creation_without_pending_tasks(monkeypa
         await slotd_main.serve()
 
     assert server is not None and server.closed is True
+
+
+@pytest.mark.asyncio
+async def test_serve_closes_supervisor_coroutines_at_every_creation_point(monkeypatch):
+    class Sampler:
+        def start(self):
+            return asyncio.create_task(asyncio.sleep(3600))
+
+    class LegacySampler:
+        async def run(self, _running):
+            await asyncio.sleep(3600)
+
+        async def aclose(self):
+            return None
+
+    class Services:
+        telemetry_sampler = Sampler()
+        tps_sampler = LegacySampler()
+
+        async def close(self):
+            return None
+
+    class Controller:
+        services = Services()
+        profiles = ()
+        adapters = {}
+        slot_inspector = None
+
+        async def reconcile_startup(self):
+            return None
+
+        async def maintenance_tick(self):
+            await asyncio.sleep(3600)
+
+    class Server:
+        def __init__(self, _controller):
+            self._server = self
+
+        async def start(self):
+            return None
+
+        async def serve_forever(self):
+            await asyncio.sleep(3600)
+
+        async def close(self):
+            return None
+
+    original_create_task = asyncio.create_task
+    for failure_point in range(1, 7):
+        calls = 0
+        created_names = []
+
+        def create_task(coro, *args, **kwargs):
+            nonlocal calls
+            calls += 1
+            created_names.append(kwargs.get("name"))
+            if calls == failure_point:
+                coro.close()
+                raise RuntimeError("injected task creation failure")
+            return original_create_task(coro, *args, **kwargs)
+
+        loop = asyncio.get_running_loop()
+        loop_errors = []
+        previous_handler = loop.get_exception_handler()
+        loop.set_exception_handler(lambda _loop, context: loop_errors.append(context))
+        monkeypatch.setattr(slotd_main, "build_controller_assembly", lambda: _test_assembly(Controller()))
+        monkeypatch.setattr(slotd_main, "UnixRpcServer", Server)
+        monkeypatch.setattr(slotd_main.asyncio, "create_task", create_task)
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            with pytest.raises(RuntimeError, match="injected task creation failure"):
+                await slotd_main.serve()
+        loop.set_exception_handler(previous_handler)
+        assert not [warning for warning in caught if "never awaited" in str(warning.message)]
+        assert not loop_errors
+        assert created_names[failure_point - 1] == (
+            "horizon-initialization",
+            "horizon-maintenance-supervisor",
+            "horizon-event-loop-lag-supervisor",
+            "horizon-telemetry-supervisor",
+            "horizon-legacy-tps-supervisor",
+            "horizon-rpc-supervisor",
+        )[failure_point - 1]
+
+
+@pytest.mark.asyncio
+async def test_serve_observes_completed_supervisor_exception_during_cancel_race(monkeypatch):
+    class Services:
+        tps_sampler = None
+        telemetry_sampler = None
+
+        async def close(self):
+            return None
+
+    class Controller:
+        services = Services()
+        profiles = ()
+        adapters = {}
+        slot_inspector = None
+
+        async def reconcile_startup(self):
+            return None
+
+        async def maintenance_tick(self):
+            await asyncio.sleep(3600)
+
+    class Server:
+        def __init__(self, _controller):
+            self._server = self
+
+        async def start(self):
+            return None
+
+        async def serve_forever(self):
+            raise RuntimeError("unobserved supervisor")
+
+        async def close(self):
+            return None
+
+    real_wait = asyncio.wait
+    raced = False
+
+    async def race_wait(aws, *args, **kwargs):
+        nonlocal raced
+        done, pending = await real_wait(aws, *args, **kwargs)
+        if not raced and done:
+            raced = True
+            asyncio.current_task().cancel()
+            return set(), set(aws)
+        return done, pending
+
+    loop = asyncio.get_running_loop()
+    loop_errors = []
+    previous_handler = loop.get_exception_handler()
+    loop.set_exception_handler(lambda _loop, context: loop_errors.append(context))
+    monkeypatch.setattr(slotd_main, "build_controller_assembly", lambda: _test_assembly(Controller()))
+    monkeypatch.setattr(slotd_main, "UnixRpcServer", Server)
+    monkeypatch.setattr(slotd_main.asyncio, "wait", race_wait)
+    try:
+        with pytest.raises(asyncio.CancelledError):
+            await slotd_main.serve()
+    finally:
+        loop.set_exception_handler(previous_handler)
+    await asyncio.sleep(0)
+    assert not loop_errors
 
 
 class _Reader:

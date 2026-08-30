@@ -122,10 +122,10 @@ class ServiceContainer:
                     first_error = exc
             else:
                 self._crafty_closed.add(identity)
-        if first_error is not None:
-            raise first_error
         if cancelled:
             raise asyncio.CancelledError
+        if first_error is not None:
+            raise first_error
 
     async def _close_update_services(self) -> None:
         first_error: BaseException | None = None
@@ -147,10 +147,10 @@ class ServiceContainer:
                     first_error = exc
             else:
                 self._updates_closed.add(identity)
-        if first_error is not None:
-            raise first_error
         if cancelled:
             raise asyncio.CancelledError
+        if first_error is not None:
+            raise first_error
 
     async def _close_notification(self) -> None:
         if self._notification_closed:
@@ -215,12 +215,12 @@ class ServiceContainer:
         await run_async(self._close_history)
         run_sync(self._close_state_database)
 
+        if cancelled:
+            raise asyncio.CancelledError
         if first_error is not None:
             if self._first_close_error is None:
                 self._first_close_error = first_error
             raise self._first_close_error
-        if cancelled:
-            raise asyncio.CancelledError
 
     @staticmethod
     def _consume_close_task(task: asyncio.Task[None]) -> None:

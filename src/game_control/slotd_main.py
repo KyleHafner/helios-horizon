@@ -328,8 +328,12 @@ class UnixRpcServer:
 RpcServer = UnixRpcServer
 
 
-def _build_controller_unmanaged(config_path: str | os.PathLike[str] = ROOT_CONFIG, *, provisional: _ProvisionalOwner | None = None) -> Controller:
+def _build_controller_unmanaged(config_path: str | os.PathLike[str] = ROOT_CONFIG, *, provisional: _ProvisionalOwner | None = None, boundary_hook: Any | None = None) -> Controller:
     """Construct the production root controller from a closed root config."""
+    def boundary(label: str) -> None:
+        if boundary_hook is not None:
+            boundary_hook(label)
+
     config_file = Path(config_path)
     if config_file.is_symlink() or not config_file.is_file():
         raise RuntimeError("root controller configuration is unavailable")
@@ -357,6 +361,7 @@ def _build_controller_unmanaged(config_path: str | os.PathLike[str] = ROOT_CONFI
     state_db = StateDatabase.open(state_path)
     if provisional is not None:
         provisional.register(state_db, state_db.close)
+    boundary("state_db")
     crafty_cfg = config.get("crafty", {})
     if not crafty_cfg and ("crafty_base_url" in config or "crafty_token_path" in config):
         crafty_cfg = {
@@ -404,15 +409,18 @@ def _build_controller_unmanaged(config_path: str | os.PathLike[str] = ROOT_CONFI
                 )
                 if provisional is not None:
                     provisional.register(crafty, crafty.aclose)
+                boundary("crafty")
             adapters[profile.id] = crafty
         else:
             if profile.id.value == "minecraft-sunlit-cobblemon":
                 sunlit_rcon = RconClient(**rcon_kwargs)
                 if provisional is not None:
                     provisional.register(sunlit_rcon, lambda: None)
+                boundary("one_shot_rcon")
                 rcon_telemetry = PersistentRconTelemetry(profile.id.value, **rcon_kwargs)
                 if provisional is not None:
                     provisional.register(rcon_telemetry, rcon_telemetry.close)
+                boundary("persistent_rcon")
                 adapters[profile.id] = SystemdAdapter(rcon=sunlit_rcon)
             else:
                 adapters[profile.id] = SystemdAdapter()
@@ -468,9 +476,12 @@ def _build_controller_unmanaged(config_path: str | os.PathLike[str] = ROOT_CONFI
         crafty_adapters=(crafty,) if crafty is not None else (),
         own_telemetry_resources=True,
         register_owned=provisional.register if provisional is not None else None,
+        _boundary_hook=boundary_hook,
     )
+    boundary("service_seams_return")
     if services.session_store is not None:
         services.session_store.recover(now=datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"))
+    boundary("session_recovery")
     controller = Controller(
         profiles=registry,
         state_db=state_db,
@@ -487,6 +498,7 @@ def _build_controller_unmanaged(config_path: str | os.PathLike[str] = ROOT_CONFI
     )
     if provisional is not None:
         provisional.register(controller, controller.aclose)
+    boundary("controller")
     return controller
 
 
@@ -535,6 +547,29 @@ class _ProvisionalOwner:
             raise first
 
 
+async def _drain_provisional(owner: _ProvisionalOwner) -> BaseException | None:
+    """Drain root construction cleanup despite caller cancellation."""
+    cleanup = asyncio.ensure_future(owner.aclose())
+    interrupted = False
+    while not cleanup.done():
+        try:
+            await asyncio.shield(cleanup)
+        except asyncio.CancelledError:
+            interrupted = True
+            continue
+        except BaseException:
+            if cleanup.done():
+                break
+            raise
+    try:
+        cleanup.result()
+    except BaseException as exc:
+        if interrupted and isinstance(exc, asyncio.CancelledError):
+            return asyncio.CancelledError()
+        return exc
+    return asyncio.CancelledError() if interrupted else None
+
+
 class _RootAssembly:
     def __init__(self, controller: Controller, services: Any, container: ServiceContainer):
         self.controller, self.services, self.container = controller, services, container
@@ -543,11 +578,16 @@ class _RootAssembly:
         await self.container.aclose()
 
 
-async def build_controller_assembly(config_path: str | os.PathLike[str] = ROOT_CONFIG) -> _RootAssembly:
+async def build_controller_assembly(config_path: str | os.PathLike[str] = ROOT_CONFIG, *, _boundary_hook: Any | None = None) -> _RootAssembly:
     """Build the complete root graph and publish it only after finalization."""
     provisional = _ProvisionalOwner()
     try:
-        controller = _build_controller_unmanaged(config_path, provisional=provisional)
+        build_kwargs: dict[str, Any] = {"provisional": provisional}
+        # The private boundary hook is test-only fault injection; production
+        # keeps the same typed acquisition sequence without a callback.
+        if _boundary_hook is not None:
+            build_kwargs["boundary_hook"] = _boundary_hook
+        controller = _build_controller_unmanaged(config_path, **build_kwargs)
         services = controller.services
         updates = tuple(services.updates.services.values())
         history = services.audit.history
@@ -563,13 +603,21 @@ async def build_controller_assembly(config_path: str | os.PathLike[str] = ROOT_C
             notification_service=ResourceRef.owned(notification_service),
             legacy_tps_sampler=ResourceRef.owned(services.tps_sampler) if services.tps_sampler is not None else None,
         )
+        if _boundary_hook is not None:
+            _boundary_hook("container")
         if not isinstance(services._container_slot, _ContainerSlot):
             raise RuntimeError("service container slot is unavailable")
         services._finalize_container(container)
+        if _boundary_hook is not None:
+            _boundary_hook("finalizer")
         provisional.transfer()
         return _RootAssembly(controller, services, container)
-    except BaseException:
-        await provisional.aclose()
+    except BaseException as original:
+        cleanup_error = await _drain_provisional(provisional)
+        # Construction's primary failure, especially cancellation, is never
+        # replaced by a later owner cleanup failure.
+        if cleanup_error is not None and not isinstance(original, asyncio.CancelledError):
+            raise original from cleanup_error
         raise
 
 
@@ -663,6 +711,25 @@ async def serve() -> None:
     server: UnixRpcServer | None = None
     owned_tasks: list[asyncio.Task[Any]] = []
     task_roles: dict[asyncio.Task[Any], str] = {}
+    observed_tasks: set[asyncio.Task[Any]] = set()
+
+    def create_owned_task(coroutine: Any, *, name: str) -> asyncio.Task[Any]:
+        """Create a supervised task without leaking its coroutine on failure."""
+        try:
+            return asyncio.create_task(coroutine, name=name)
+        except BaseException:
+            close = getattr(coroutine, "close", None)
+            if callable(close):
+                close()
+            raise
+
+    def observe_task(task: asyncio.Task[Any]) -> BaseException | None:
+        if task in observed_tasks:
+            return None
+        observed_tasks.add(task)
+        if task.cancelled():
+            return asyncio.CancelledError()
+        return task.exception()
 
     async def minecraft_running() -> bool:
         minecraft_id = (
@@ -705,26 +772,26 @@ async def serve() -> None:
             backups.reconcile_startup()
         await controller.reconcile_startup()
         await server.start()
-        initialization = asyncio.create_task(asyncio.sleep(0), name="horizon-initialization")
+        initialization = create_owned_task(asyncio.sleep(0), name="horizon-initialization")
         owned_tasks.append(initialization)
         task_roles[initialization] = "initialization"
-        maintenance_task = asyncio.create_task(_maintenance_loop(controller, initialization=initialization), name="horizon-maintenance-supervisor")
+        maintenance_task = create_owned_task(_maintenance_loop(controller, initialization=initialization), name="horizon-maintenance-supervisor")
         owned_tasks.append(maintenance_task)
         task_roles[maintenance_task] = "maintenance"
-        loop_lag_task = asyncio.create_task(_event_loop_lag_loop(controller), name="horizon-event-loop-lag-supervisor")
+        loop_lag_task = create_owned_task(_event_loop_lag_loop(controller), name="horizon-event-loop-lag-supervisor")
         owned_tasks.append(loop_lag_task)
         task_roles[loop_lag_task] = "event_loop_lag"
         telemetry_sampler = getattr(getattr(controller, "services", None), "telemetry_sampler", None)
         if telemetry_sampler is not None:
-            telemetry_task = asyncio.create_task(_run_telemetry_sampler(telemetry_sampler, initialization), name="horizon-telemetry-supervisor")
+            telemetry_task = create_owned_task(_run_telemetry_sampler(telemetry_sampler, initialization), name="horizon-telemetry-supervisor")
             owned_tasks.append(telemetry_task)
             task_roles[telemetry_task] = "telemetry"
         tps_sampler = getattr(controller.services, "tps_sampler", None)
         if tps_sampler is not None:
-            tps_task = asyncio.create_task(tps_sampler.run(minecraft_running), name="horizon-legacy-tps-supervisor")
+            tps_task = create_owned_task(tps_sampler.run(minecraft_running), name="horizon-legacy-tps-supervisor")
             owned_tasks.append(tps_task)
             task_roles[tps_task] = "legacy_tps"
-        server_task = asyncio.create_task(server._server.serve_forever(), name="horizon-rpc-supervisor")  # type: ignore[union-attr]
+        server_task = create_owned_task(server._server.serve_forever(), name="horizon-rpc-supervisor")  # type: ignore[union-attr]
         owned_tasks.append(server_task)
         task_roles[server_task] = "rpc"
         supervised = set(owned_tasks)
@@ -732,9 +799,9 @@ async def serve() -> None:
             done, _pending = await asyncio.wait(supervised, return_when=asyncio.FIRST_COMPLETED)
             for task in done:
                 supervised.discard(task)
-                if task.cancelled():
-                    raise asyncio.CancelledError
-                error = task.exception()
+                error = observe_task(task)
+                if isinstance(error, asyncio.CancelledError):
+                    raise error
                 role = task_roles[task]
                 if role == "initialization":
                     if error is not None:
@@ -790,6 +857,9 @@ async def serve() -> None:
         if pending_tasks:
             drain_task = asyncio.ensure_future(asyncio.gather(*pending_tasks, return_exceptions=True))
             await drain(drain_task)
+        for task in owned_tasks:
+            if task.done():
+                observe_task(task)
         if server is not None:
             close_task = asyncio.ensure_future(server.close())
             await drain(close_task)

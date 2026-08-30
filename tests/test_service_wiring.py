@@ -5,6 +5,7 @@ from pathlib import Path
 import asyncio
 import threading
 import sqlite3
+from contextlib import suppress
 from types import SimpleNamespace
 
 import pytest
@@ -43,6 +44,9 @@ from game_control.service_wiring import (
     _StatusFacade,
 )
 from game_control.status import StatusService
+from game_control.state_db import StateDatabase
+from game_control.telemetry_db import TelemetryDatabase
+from game_control.tps import TpsSampler
 from game_control.updates import UpdateService
 from game_control import slotd_main
 
@@ -183,7 +187,6 @@ async def test_build_controller_wires_real_typed_service_seams(monkeypatch, tmp_
 @pytest.mark.asyncio
 async def test_notification_facade_keeps_sqlite_audit_on_event_loop(tmp_path):
     import sqlite3
-    import threading
 
     profile = _profile(ProfileId.MINECRAFT, AdapterKind.CRAFTY)
     profile.notification_events = frozenset({NotificationEvent.START})
@@ -642,6 +645,215 @@ def test_legacy_telemetry_config_keeps_no_tick_when_no_approved_profile_exists()
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "mode, exporter, legacy_rows, modern_exporters, reason",
+    [
+        ("disabled", False, False, False, None),
+        ("disabled", True, False, True, None),
+        ("enabled", False, True, False, None),
+        ("enabled", True, True, False, "legacy_tps_override"),
+    ],
+)
+async def test_legacy_exporter_matrix_has_one_store_and_explicit_task_policy(
+    mode, exporter, legacy_rows, modern_exporters, reason
+):
+    stats = {"legacy_tps_mode": mode}
+    if exporter:
+        stats["exporter_url"] = "http://127.0.0.1:19565/metrics"
+    config = wiring._legacy_telemetry_config(
+        stats, ("minecraft", "minecraft-sunlit-cobblemon")
+    )
+    assert bool(config.exporters) is modern_exporters
+    assert config.resource_interval_seconds == 5.0
+    task_names = {"horizon-telemetry-supervisor"}
+    if legacy_rows:
+        task_names.add("horizon-legacy-tps-supervisor")
+    assert ("horizon-legacy-tps-supervisor" in task_names) is legacy_rows
+    health = wiring._StatusFacade(
+        SimpleNamespace(telemetry_health=lambda: {"ok": True}),
+        telemetry_health_reason=reason,
+    ).telemetry_health()
+    assert health.get("reason") == reason
+    if not legacy_rows:
+        return
+
+    class Response:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_args):
+            return None
+
+        def raise_for_status(self):
+            return None
+
+        async def aiter_bytes(self):
+            yield b"mc_tick_seconds{quantile=\"0.5\"} 0.05\n"
+
+    class Client:
+        def stream(self, *_args, **_kwargs):
+            return Response()
+
+        async def aclose(self):
+            return None
+
+    connection = sqlite3.connect(":memory:")
+    connection.execute("CREATE TABLE metric_samples(profile_id TEXT, metric TEXT, ts TEXT, value REAL)")
+    sampler = TpsSampler(
+        connection,
+        client=Client(),
+        clock=lambda: datetime(2026, 1, 1, tzinfo=timezone.utc),
+    )
+    assert await sampler.run_once()
+    rows = connection.execute("SELECT profile_id, metric, ts FROM metric_samples").fetchall()
+    assert len(rows) == 2
+    assert {row[0] for row in rows} == {"minecraft"}
+    assert len({row[2] for row in rows}) == 1
+    await sampler.aclose()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "mode, exporter, has_legacy, has_modern_tick",
+    [("disabled", False, False, False), ("disabled", True, False, True),
+     ("enabled", False, True, False), ("enabled", True, True, False)],
+)
+async def test_actual_composition_matrix_runs_tasks_and_isolated_sqlite(
+    monkeypatch, tmp_path, mode, exporter, has_legacy, has_modern_tick
+):
+    class Response:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_args):
+            return None
+
+        def raise_for_status(self):
+            return None
+
+        async def aiter_bytes(self):
+            yield b"mc_tick_seconds{quantile=\"0.5\"} 0.05\n"
+
+    class Client:
+        def stream(self, *_args, **_kwargs):
+            return Response()
+
+    monkeypatch.setattr("game_control.state_db.STATE_DB_PATH", tmp_path / "state.db")
+    state_db = StateDatabase.open(tmp_path / "state.db")
+    connection = state_db.connection
+    profiles = tuple(_profile(profile_id, AdapterKind.SYSTEMD) for profile_id in (
+        ProfileId.MINECRAFT, ProfileId.MINECRAFT_SUNLIT_COBBLEMON,
+    ))
+    adapters = {profile.id: _Adapter() for profile in profiles}
+    stats = {"legacy_tps_mode": mode}
+    if exporter:
+        stats["exporter_url"] = "http://127.0.0.1:19565/metrics"
+    writer = TelemetryDatabase.open(tmp_path / "telemetry.db")
+    services = wiring.build_service_seams(
+        profiles, adapters, state_db,
+        SimpleNamespace(observe=lambda: SimpleNamespace(owner=None, inconsistent=False)),
+        stats_config=stats, telemetry_db=writer,
+    )
+    collector = services.telemetry_collectors
+    collector._monotonic = lambda: 100.0
+    collector._wall_clock_ms = lambda: 123456
+    collector._fetch_exporter = lambda _url: _async_text(
+        "mc_tick_seconds{quantile=\"0.5\"} 0.05\n"
+    )
+    snapshot = SimpleNamespace(profiles=tuple(
+        SimpleNamespace(profile_id=profile.id, state="running", pid=None, rss_bytes=None)
+        for profile in profiles
+    ))
+    await services.telemetry_runtime.cycle(snapshot)
+    if has_legacy:
+        legacy = services.tps_sampler
+        await legacy._client.aclose()
+        legacy._client = Client()
+        legacy._owns_client = False
+        assert await legacy.run_once()
+    assert writer.drain(2.0)
+    modern_tick_rows = writer.connection.execute(
+        "SELECT s.ts_ms, r.metric FROM telemetry_samples s "
+        "JOIN telemetry_series r USING(series_id) WHERE r.metric LIKE 'mspt_p%'"
+    ).fetchall()
+    assert bool(modern_tick_rows) is has_modern_tick
+    if modern_tick_rows:
+        assert len({row[0] for row in modern_tick_rows}) == 1
+    legacy_rows = connection.execute("SELECT profile_id, metric, ts FROM metric_samples").fetchall()
+    assert len(legacy_rows) == (2 if has_legacy else 0)
+    if legacy_rows:
+        assert len({row[2] for row in legacy_rows}) == 1
+    assert services.telemetry_runtime.sampler.interval_seconds == 5.0
+    assert services.status.telemetry_health().get("reason") == (
+        "legacy_tps_override" if mode == "enabled" and exporter else None
+    )
+
+    built_services, built_profiles, built_adapters = services, profiles, adapters
+    class Controller:
+        services = built_services
+        profiles = built_profiles
+        adapters = built_adapters
+        slot_inspector = SimpleNamespace(observe=lambda: SimpleNamespace(owner=None))
+        performance = SimpleNamespace(record_event_loop_lag=lambda _value: None)
+
+        async def reconcile_startup(self):
+            return None
+
+        async def maintenance_tick(self):
+            await asyncio.sleep(3600)
+
+    class Assembly:
+        controller = Controller()
+
+        async def aclose(self):
+            return None
+
+    class Server:
+        def __init__(self, _controller):
+            self._server = self
+
+        async def start(self):
+            return None
+
+        async def serve_forever(self):
+            return None
+
+        async def close(self):
+            return None
+
+    names = []
+    original_create_task = asyncio.create_task
+
+    def create_task(coro, *args, **kwargs):
+        names.append(kwargs.get("name"))
+        return original_create_task(coro, *args, **kwargs)
+
+    async def build():
+        return Assembly()
+
+    monkeypatch.setattr(slotd_main, "build_controller_assembly", build)
+    monkeypatch.setattr(slotd_main, "UnixRpcServer", Server)
+    monkeypatch.setattr(slotd_main.asyncio, "create_task", create_task)
+    with pytest.raises(RuntimeError, match="RPC server task exited unexpectedly"):
+        await slotd_main.serve()
+    assert "horizon-telemetry-supervisor" in names
+    assert ("horizon-legacy-tps-supervisor" in names) is has_legacy
+    with suppress(asyncio.CancelledError):
+        await services.telemetry_runtime.close()
+    await services.alerts.close()
+    await services.audit.history.aclose()
+    for update in services.updates.services.values():
+        await update.aclose()
+    writer.drain(2.0)
+    writer.close()
+    state_db.close()
+
+
+async def _async_text(value):
+    return value
+
+
+@pytest.mark.asyncio
 async def test_legacy_collector_ownership_bridge_closes_only_explicit_rcon():
     events = []
 
@@ -678,6 +890,55 @@ async def test_legacy_collector_ownership_bridge_closes_only_explicit_rcon():
     assert rcon.closes == 1
     assert database.drains == 1
     assert database.closes == 0
+
+
+@pytest.mark.asyncio
+async def test_injected_telemetry_and_rcon_refs_remain_borrowed_after_runtime_close():
+    from game_control.runtime.telemetry import (
+        ResourceRef, TelemetryCollector, TelemetryRuntime, TelemetryRuntimeConfig,
+    )
+
+    class Database:
+        def __init__(self):
+            self.drains = 0
+            self.closed = False
+
+        def drain(self, _timeout=None):
+            self.drains += 1
+            return True
+
+        def close(self):
+            self.closed = True
+
+        def enqueue_sample(self, *_args, **_kwargs):
+            return True
+
+    class Rcon:
+        profile_id = "minecraft"
+        closed = False
+
+        async def close(self):
+            self.closed = True
+
+        async def execute(self, _command):
+            raise RuntimeError("not used")
+
+    database, rcon = Database(), Rcon()
+    collector = TelemetryCollector(
+        profiles=(), config=TelemetryRuntimeConfig(),
+        database=ResourceRef.borrowed(database), rcon=ResourceRef.borrowed(rcon),
+        player_tracker=SimpleNamespace(),
+    )
+    runtime = TelemetryRuntime(
+        SimpleNamespace(snapshot=lambda **_kwargs: SimpleNamespace(profiles=())), collector,
+        database=ResourceRef.borrowed(database), rcon=ResourceRef.borrowed(rcon),
+        sampler=ResourceRef.borrowed(SimpleNamespace()),
+    )
+    await runtime.close()
+    assert database.drains == 1
+    assert database.closed is False
+    assert rcon.closed is False
+    assert database.enqueue_sample("minecraft", "players", 1, ts_ms=1)
 
 
 @pytest.mark.asyncio

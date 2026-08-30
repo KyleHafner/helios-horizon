@@ -39,6 +39,21 @@ class SyncClose:
         self.events.append(self.name)
 
 
+class CancelClose:
+    def __init__(self, name, events):
+        self.name = name
+        self.events = events
+        self.calls = 0
+
+    async def close(self):
+        self.calls += 1
+        self.events.append(self.name)
+        raise asyncio.CancelledError
+
+    async def aclose(self):
+        await self.close()
+
+
 def _container(events, *, owned=True, controller=None, telemetry=None):
     marker = lambda name: AsyncClose(name, events)
     controller = controller or marker("controller")
@@ -154,6 +169,38 @@ async def test_sync_state_cancellation_is_retryable_and_not_an_ordinary_error():
     await container.aclose()
     assert state.calls == 2
     assert container.closed
+
+
+@pytest.mark.asyncio
+async def test_stage_cancellation_wins_over_later_ordinary_cleanup_error():
+    events = []
+    controller = CancelClose("controller", events)
+    telemetry = AsyncClose("telemetry", events, error=RuntimeError("later"))
+    container = _container(events, controller=controller, telemetry=telemetry)
+
+    with pytest.raises(asyncio.CancelledError):
+        await container.aclose()
+
+    assert events[:2] == ["controller", "telemetry"]
+    assert telemetry.calls == 1
+    with pytest.raises(asyncio.CancelledError):
+        await container.aclose()
+    assert telemetry.calls == 2
+
+
+@pytest.mark.asyncio
+async def test_sibling_cancellation_wins_while_other_siblings_are_attempted():
+    events = []
+    first = CancelClose("crafty-cancel", events)
+    second = AsyncClose("crafty-error", events, error=RuntimeError("sibling"))
+    container = _container(events)
+    container.crafty_adapters = (ResourceRef.owned(first), ResourceRef.owned(second))
+
+    with pytest.raises(asyncio.CancelledError):
+        await container.aclose()
+
+    assert events.index("crafty-error") > events.index("crafty-cancel")
+    assert first.calls == 1 and second.calls == 1
 
 
 def test_sync_close_rejects_running_event_loop():
