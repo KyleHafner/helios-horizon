@@ -8,11 +8,19 @@ composition root is moved in a later, sequential commit.
 from __future__ import annotations
 
 import math
+import re
 from dataclasses import dataclass
 from typing import Any, Literal, Mapping, Protocol, runtime_checkable
 
 
 AlertProfileState = Literal["starting", "running", "stopped", "stopping", "failed"]
+_IDENTIFIER = re.compile(r"^[a-zA-Z_][a-zA-Z0-9_:.-]{0,127}$")
+
+
+def _is_safe_identifier(value: Any) -> bool:
+    """Return whether a value satisfies the bounded ASCII identifier contract."""
+
+    return isinstance(value, str) and _IDENTIFIER.fullmatch(value) is not None
 
 
 def _bounded_nonnegative(value: Any, *, name: str) -> float | None:
@@ -39,18 +47,18 @@ class AlertObservation:
     benchmark_regression: bool | None = None
 
     def __post_init__(self) -> None:
-        if (
-            not isinstance(self.profile_id, str)
-            or not self.profile_id
-            or len(self.profile_id) > 128
-            or any(ord(char) < 0x20 or ord(char) == 0x7F for char in self.profile_id)
-        ):
+        if not _is_safe_identifier(self.profile_id):
             raise ValueError("invalid alert profile")
         if not isinstance(self.profile_state, str) or self.profile_state not in {
             "starting", "running", "stopped", "stopping", "failed"
         }:
             raise ValueError("invalid alert profile state")
-        if isinstance(self.now, bool) or not isinstance(self.now, (int, float)) or not math.isfinite(float(self.now)):
+        if (
+            isinstance(self.now, bool)
+            or not isinstance(self.now, (int, float))
+            or not math.isfinite(float(self.now))
+            or float(self.now) < 0
+        ):
             raise ValueError("invalid alert timestamp")
         for value, name in (
             (self.mspt_p95, "mspt_p95"),

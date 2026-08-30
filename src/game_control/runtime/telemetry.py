@@ -8,17 +8,22 @@ from RPC or browser requests.
 from __future__ import annotations
 
 import math
-import re
 from dataclasses import dataclass
 from enum import StrEnum
 from pathlib import Path
 from typing import Any, Iterable, Mapping
 from urllib.parse import urlsplit
 
-from .protocols import AlertSink, StatusSnapshotProvider, TelemetryCollector, TelemetryDatabaseWriter, TelemetrySampler
+from .protocols import (
+    AlertSink,
+    StatusSnapshotProvider,
+    TelemetryCollector,
+    TelemetryDatabaseWriter,
+    TelemetrySampler,
+    _is_safe_identifier,
+)
 
 
-_IDENTIFIER = re.compile(r"^[a-zA-Z_][a-zA-Z0-9_:.-]{0,127}$")
 _MAX_PATH_LENGTH = 4096
 
 DEFAULT_HOST_METRICS = (
@@ -89,7 +94,7 @@ def _safe_url(value: Any) -> str:
 
 
 def _safe_identifier(value: Any, *, name: str) -> str:
-    if not isinstance(value, str) or not _IDENTIFIER.fullmatch(value):
+    if not _is_safe_identifier(value):
         raise ValueError(f"{name} is invalid")
     return value
 
