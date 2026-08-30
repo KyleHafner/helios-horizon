@@ -1,7 +1,22 @@
 [project]
 name = "helios-game-control"
 version = "0.1.0"
+description = "Security-focused single-slot control plane for self-hosted game servers"
+readme = "README.md"
+license = "MIT"
+authors = [{ name = "Swag Systems" }]
+maintainers = [{ name = "Swag Systems" }]
 requires-python = ">=3.11"
+keywords = ["fastapi", "game-server", "linux", "self-hosted", "systemd"]
+classifiers = [
+  "Development Status :: 3 - Alpha",
+  "License :: OSI Approved :: MIT License",
+  "Operating System :: POSIX :: Linux",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Topic :: System :: Systems Administration",
+]
 dependencies = [
   "fastapi>=0.115,<1",
   "uvicorn[standard]>=0.32,<1",
@@ -9,6 +24,11 @@ dependencies = [
   "httpx>=0.28,<1",
   "psutil>=6.1,<7",
 ]
+
+[project.urls]
+Homepage = "https://github.com/swagsystems/helios-horizon"
+Repository = "https://github.com/swagsystems/helios-horizon"
+Issues = "https://github.com/swagsystems/helios-horizon/issues"
 
 [build-system]
 requires = ["hatchling"]
@@ -25,7 +45,6 @@ test = [
   "pytest>=8.3,<9",
   "pytest-asyncio>=0.25,<1",
   "playwright>=1.49,<2",
-  "httpx2>=2,<3",
 ]
 
 [tool.pytest.ini_options]
