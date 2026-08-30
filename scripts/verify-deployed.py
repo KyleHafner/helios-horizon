@@ -330,6 +330,19 @@ def _direct_regular_unit_names(directory: Path) -> set[str] | None:
     return names
 
 
+def _direct_regular_names(directory: Path) -> set[str] | None:
+    try:
+        entries = directory.iterdir()
+        names: set[str] = set()
+        for path in entries:
+            info = path.lstat()
+            if stat.S_ISREG(info.st_mode):
+                names.add(path.name)
+        return names
+    except OSError:
+        return None
+
+
 def _horizon_owned_unit_names(unit_names: set[str]) -> set[str]:
     """Select only regular unit names belonging to Horizon's namespaces."""
 
@@ -417,6 +430,28 @@ def _check_target_package(checks: Checks) -> None:
         "ok" if owned_unit_names == EXPECTED_UNIT_FILES else ("unit_manifest_unavailable" if owned_unit_names is None else "unit_manifest_mismatch"),
         expected=sorted(EXPECTED_UNIT_FILES),
         actual=None if owned_unit_names is None else sorted(owned_unit_names),
+    )
+    libexec_names = _direct_regular_names(TARGET_ROOT / _LIBEXEC_NAMESPACE.path.lstrip("/"))
+    owned_libexec_names = (
+        None
+        if libexec_names is None
+        else {name for name in libexec_names if name in _LIBEXEC_NAMESPACE.exact or name.startswith(_LIBEXEC_NAMESPACE.prefixes)}
+    )
+    checks.add(
+        "target.libexec.manifest",
+        owned_libexec_names == set(_LIBEXEC_NAMESPACE.exact),
+        "ok" if owned_libexec_names == set(_LIBEXEC_NAMESPACE.exact) else "libexec_manifest_mismatch",
+        expected=sorted(_LIBEXEC_NAMESPACE.exact),
+        actual=None if owned_libexec_names is None else sorted(owned_libexec_names),
+    )
+    web_specs = tuple(spec for spec in _DEPLOYMENT_MANIFEST.files if spec.target.startswith("/opt/game-control/web/"))
+    web_names = _direct_regular_names(TARGET_ROOT / "opt/game-control/web")
+    checks.add(
+        "target.web.manifest",
+        web_names == {spec.target.rsplit("/", 1)[-1] for spec in web_specs},
+        "ok" if web_names == {spec.target.rsplit("/", 1)[-1] for spec in web_specs} else "web_manifest_mismatch",
+        expected=sorted(spec.target.rsplit("/", 1)[-1] for spec in web_specs),
+        actual=None if web_names is None else sorted(web_names),
     )
     legacy_unit_names = unit_names if unit_names is not None else set()
     legacy = sorted(LEGACY_TARGET_FILES.intersection(profile_names | runner_names | legacy_unit_names))
@@ -554,8 +589,8 @@ def _check_target_package(checks: Checks) -> None:
             checks.add("target.unit." + unit_name.removesuffix(".service"), False, "game_unit_missing")
 
     platform_files = {
-        "etc/nftables.conf": (0o644, ("policy drop", "tcp dport 25575 drop", 'iifname "wg-hzn-terraria"')),
-        "etc/game-control/lazymc/lazymc.toml": (
+        "ops/nftables/horizon.nft": (0o644, ("policy drop", "tcp dport 25575 drop", 'iifname "wg-hzn-terraria"')),
+        "ops/lazymc/lazymc.toml": (
             0o644,
             (
                 "address = \"0.0.0.0:25565\"",
@@ -568,15 +603,15 @@ def _check_target_package(checks: Checks) -> None:
                 "version = \"0.2.11\"",
             ),
         ),
-        "etc/systemd/journald@horizon.conf": (0o644, ("Storage=persistent", "SystemMaxUse=1G", "MaxRetentionSec=14day")),
-        "usr/local/share/horizon/horizon-private-measurement.conf": (0o644, ("RateLimitIntervalSec=0", "RateLimitBurst=0")),
-        "usr/local/libexec/game-sunlit-prepare": (0o755, ("MUTABLE_ROOT", "TARGET")),
-        "usr/local/libexec/horizon-capability-issue": (0o755, ("lazymc-waker", "helios-mcp-observer", "helios-mcp-waker")),
-        "usr/local/libexec/horizon-lazymc-wake": (0o755, ("run_wake_hook",)),
-        "usr/local/libexec/game-sunlit-rcon-prepare": (0o755, ("CREDENTIALS_DIRECTORY", "rcon.password")),
-        "usr/local/libexec/game-sunlit-stop": (0o755, ("STOP_MARKERS",)),
-        "usr/local/libexec/horizon-alert-notify": (0o755, ("ALERTMANAGER_URL", "TARGETS")),
-        "usr/local/libexec/horizon-bore-liveness": (
+        "ops/journald/horizon.conf": (0o644, ("Storage=persistent", "SystemMaxUse=1G", "MaxRetentionSec=14day")),
+        "ops/journald/horizon-private-measurement.conf": (0o644, ("RateLimitIntervalSec=0", "RateLimitBurst=0")),
+        "ops/bin/game-sunlit-prepare": (0o755, ("MUTABLE_ROOT", "TARGET")),
+        "ops/bin/horizon-capability-issue": (0o755, ("lazymc-waker", "helios-mcp-observer", "helios-mcp-waker")),
+        "ops/bin/horizon-lazymc-wake": (0o755, ("run_wake_hook",)),
+        "ops/bin/game-sunlit-rcon-prepare": (0o755, ("CREDENTIALS_DIRECTORY", "rcon.password")),
+        "ops/bin/game-sunlit-stop": (0o755, ("STOP_MARKERS",)),
+        "ops/bin/horizon-alert-notify": (0o755, ("ALERTMANAGER_URL", "TARGETS")),
+        "ops/bin/horizon-bore-liveness": (
             0o755,
             (
                 "bore-minecraft-fenced.service",
@@ -585,29 +620,32 @@ def _check_target_package(checks: Checks) -> None:
                 "_local_client_sessions_present",
             ),
         ),
-        "usr/local/libexec/horizon-journal-evidence": (0o755, ("horizon_journal",)),
-        "usr/local/libexec/horizon-journal-finalize": (0o755, ("finalize",)),
-        "usr/local/libexec/horizon_journal.py": (0o644, ("RateLimitBurst", "two distinct complete boots")),
-        "usr/local/libexec/horizon-state-migrate": (0o755, ("RETAINED_PROFILES", "BEGIN EXCLUSIVE")),
-        "usr/local/libexec/horizon-jvm-args": (0o755, ("managed Sunlit JVM argfile", "load_accepted_campaign")),
-        "usr/local/libexec/horizon-memory-drill": (0o755, ("horizon-memory-drill.v1", "MemorySwapMax", "OOMPolicy")),
-        "usr/local/libexec/horizon-telemetry-migrate": (0o755, ("telemetry DB importer", "MigrationError")),
-        "usr/local/libexec/horizon-phase2-threshold": (0o755, ("SKIP_PUSH", "INCONCLUSIVE")),
-        "usr/local/libexec/horizon-phase2-collect": (0o755, ("api/v1/status", "readOnly")),
-        "usr/local/libexec/horizon-phase2-browser-evidence": (
+        "ops/bin/horizon-journal-evidence": (0o755, ("horizon_journal",)),
+        "ops/bin/horizon-journal-finalize": (0o755, ("finalize",)),
+        "ops/bin/horizon_journal.py": (0o644, ("RateLimitBurst", "two distinct complete boots")),
+        "ops/bin/horizon-state-migrate": (0o755, ("RETAINED_PROFILES", "BEGIN EXCLUSIVE")),
+        "ops/bin/horizon-jvm-args": (0o755, ("managed Sunlit JVM argfile", "load_accepted_campaign")),
+        "ops/bin/horizon-memory-drill": (0o755, ("horizon-memory-drill.v1", "MemorySwapMax", "OOMPolicy")),
+        "ops/bin/horizon-telemetry-migrate": (0o755, ("telemetry DB importer", "MigrationError")),
+        "ops/bin/horizon-phase2-threshold": (0o755, ("SKIP_PUSH", "INCONCLUSIVE")),
+        "ops/bin/horizon-phase2-collect": (0o755, ("api/v1/status", "readOnly")),
+        "scripts/phase2-browser-evidence.py": (
             0o755, ("phase2.1.browser.v2", "horizon:status-applied", "resume_authoritative_status_requests")
         ),
-        "usr/local/libexec/horizon-phase2-live-acceptance": (
+        "ops/bin/horizon-phase2-live-acceptance": (
             0o755, ("phase2.live.fixture.v1", "written to stdout only", "def _order_contract")
         ),
-        "opt/game-control/web/app.js": (0o644, ("const PROFILE_FALLBACK",)),
-        "opt/game-control/web/commands.js": (0o644, ("window.HORIZON_COMMANDS",)),
-        "opt/game-control/web/index.html": (0o644, ('<main id="main-content"', "/app.js")),
-        "opt/game-control/web/palette.js": (0o644, ("window.HORIZON_PALETTE",)),
-        "opt/game-control/web/styles.css": (0o644, (".active-slot",)),
+        "web/app.js": (0o644, ("const PROFILE_FALLBACK",)),
+        "web/commands.js": (0o644, ("window.HORIZON_COMMANDS",)),
+        "web/index.html": (0o644, ('<main id="main-content"', "/app.js")),
+        "web/palette.js": (0o644, ("window.HORIZON_PALETTE",)),
+        "web/styles.css": (0o644, (".active-slot",)),
     }
     platform_ok = True
-    for relative, (expected_mode, markers) in platform_files.items():
+    for source, (_declared_mode, markers) in platform_files.items():
+        spec = next(spec for spec in _DEPLOYMENT_MANIFEST.files if spec.source == source)
+        relative = spec.target.removeprefix("/")
+        expected_mode = spec.mode
         path = TARGET_ROOT / relative
         value = _file_mode(path)
         try:

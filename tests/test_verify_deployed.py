@@ -535,7 +535,7 @@ def test_static_verifier_accepts_complete_vm_target_root(tmp_path, capsys):
     assert VERIFY.main(["--root", str(root), "--static"]) == 0
     payload = json.loads(capsys.readouterr().out)
     assert payload["ok"] is True
-    assert payload["check_count"] == 37
+    assert payload["check_count"] == 68
     assert {item["id"] for item in payload["checks"]} >= {
         "target.symlink.srv.game-servers.minecraft-sunlit-cobblemon.libraries",
         "target.unit.minecraft-sunlit-cobblemon",
@@ -578,6 +578,26 @@ def test_static_verifier_rejects_sunlit_launch_bridge_drift(tmp_path, capsys):
     assert VERIFY.main(["--root", str(root), "--static"]) == 1
     payload = json.loads(capsys.readouterr().out)
     check = next(item for item in payload["checks"] if item["id"].startswith("target.symlink."))
+    assert check["ok"] is False
+
+
+def test_static_verifier_uses_canonical_manifest_and_ignores_target_manifests(tmp_path, capsys):
+    root = _staged_root(tmp_path)
+    runtime_manifest = root / "opt/game-control/.horizon-runtime-manifest"
+    runtime_manifest.write_text("1\t../escape\t" + "0" * 64 + "\t0600\n", encoding="ascii")
+    assert VERIFY.main(["--root", str(root), "--static"]) == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["ok"] is True
+    assert next(item for item in payload["checks"] if item["id"] == "target.files.manifest")["ok"]
+
+
+def test_static_verifier_reports_manifest_file_metadata_drift(tmp_path, capsys):
+    root = _staged_root(tmp_path)
+    target = root / "etc/game-control/game-control.toml"
+    target.chmod(0o644)
+    assert VERIFY.main(["--root", str(root), "--static"]) == 1
+    payload = json.loads(capsys.readouterr().out)
+    check = next(item for item in payload["checks"] if item["id"] == "target.files.manifest")
     assert check["ok"] is False
 
 

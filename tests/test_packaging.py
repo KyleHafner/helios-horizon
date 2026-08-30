@@ -1385,6 +1385,7 @@ def test_installer_secret_drift_checks_fail_closed_without_reading_content(tmp_p
     secret.write_bytes(b"opaque\n")
     os.chmod(secret, 0o644)
     assert secret_problems() == ["fixed B2 secret mode drift"]
+
     os.chmod(secret, 0o600)
     hard_link = secret.with_name("hard-link")
     os.link(secret, hard_link)
@@ -1402,3 +1403,20 @@ def test_installer_secret_drift_checks_fail_closed_without_reading_content(tmp_p
     if os.geteuid() == 0:
         os.chown(secret, 65534, 65534)
         assert secret_problems() == ["fixed B2 secret ownership drift"]
+
+
+def test_installer_static_and_runtime_projections_match_canonical_manifest(tmp_path: Path) -> None:
+    from game_control.deployment_manifest import get_manifest
+    from ops.install import Installer
+
+    root = tmp_path / "root"
+    installer = Installer(root, skip_systemd_verify=True)
+    manifest = get_manifest()
+    assert set(installer._expected_install_files()) == {
+        Path(spec.target) for spec in manifest.files_for(root)
+    }
+    assert set(installer.runtime_files()) == {
+        Path(spec.target) for spec in manifest.runtime_files_for(root)
+    }
+    assert set(installer.expected_links()) == {spec.target_path(root) for spec in manifest.symlinks}
+    assert len(installer.directories()) == len(manifest.directories)
