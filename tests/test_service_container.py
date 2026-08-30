@@ -132,6 +132,30 @@ async def test_cancellation_drains_all_stages_and_preserves_lease_cleanup():
     assert not [task for task in asyncio.all_tasks() if task is not asyncio.current_task() and not task.done()]
 
 
+@pytest.mark.asyncio
+async def test_sync_state_cancellation_is_retryable_and_not_an_ordinary_error():
+    events = []
+
+    class State:
+        calls = 0
+
+        def close(self):
+            self.calls += 1
+            events.append("state")
+            if self.calls == 1:
+                raise asyncio.CancelledError
+
+    state = State()
+    container = _container(events)
+    container.state_database = ResourceRef.owned(state)
+    with pytest.raises(asyncio.CancelledError):
+        await container.aclose()
+    assert container._first_close_error is None
+    await container.aclose()
+    assert state.calls == 2
+    assert container.closed
+
+
 def test_sync_close_rejects_running_event_loop():
     async def check():
         with pytest.raises(RuntimeError, match="use await aclose"):

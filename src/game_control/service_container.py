@@ -196,9 +196,11 @@ class ServiceContainer:
                     first_error = exc
 
         def run_sync(stage) -> None:
-            nonlocal first_error
+            nonlocal first_error, cancelled
             try:
                 stage()
+            except asyncio.CancelledError:
+                cancelled = True
             except BaseException as exc:
                 if first_error is None:
                     first_error = exc
