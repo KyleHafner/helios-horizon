@@ -50,15 +50,22 @@ The stores have separate owners and meanings:
 - The telemetry DB contains bounded disposable observations. It is not
   lifecycle authority and does not replace root job or reservation state.
 - Reservation JSON and the operation lock provide cross-process ownership.
-  Exact profile, operation, request, generation, process identity, and bounded
-  expiry are checked before a worker may publish.
+  The typed reservation records and checks exact profile, request/operation ID,
+  state generation, controller process identity, and bounded expiry before a
+  worker may publish. The root jobs ledger records the operation name; the
+  reservation record has no separate operation-name field.
 - Staged release, restore, backup, and domain journals are recovery evidence;
   they are not browser-selected paths or lifecycle authority.
 
 File-backed history and telemetry reads use approved, read-only worker-local
-SQLite connections. Writer connections remain thread-affine. A missing,
-malformed, unreadable, or conflicting authoritative store is unavailable and
-fails closed; it is never inferred to mean stopped, idle, or healthy.
+SQLite connections. Writer connections remain thread-affine. Typed root-state
+readers and safety gates represent a missing, malformed, unreadable, or
+conflicting authoritative store as unavailable and fail closed. The
+compatibility status path is weaker: `RootActiveJobsReader.__call__()` maps an
+unavailable jobs read to `None`, so `derive_state()` can still project
+`STOPPED` when the process is not alive and no conflicting slot owner is
+reported. That projection limitation is documented below and is not safety
+evidence.
 
 ## Lifecycle and health states
 
@@ -76,10 +83,13 @@ does expose `unknown`, which is the correct representation for unavailable
 health or observation evidence. A conceptual unavailable state must not be
 serialized as a new lifecycle enum.
 
-The current status implementation has a known limitation: an adapter
-observation error can still derive `STOPPED` in some paths. Therefore the
-stronger rule “unavailable observation never creates a stopped transition” is
-a target invariant, not a claim that this exact tree already satisfies it.
+The current status implementation has two known compatibility limitations:
+an adapter observation error can derive `STOPPED` in some paths, and an
+unavailable root-jobs read is mapped to no active job before state derivation,
+which can also derive `STOPPED` when the process is not alive and no
+conflicting owner is present. Therefore the stronger rule “unavailable
+observation never creates a stopped transition” is a target invariant, not a
+claim that this exact tree already satisfies it.
 Cached status is a UI/operator projection and cannot create a lifecycle
 transition or satisfy a safety gate.
 
@@ -109,11 +119,12 @@ The lease protocol is:
 absent -> reserve under operation lock -> renew/assert -> release
 ```
 
-The reservation records exact profile, operation, request, state generation,
-controller process identity, and bounded expiry. Renewal loss stops further
-publication, drains any worker that can still mutate, records the safe
-outcome, and releases only after that drain. Scheduled and manual backup use
-the same controller lease authority.
+The reservation records exact profile, request/operation ID, state generation,
+controller process identity, and bounded expiry; the root jobs ledger carries
+the operation name separately. Renewal loss stops further publication, drains
+any worker that can still mutate, records the safe outcome, and releases only
+after that drain. Scheduled and manual backup use the same controller lease
+authority.
 
 ## Status truthfulness and benchmark admission
 
@@ -285,8 +296,9 @@ than mutable line numbers:
 - **Generation:** the root-state version used to fence stale operations.
 - **Evidence:** a typed observation with provenance and availability semantics
   that a safety gate may consume.
-- **Unavailable:** evidence or a store could not be safely read; it is not a
-  stopped, idle, healthy, or zero value.
+- **Unavailable:** a typed reader or safety gate could not safely read evidence
+  or a store and must fail closed; the compatibility status projection may
+  still show `stopped` for an unavailable root-jobs read, as documented above.
 - **Deferred:** a durable operation was intentionally not executed because a
   safety or scheduling condition was not met.
 - **Terminal:** a job outcome that cannot continue; cancellation and lease
