@@ -10,8 +10,11 @@ import shutil
 import stat
 import subprocess
 import sys
+from contextlib import contextmanager
 from dataclasses import dataclass
+from enum import Enum
 from pathlib import Path
+from typing import Callable, ContextManager, Iterator
 
 from game_control.modpack_update import AssemblyError, activate_release
 
@@ -31,6 +34,22 @@ LIBRARIES = Path("/opt/game-servers/minecraft-sunlit-cobblemon/libraries")
 
 class PromotionError(ValueError):
     pass
+
+
+class PublicationAction(str, Enum):
+    STATE = "state"
+    RELEASE = "release"
+    VERSION_STATE = "version_state"
+    METADATA = "metadata"
+    ACTIVE_LINK = "active_link"
+    ROLLBACK_STATE = "rollback_state"
+    ROLLBACK_RELEASE = "rollback_release"
+    ROLLBACK_VERSION_STATE = "rollback_version_state"
+    ROLLBACK_METADATA = "rollback_metadata"
+    ROLLBACK_ACTIVE_LINK = "rollback_active_link"
+
+
+PublicationGuard = Callable[[PublicationAction], ContextManager[None]]
 
 
 @dataclass(frozen=True, slots=True)
@@ -53,6 +72,7 @@ class PromotionContext:
     active_link: Path
     slot: Path
     libraries: Path
+    publication_guard: PublicationGuard | None = None
 
 
 def _validate_version(version: str) -> str:
@@ -87,6 +107,7 @@ def promote_candidate(
     manifest: Path,
     candidate_root: Path,
     manifest_sha256: str | None = None,
+    publication_guard: PublicationGuard,
 ) -> dict:
     """Promote a staged candidate using the package-owned policy.
 
@@ -109,6 +130,7 @@ def promote_candidate(
         active_link=Path(ACTIVE_LINK),
         slot=Path(SLOT),
         libraries=Path(LIBRARIES),
+        publication_guard=publication_guard,
     )
     return promote(context)
 
@@ -172,6 +194,57 @@ def _inactive(context: PromotionContext) -> None:
     )
     if result.stdout.strip() != "inactive" or context.slot.exists() or context.slot.is_symlink():
         raise PromotionError("Sunlit is not in the required inactive state")
+
+
+@contextmanager
+def _publication(context: PromotionContext, action: PublicationAction) -> Iterator[None]:
+    """Enter the caller's atomic ownership fence for one bounded publication.
+
+    The source-only compatibility path has no caller authority and therefore
+    fails closed.  The updater must provide a reservation-aware guard
+    explicitly; an inactive observation alone is not a publication fence.
+    """
+    if context.publication_guard is None:
+        raise PromotionError("publication guard is required")
+    guarded = context.publication_guard(action)
+    if not hasattr(guarded, "__enter__") or not hasattr(guarded, "__exit__"):
+        raise PromotionError("publication guard is malformed")
+    with guarded:
+        yield
+
+
+def _guarded_replace(
+    context: PromotionContext,
+    action: PublicationAction,
+    source: Path,
+    destination: Path,
+    directory: Path,
+) -> None:
+    with _publication(context, action):
+        os.replace(source, destination)
+        _fsync_dir(directory)
+
+
+def _guarded_activate(
+    context: PromotionContext,
+    action: PublicationAction,
+    release: Path,
+    *,
+    expected_prior: str | None,
+) -> None:
+    with _publication(context, action):
+        activate_release(
+            context.active_link,
+            context.release_root,
+            release,
+            expected_prior=expected_prior,
+        )
+
+
+def _guarded_unlink_active(context: PromotionContext) -> None:
+    with _publication(context, PublicationAction.ROLLBACK_ACTIVE_LINK):
+        context.active_link.unlink(missing_ok=True)
+        _fsync_dir(context.active_link.parent)
 
 
 def _trusted_directory(
@@ -251,7 +324,14 @@ def _bind_candidate_links(runtime: Path, document: dict, context: PromotionConte
             _replace_link(runtime / relative, target)
 
 
-def _write_metadata(state: Path, document: dict, context: PromotionContext) -> None:
+def _write_metadata(
+    state: Path,
+    document: dict,
+    context: PromotionContext,
+    *,
+    publication_action: PublicationAction | None = None,
+    owner: tuple[int, int] | None = None,
+) -> None:
     metadata = state / ".horizon"
     if metadata.exists() or metadata.is_symlink():
         if metadata.is_symlink() or not metadata.is_dir():
@@ -263,8 +343,7 @@ def _write_metadata(state: Path, document: dict, context: PromotionContext) -> N
     manifest_target = metadata / "manifest.json"
     manifest_temporary = metadata / ".manifest.json.promote"
     shutil.copyfile(context.manifest, manifest_temporary, follow_symlinks=False)
-    os.replace(manifest_temporary, manifest_target)
-    os.chmod(manifest_target, 0o600)
+    os.chmod(manifest_temporary, 0o600)
     release = {
         "profile_id": "minecraft-sunlit-cobblemon",
         "version": context.version,
@@ -274,12 +353,32 @@ def _write_metadata(state: Path, document: dict, context: PromotionContext) -> N
     release_target = metadata / "release.json"
     release_temporary = metadata / ".release.json.promote"
     release_temporary.write_text(json.dumps(release, sort_keys=True, separators=(",", ":")) + "\n", encoding="ascii")
-    os.replace(release_temporary, release_target)
-    os.chmod(release_target, 0o600)
-    for path in (manifest_target, release_target):
+    os.chmod(release_temporary, 0o600)
+    if owner is not None:
+        for path in (manifest_temporary, release_temporary):
+            os.chown(path, owner[0], owner[1], follow_symlinks=False)
+            os.chmod(path, 0o640, follow_symlinks=False)
+    for path in (manifest_temporary, release_temporary):
         with path.open("rb") as stream:
             os.fsync(stream.fileno())
-    _fsync_dir(metadata)
+
+    def publish() -> None:
+        os.replace(manifest_temporary, manifest_target)
+        os.replace(release_temporary, release_target)
+        if owner is not None:
+            os.chown(metadata, owner[0], owner[1], follow_symlinks=False)
+            os.chmod(metadata, 0o750, follow_symlinks=False)
+        _fsync_dir(metadata)
+
+    try:
+        if publication_action is None:
+            publish()
+        else:
+            with _publication(context, publication_action):
+                publish()
+    finally:
+        manifest_temporary.unlink(missing_ok=True)
+        release_temporary.unlink(missing_ok=True)
 
 
 def _sunlit_ids() -> tuple[int, int]:
@@ -431,7 +530,12 @@ def _resume_published_release(context: PromotionContext, runtime: Path, document
     _bind_candidate_links(runtime, document, context)
     if _tree_digest(runtime) != _tree_digest(context.release):
         raise PromotionError("published release does not match the reviewed candidate")
-    activate_release(context.active_link, context.release_root, context.release, expected_prior=None)
+    _guarded_activate(
+        context,
+        PublicationAction.ACTIVE_LINK,
+        context.release,
+        expected_prior=None,
+    )
     shutil.rmtree(runtime)
     _fsync_dir(context.candidate)
     return _publish_report(context, document)
@@ -497,17 +601,29 @@ def _metadata_backup(context: PromotionContext, sunlit_owner: tuple[int, int]) -
 def _restore_metadata(context: PromotionContext, backup: dict[str, tuple[bytes, int, int, int] | None]) -> None:
     metadata = context.state_root / ".horizon"
     metadata.mkdir(mode=0o700, exist_ok=True)
+    prepared: dict[str, Path] = {}
     for name, value in backup.items():
-        path = metadata / name
         if value is None:
-            path.unlink(missing_ok=True)
             continue
         temporary = metadata / f".{name}.rollback"
         temporary.write_bytes(value[0])
         os.chmod(temporary, value[1])
         os.chown(temporary, value[2], value[3])
-        os.replace(temporary, path)
-    _fsync_dir(metadata)
+        with temporary.open("rb") as stream:
+            os.fsync(stream.fileno())
+        prepared[name] = temporary
+    try:
+        with _publication(context, PublicationAction.ROLLBACK_METADATA):
+            for name, value in backup.items():
+                path = metadata / name
+                if value is None:
+                    path.unlink(missing_ok=True)
+                else:
+                    os.replace(prepared[name], path)
+            _fsync_dir(metadata)
+    finally:
+        for temporary in prepared.values():
+            temporary.unlink(missing_ok=True)
 
 
 def _promote_upgrade(context: PromotionContext, runtime: Path, state: Path, document: dict, sunlit_owner: tuple[int, int]) -> dict:
@@ -534,6 +650,7 @@ def _promote_upgrade(context: PromotionContext, runtime: Path, state: Path, docu
     release_stage = context.release_root / f".{context.version}.promote.{os.getpid()}"
     release_published = False
     version_state_moved = False
+    metadata_attempted = False
     activated = False
     if release_stage.exists() or release_stage.is_symlink():
         raise PromotionError("release staging path already exists")
@@ -541,25 +658,68 @@ def _promote_upgrade(context: PromotionContext, runtime: Path, state: Path, docu
         shutil.copytree(runtime, release_stage, symlinks=True)
         _verify_release_ownership(release_stage)
         _fsync_tree(release_stage)
-        os.replace(release_stage, context.release)
+        _prepare_state_ownership(version_state)
+        _guarded_replace(
+            context,
+            PublicationAction.RELEASE,
+            release_stage,
+            context.release,
+            context.release_root,
+        )
         release_published = True
-        _fsync_dir(context.release_root)
-        os.replace(version_state, production_version_state)
+        _guarded_replace(
+            context,
+            PublicationAction.VERSION_STATE,
+            version_state,
+            production_version_state,
+            versions_root,
+        )
         version_state_moved = True
-        _prepare_state_ownership(production_version_state)
-        _fsync_dir(versions_root)
-        _write_metadata(context.state_root, document, context)
-        _prepare_state_ownership(context.state_root / ".horizon")
-        activate_release(context.active_link, context.release_root, context.release, expected_prior=prior_target)
+        metadata_attempted = True
+        _write_metadata(
+            context.state_root,
+            document,
+            context,
+            publication_action=PublicationAction.METADATA,
+            owner=sunlit_owner,
+        )
+        _guarded_activate(
+            context,
+            PublicationAction.ACTIVE_LINK,
+            context.release,
+            expected_prior=prior_target,
+        )
         activated = True
     except BaseException:
         if activated and context.active_link.is_symlink():
-            activate_release(context.active_link, context.release_root, prior_release, expected_prior=os.readlink(context.active_link))
-        _restore_metadata(context, metadata_backup)
+            _guarded_activate(
+                context,
+                PublicationAction.ROLLBACK_ACTIVE_LINK,
+                prior_release,
+                expected_prior=os.readlink(context.active_link),
+            )
+        if metadata_attempted:
+            _restore_metadata(context, metadata_backup)
         if version_state_moved and production_version_state.exists() and not version_state.exists():
-            os.replace(production_version_state, version_state)
+            _guarded_replace(
+                context,
+                PublicationAction.ROLLBACK_VERSION_STATE,
+                production_version_state,
+                version_state,
+                versions_root,
+            )
         if release_published and context.release.exists():
-            shutil.rmtree(context.release)
+            rollback_release = context.release_root / f".{context.version}.rollback.{os.getpid()}"
+            if rollback_release.exists() or rollback_release.is_symlink():
+                raise PromotionError("release rollback path already exists")
+            _guarded_replace(
+                context,
+                PublicationAction.ROLLBACK_RELEASE,
+                context.release,
+                rollback_release,
+                context.release_root,
+            )
+            shutil.rmtree(rollback_release)
         if release_stage.exists():
             shutil.rmtree(release_stage)
         raise
@@ -609,25 +769,58 @@ def _promote(context: PromotionContext) -> dict:
     if release_stage.exists() or release_stage.is_symlink():
         raise PromotionError("release staging path already exists")
     try:
-        os.replace(state, context.state_root)
-        state_moved = True
-        _fsync_dir(context.state_root.parent)
+        # Build, verify, and durably flush the potentially large release while
+        # the caller's short operation-lock publication fence remains free.
         shutil.copytree(runtime, release_stage, symlinks=True)
         _verify_release_ownership(release_stage)
         _fsync_tree(release_stage)
-        os.replace(release_stage, context.release)
+        _guarded_replace(
+            context,
+            PublicationAction.STATE,
+            state,
+            context.state_root,
+            context.state_root.parent,
+        )
+        state_moved = True
+        _guarded_replace(
+            context,
+            PublicationAction.RELEASE,
+            release_stage,
+            context.release,
+            context.release_root,
+        )
         release_published = True
-        _fsync_dir(context.release_root)
-        activate_release(context.active_link, context.release_root, context.release, expected_prior=None)
+        _guarded_activate(
+            context,
+            PublicationAction.ACTIVE_LINK,
+            context.release,
+            expected_prior=None,
+        )
     except BaseException:
         if context.active_link.is_symlink():
-            context.active_link.unlink(missing_ok=True)
+            _guarded_unlink_active(context)
         if release_published and context.release.exists():
-            shutil.rmtree(context.release)
+            rollback_release = context.release_root / f".{context.version}.rollback.{os.getpid()}"
+            if rollback_release.exists() or rollback_release.is_symlink():
+                raise PromotionError("release rollback path already exists")
+            _guarded_replace(
+                context,
+                PublicationAction.ROLLBACK_RELEASE,
+                context.release,
+                rollback_release,
+                context.release_root,
+            )
+            shutil.rmtree(rollback_release)
         if release_stage.exists():
             shutil.rmtree(release_stage)
         if state_moved and context.state_root.exists() and not state.exists():
-            os.replace(context.state_root, state)
+            _guarded_replace(
+                context,
+                PublicationAction.ROLLBACK_STATE,
+                context.state_root,
+                state,
+                state.parent,
+            )
         raise
     shutil.rmtree(runtime)
     _fsync_dir(context.candidate)
@@ -635,8 +828,10 @@ def _promote(context: PromotionContext) -> dict:
 
 
 def promote(context: PromotionContext | None = None) -> dict:
-    """Promote one candidate; compatibility callers get a fresh default context."""
-    return _promote(_default_context() if context is None else context)
+    """Promote one candidate only with explicit publication authority."""
+    if context is None or context.publication_guard is None:
+        raise PromotionError("publication guard is required")
+    return _promote(context)
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -657,12 +852,8 @@ def main(argv: list[str] | None = None) -> int:
         or (args.manifest_sha256 is not None and args.manifest_sha256 != MANIFEST_SHA256)
     ):
         return 2
-    try:
-        print(json.dumps(promote(_default_context()), sort_keys=True))
-    except (AssemblyError, OSError, PromotionError, KeyError, TypeError, ValueError) as exc:
-        print(f"error: {exc}", file=sys.stderr)
-        return 2
-    return 0
+    print("error: historical promotion front door is unsupported", file=sys.stderr)
+    return 2
 
 
 if __name__ == "__main__":

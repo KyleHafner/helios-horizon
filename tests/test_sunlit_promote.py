@@ -4,8 +4,11 @@ import hashlib
 import json
 import os
 import threading
+from contextlib import contextmanager
+from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
+from typing import Iterator
 
 import pytest
 
@@ -18,6 +21,11 @@ ROOT = Path(__file__).parents[1]
 def _write_json(path: Path, value: dict) -> None:
     path.write_text(json.dumps(value), encoding="utf-8")
     path.chmod(0o600)
+
+
+@contextmanager
+def _allow_publication(_action: MODULE.PublicationAction) -> Iterator[None]:
+    yield
 
 
 def test_promotes_exact_inactive_candidate_into_fixed_layout(tmp_path: Path, monkeypatch) -> None:
@@ -80,8 +88,36 @@ def test_promotes_exact_inactive_candidate_into_fixed_layout(tmp_path: Path, mon
         monkeypatch.setitem(globals_, name, value)
     monkeypatch.setattr(globals_["subprocess"], "run", lambda *_args, **_kwargs: SimpleNamespace(stdout="inactive\n"))
     monkeypatch.setitem(globals_, "_sunlit_ids", lambda: (os.getuid(), os.getgid()))
+    guard_depth = 0
+    actions: list[MODULE.PublicationAction] = []
 
-    report = MODULE.promote()
+    @contextmanager
+    def guarded(action: MODULE.PublicationAction) -> Iterator[None]:
+        nonlocal guard_depth
+        assert guard_depth == 0
+        guard_depth += 1
+        actions.append(action)
+        try:
+            yield
+        finally:
+            guard_depth -= 1
+
+    real_copytree = MODULE.shutil.copytree
+    real_fsync_tree = MODULE._fsync_tree
+
+    def copytree_outside_guard(*args, **kwargs):
+        assert guard_depth == 0
+        return real_copytree(*args, **kwargs)
+
+    def fsync_tree_outside_guard(root: Path) -> None:
+        assert guard_depth == 0
+        real_fsync_tree(root)
+
+    monkeypatch.setattr(MODULE.shutil, "copytree", copytree_outside_guard)
+    monkeypatch.setattr(MODULE, "_fsync_tree", fsync_tree_outside_guard)
+
+    context = replace(MODULE._default_context(), publication_guard=guarded)
+    report = MODULE.promote(context)
 
     assert report["active"] is True
     assert active.is_symlink() and active.resolve() == (release_root / "v1").resolve()
@@ -92,15 +128,31 @@ def test_promotes_exact_inactive_candidate_into_fixed_layout(tmp_path: Path, mon
     assert (state_root / ".horizon/manifest.json").is_file()
     assert not (candidate / "runtime").exists()
     assert not (candidate / "state").exists()
-    assert MODULE.promote() == report
+    assert MODULE.promote(context) == report
+    assert actions == [
+        MODULE.PublicationAction.STATE,
+        MODULE.PublicationAction.RELEASE,
+        MODULE.PublicationAction.ACTIVE_LINK,
+    ]
 
 
 def test_promote_candidate_keeps_contexts_isolated_under_concurrency(tmp_path: Path, monkeypatch) -> None:
     barrier = threading.Barrier(2)
     observed: list[MODULE.PromotionContext] = []
+    guard_events: list[tuple[str, MODULE.PublicationAction]] = []
+
+    def make_guard(label: str) -> MODULE.PublicationGuard:
+        @contextmanager
+        def guard(action: MODULE.PublicationAction) -> Iterator[None]:
+            guard_events.append((label, action))
+            yield
+
+        return guard
     def fake_promote(context: MODULE.PromotionContext) -> dict:
         barrier.wait(timeout=2)
-        observed.append(context)
+        assert context.publication_guard is not None
+        with context.publication_guard(MODULE.PublicationAction.ACTIVE_LINK):
+            observed.append(context)
         return {
             "active": True,
             "version": context.version,
@@ -127,12 +179,13 @@ def test_promote_candidate_keeps_contexts_isolated_under_concurrency(tmp_path: P
     import concurrent.futures
 
     calls = (
-        ("v1", tmp_path / "s1/manifest.json", tmp_path / "s1/candidate", "a" * 64),
-        ("v2", tmp_path / "s2/manifest.json", tmp_path / "s2/candidate", "b" * 64),
+        ("v1", tmp_path / "s1/manifest.json", tmp_path / "s1/candidate", "a" * 64, make_guard("v1")),
+        ("v2", tmp_path / "s2/manifest.json", tmp_path / "s2/candidate", "b" * 64, make_guard("v2")),
     )
     with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
         results = list(pool.map(lambda args: MODULE.promote_candidate(
-            version=args[0], manifest=args[1], candidate_root=args[2], manifest_sha256=args[3]
+            version=args[0], manifest=args[1], candidate_root=args[2], manifest_sha256=args[3],
+            publication_guard=args[4],
         ), calls))
 
     assert [result["version"] for result in results] == ["v1", "v2"]
@@ -142,6 +195,10 @@ def test_promote_candidate_keeps_contexts_isolated_under_concurrency(tmp_path: P
     assert {(context.version, context.manifest_sha256, context.candidate) for context in observed} == {
         ("v1", "a" * 64, tmp_path / "s1/candidate"),
         ("v2", "b" * 64, tmp_path / "s2/candidate"),
+    }
+    assert set(guard_events) == {
+        ("v1", MODULE.PublicationAction.ACTIVE_LINK),
+        ("v2", MODULE.PublicationAction.ACTIVE_LINK),
     }
     assert (
         MODULE.VERSION,
@@ -166,10 +223,12 @@ def test_promote_candidate_exception_does_not_contaminate_repeated_call(tmp_path
     monkeypatch.setattr(MODULE, "RELEASE_ROOT", tmp_path / "releases")
     with pytest.raises(MODULE.PromotionError):
         MODULE.promote_candidate(
-            version="bad", manifest=tmp_path / "bad.json", candidate_root=tmp_path / "bad/candidate"
+            version="bad", manifest=tmp_path / "bad.json", candidate_root=tmp_path / "bad/candidate",
+            publication_guard=_allow_publication,
         )
     result = MODULE.promote_candidate(
-        version="good", manifest=tmp_path / "good.json", candidate_root=tmp_path / "good/candidate"
+        version="good", manifest=tmp_path / "good.json", candidate_root=tmp_path / "good/candidate",
+        publication_guard=_allow_publication,
     )
 
     assert calls == ["bad", "good"]
@@ -181,6 +240,98 @@ def test_historical_main_rejects_caller_selected_roots(monkeypatch, tmp_path: Pa
     monkeypatch.setattr(MODULE, "CANDIDATE", tmp_path / "fixed-candidate")
     assert MODULE.main(["--candidate-root", str(tmp_path / "other")]) == 2
     assert MODULE.main(["--manifest", str(tmp_path / "other-manifest.json")]) == 2
+    assert MODULE.main([]) == 2
+
+
+def test_promote_without_publication_guard_fails_before_preflight(monkeypatch) -> None:
+    monkeypatch.setattr(MODULE, "_promote", lambda _context: (_ for _ in ()).throw(
+        AssertionError("unguarded promotion reached preflight")
+    ))
+    with pytest.raises(MODULE.PromotionError, match="publication guard is required"):
+        MODULE.promote()
+
+
+def test_guard_refusal_rolls_back_only_through_guard_and_keeps_state_stable(tmp_path: Path, monkeypatch) -> None:
+    candidate = tmp_path / "stage/candidate"
+    runtime = candidate / "runtime"
+    state = candidate / "state"
+    release_root = tmp_path / "releases"
+    state_root = tmp_path / "stable/state"
+    active_link = tmp_path / "stable/current"
+    for path in (runtime, state, release_root, state_root.parent):
+        path.mkdir(parents=True, exist_ok=True)
+    (state / "sentinel").write_text("unchanged", encoding="utf-8")
+    manifest = tmp_path / "stage/manifest.json"
+    manifest.write_text("{}", encoding="ascii")
+    actions: list[MODULE.PublicationAction] = []
+    guard_depth = 0
+
+    @contextmanager
+    def guard(action: MODULE.PublicationAction) -> Iterator[None]:
+        nonlocal guard_depth
+        assert guard_depth == 0
+        actions.append(action)
+        if action is MODULE.PublicationAction.ACTIVE_LINK:
+            raise MODULE.PromotionError("reservation changed")
+        guard_depth += 1
+        try:
+            yield
+        finally:
+            guard_depth -= 1
+
+    context = MODULE.PromotionContext(
+        version="v1",
+        manifest_sha256="a" * 64,
+        staging_root=candidate.parent,
+        candidate=candidate,
+        manifest=manifest,
+        release_root=release_root,
+        release=release_root / "v1",
+        state_root=state_root,
+        active_link=active_link,
+        slot=tmp_path / "slot",
+        libraries=tmp_path / "libraries",
+        publication_guard=guard,
+    )
+    document = {
+        "manifest_sha256": "a" * 64,
+        "artifact": {"version": "v1", "archive": {"sha256": "b" * 64}},
+    }
+    monkeypatch.setattr(MODULE, "_inactive", lambda _context: None)
+    monkeypatch.setattr(MODULE, "_manifest", lambda _context: document)
+    monkeypatch.setattr(MODULE, "_trusted_directory", lambda *_args, **_kwargs: SimpleNamespace())
+    monkeypatch.setattr(
+        MODULE,
+        "_regular_json",
+        lambda path, **_kwargs: {"active": False, "version": "v1", "manifest_sha256": "a" * 64}
+        if path.name == "candidate.json" else {},
+    )
+    monkeypatch.setattr(MODULE, "_sunlit_ids", lambda: (os.getuid(), os.getgid()))
+    monkeypatch.setattr(MODULE, "_already_promoted", lambda *_args: None)
+    monkeypatch.setattr(MODULE, "_resume_published_release", lambda *_args: None)
+    monkeypatch.setattr(MODULE, "_bind_candidate_links", lambda *_args: None)
+    monkeypatch.setattr(MODULE, "_normalize_release_permissions", lambda *_args: None)
+    monkeypatch.setattr(MODULE, "_write_metadata", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(MODULE, "_prepare_state_ownership", lambda *_args: None)
+    monkeypatch.setattr(MODULE, "_verify_release_ownership", lambda *_args: None)
+    monkeypatch.setattr(MODULE, "_fsync_tree", lambda *_args: (_ for _ in ()).throw(
+        AssertionError("fsync-tree must be stubbed before publication")
+    ) if guard_depth else None)
+
+    with pytest.raises(MODULE.PromotionError, match="reservation changed"):
+        MODULE.promote(context)
+
+    assert actions == [
+        MODULE.PublicationAction.STATE,
+        MODULE.PublicationAction.RELEASE,
+        MODULE.PublicationAction.ACTIVE_LINK,
+        MODULE.PublicationAction.ROLLBACK_RELEASE,
+        MODULE.PublicationAction.ROLLBACK_STATE,
+    ]
+    assert not state_root.exists()
+    assert not context.release.exists()
+    assert not active_link.exists() and not active_link.is_symlink()
+    assert (state / "sentinel").read_text(encoding="utf-8") == "unchanged"
 
 
 def test_upgrades_existing_release_without_replacing_stable_state(tmp_path: Path, monkeypatch) -> None:
@@ -260,8 +411,36 @@ def test_upgrades_existing_release_without_replacing_stable_state(tmp_path: Path
         monkeypatch.setitem(globals_, name, value)
     monkeypatch.setattr(globals_["subprocess"], "run", lambda *_args, **_kwargs: SimpleNamespace(stdout="inactive\n"))
     monkeypatch.setitem(globals_, "_sunlit_ids", lambda: (os.getuid(), os.getgid()))
+    actions: list[MODULE.PublicationAction] = []
+    guard_depth = 0
 
-    report = MODULE.promote()
+    @contextmanager
+    def guarded(action: MODULE.PublicationAction) -> Iterator[None]:
+        nonlocal guard_depth
+        assert guard_depth == 0
+        actions.append(action)
+        guard_depth += 1
+        try:
+            yield
+        finally:
+            guard_depth -= 1
+
+    real_copytree = MODULE.shutil.copytree
+    real_fsync_tree = MODULE._fsync_tree
+
+    def copytree_outside_guard(*args, **kwargs):
+        assert guard_depth == 0
+        return real_copytree(*args, **kwargs)
+
+    def fsync_tree_outside_guard(root: Path) -> None:
+        assert guard_depth == 0
+        real_fsync_tree(root)
+
+    monkeypatch.setattr(MODULE.shutil, "copytree", copytree_outside_guard)
+    monkeypatch.setattr(MODULE, "_fsync_tree", fsync_tree_outside_guard)
+
+    context = replace(MODULE._default_context(), publication_guard=guarded)
+    report = MODULE.promote(context)
 
     assert report["version"] == "v2"
     assert active.resolve() == new_release.resolve()
@@ -272,4 +451,10 @@ def test_upgrades_existing_release_without_replacing_stable_state(tmp_path: Path
     assert (new_release / "world").resolve() == (state_root / "world").resolve()
     assert not (candidate / "runtime").exists()
     assert not (candidate / "state").exists()
-    assert MODULE.promote() == report
+    assert MODULE.promote(context) == report
+    assert actions == [
+        MODULE.PublicationAction.RELEASE,
+        MODULE.PublicationAction.VERSION_STATE,
+        MODULE.PublicationAction.METADATA,
+        MODULE.PublicationAction.ACTIVE_LINK,
+    ]
