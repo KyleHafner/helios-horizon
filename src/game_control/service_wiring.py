@@ -9,20 +9,9 @@ URL, or credential.
 from __future__ import annotations
 
 import asyncio
-import base64
-import binascii
-import concurrent.futures
 import inspect
 import sqlite3
-import math
-import time
-import urllib.request
-import urllib.parse
-import os
-import stat
-import json
-import math
-from datetime import datetime, timezone
+from datetime import datetime
 from pathlib import Path
 from typing import Any, Callable, Mapping
 from uuid import uuid4
@@ -37,32 +26,27 @@ from .health import HealthChecker
 from .logs import LogService
 from .metrics import MetricSampler
 from .players import PlayerTracker
-from .metrics import HostTelemetrySource
 from .session_store import SessionStore
 from .tps import FIXED_EXPORTER_URL, TpsSampler
 from .telemetry_db import TelemetryDatabase
 from .state_db import STATE_DB_PATH
 from .telemetry_sampler import TelemetrySampler
-from .stats_queries import stats_tps as query_stats_tps
-from .tick_telemetry import ExporterRegistry, ExporterSpec, PrometheusTickParser, TickTelemetry
-from .rcon_telemetry import PerformanceResult, PersistentRconTelemetry, PlayerCountResult, TelemetryCommand
-from .log_follower import LogFollower
-from .gc_telemetry import GcTelemetryParser
+from .rcon_telemetry import (
+    PerformanceResult,
+    PersistentRconTelemetry,
+    PlayerCountResult,
+    TelemetryCommand,
+)
 from .models import BackupDestination, NotificationEvent, ProfileId
 from .notifications import DEFAULT_SECRET_DIR, NotificationService
 from .protocol import (
     AuditPage,
-    AuditSummary,
     BackupPage,
     BackupSummary,
     EventPage,
-    EventSummary,
-    ErrorCode,
-    GetProfiles,
     JobAccepted,
     LogPage,
     NotificationConfig,
-    ProfileStatus,
     PublicProfile,
     PublicEndpoint,
     UpdateStatus,
@@ -79,19 +63,12 @@ from .runtime.telemetry import (
     TelemetryRuntimeConfig,
     _await_cleanup,
 )
+from .history_queries import HistoryQueryService, _timestamp
 
 
 SUNLIT_ONLINE_SNAPSHOT_SECONDS = 240.0
 _HOST_TELEMETRY_METRICS = DEFAULT_HOST_METRICS
 
-# Controller-facing history pages are read frequently and can contain enough
-# rows to make sqlite3.fetchall() visible on the event loop.  Keep a small,
-# shared pool so concurrent readers are bounded instead of creating an
-# unbounded thread per RPC.  Production StateDatabase instances are reopened
-# per worker, keeping sqlite connections thread-local.
-_AUDIT_QUERY_EXECUTOR = concurrent.futures.ThreadPoolExecutor(
-    max_workers=4, thread_name_prefix="horizon-audit-query"
-)
 _AUDIT_STATE_DB_PATH = STATE_DB_PATH
 
 
@@ -799,7 +776,7 @@ class _NotificationFacade:
 
     async def test(self, action: Any, actor: str | None = None, request_id: Any = None) -> JobAccepted:
         def deliver() -> None:
-            profile = self.service._get_profile(action.profile_id)
+            self.service._get_profile(action.profile_id)
             secret = self.service._secret(action.channel)
             self.service._post(action.channel, secret, "game-control notification test")
 
@@ -816,112 +793,23 @@ class _NotificationFacade:
 
 
 class _AuditFacade:
-    def __init__(self, database: Any):
+    """Compatibility adapter; query policy lives in HistoryQueryService."""
+
+    _decode_cursor = staticmethod(HistoryQueryService._decode_cursor)
+    _encode_cursor = staticmethod(HistoryQueryService._encode_cursor)
+    _page_cursor = classmethod(HistoryQueryService._page_cursor.__func__)
+
+    def __init__(self, database: Any, history: HistoryQueryService | None = None):
         self.database = database
-
-    @staticmethod
-    def _decode_cursor(cursor: str | None) -> tuple[str, str] | None:
-        """Decode the opaque keyset cursor; tolerate only legacy first-page 0."""
-        if not cursor or cursor == "0":
-            return None
-        try:
-            raw = base64.urlsafe_b64decode(cursor.encode("ascii") + b"=" * (-len(cursor) % 4))
-            value = json.loads(raw)
-            if (not isinstance(value, list) or len(value) != 2 or
-                    not all(isinstance(item, str) and item for item in value)):
-                raise ValueError
-            return value[0], value[1]
-        except (ValueError, TypeError, UnicodeError, json.JSONDecodeError, binascii.Error) as exc:
-            raise SafeError("invalid_cursor", "invalid history cursor") from exc
-
-    @staticmethod
-    def _encode_cursor(timestamp: str, row_id: str) -> str:
-        raw = json.dumps([timestamp, row_id], separators=(",", ":")).encode("utf-8")
-        return base64.urlsafe_b64encode(raw).decode("ascii").rstrip("=")
-
-    async def _query(self, sql: str, params: tuple[Any, ...]) -> list[tuple[Any, ...]]:
-        """Run a history query without ever borrowing the controller writer DB."""
-        # Unit/in-memory seams intentionally remain synchronous: sqlite's
-        # default connection is thread-affine, and these injected databases do
-        # not represent the production writer.  Real StateDatabase wrappers
-        # always expose ``path`` and use the read-only branch below.
-        if isinstance(self.database, sqlite3.Connection):
-            try:
-                return self.database.execute(sql, params).fetchall()
-            except sqlite3.Error as exc:
-                raise SafeError("state_unavailable", "operational state is unavailable") from exc
-
-        loop = asyncio.get_running_loop()
-
-        def run() -> list[tuple[Any, ...]]:
-            connection = None
-            try:
-                path = getattr(self.database, "path", None)
-                if path is None or Path(path).absolute() != Path(_AUDIT_STATE_DB_PATH).absolute():
-                    raise SafeError("state_unavailable", "operational state is unavailable")
-                connection = sqlite3.connect(
-                    f"file:{Path(_AUDIT_STATE_DB_PATH)}?mode=ro", uri=True,
-                    timeout=0.2,
-                )
-                connection.execute("PRAGMA query_only=ON")
-                connection.execute("PRAGMA busy_timeout=200")
-                return connection.execute(sql, params).fetchall()
-            except (OSError, TypeError, ValueError, sqlite3.Error) as exc:
-                raise SafeError("state_unavailable", "operational state is unavailable") from exc
-            finally:
-                if connection is not None:
-                    connection.close()
-
-        return await loop.run_in_executor(_AUDIT_QUERY_EXECUTOR, run)
-
-    @classmethod
-    def _page_cursor(cls, rows: list[tuple[Any, ...]], limit: int) -> str | None:
-        return cls._encode_cursor(str(rows[-1][1]), str(rows[-1][0])) if len(rows) == limit else None
+        self.history = history or HistoryQueryService(
+            database, approved_state_path=_AUDIT_STATE_DB_PATH
+        )
 
     async def list_events(self, action: Any, actor: str | None = None, request_id: Any = None) -> EventPage:
-        limit = int(action.page.limit)
-        cursor = self._decode_cursor(action.page.cursor)
-        predicate = "" if cursor is None else "WHERE (timestamp,id) < (?,?) "
-        params: tuple[Any, ...] = () if cursor is None else (cursor[0], cursor[1])
-        rows = await self._query(
-            f"SELECT id,timestamp,profile_id,code,message FROM events {predicate}"
-            "ORDER BY timestamp DESC,id DESC LIMIT ?", params + (limit,)
-        )
-        items = tuple(
-            EventSummary(
-                id=str(row[0]),
-                timestamp=_timestamp(row[1]),
-                profile_id=ProfileId(row[2]) if row[2] else None,
-                code=str(row[3])[:64],
-                message=str(row[4])[:512],
-            )
-            for row in rows
-        )
-        return EventPage(items=items, next_cursor=self._page_cursor(rows, limit))
+        return await self.history.list_events(action, actor, request_id)
 
     async def list_audit(self, action: Any, actor: str | None = None, request_id: Any = None) -> AuditPage:
-        limit = int(action.page.limit)
-        cursor = self._decode_cursor(action.page.cursor)
-        predicate = "" if cursor is None else "WHERE (timestamp,id) < (?,?) "
-        params = () if cursor is None else (cursor[0], cursor[1])
-        rows = await self._query(
-            f"SELECT id,timestamp,actor,action,profile_id,result,error_code,detail FROM audit {predicate}"
-            "ORDER BY timestamp DESC,id DESC LIMIT ?", params + (limit,)
-        )
-        items = tuple(
-            AuditSummary(
-                id=str(row[0]),
-                timestamp=_timestamp(row[1]),
-                actor=str(row[2])[:128],
-                action=str(row[3])[:128],
-                profile_id=ProfileId(row[4]) if row[4] else None,
-                result=row[5],
-                error_code=_error_code(row[6]),
-                detail=str(row[7])[:512],
-            )
-            for row in rows
-        )
-        return AuditPage(items=items, next_cursor=self._page_cursor(rows, limit))
+        return await self.history.list_audit(action, actor, request_id)
 
 
 class _ProfilesFacade:
@@ -949,39 +837,27 @@ class _ProfilesFacade:
         )
 
 
-def _timestamp(value: Any) -> datetime:
-    if isinstance(value, datetime):
-        return value if value.tzinfo else value.replace(tzinfo=timezone.utc)
-    try:
-        parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
-    except ValueError:
-        parsed = datetime.now(timezone.utc)
-    return parsed if parsed.tzinfo else parsed.replace(tzinfo=timezone.utc)
-
-
-def _error_code(value: Any) -> ErrorCode | None:
-    try:
-        return ErrorCode(value) if value else None
-    except ValueError:
-        return None
-
-
 class _StatsFacade:
-    """Read-only bridge across lifecycle and disposable telemetry databases."""
+    """Compatibility adapter over the shared HistoryQueryService owner."""
 
-    def __init__(self, state_database: Any, telemetry_database: Any) -> None:
+    def __init__(self, state_database: Any, telemetry_database: Any | None = None,
+                 history: HistoryQueryService | None = None) -> None:
         self.state_database = state_database
         self.telemetry_database = telemetry_database
+        self.history = history or HistoryQueryService(
+            state_database, telemetry_database, approved_state_path=_AUDIT_STATE_DB_PATH
+        )
 
     def tps(self, action: Any, *, now: str) -> dict[str, Any]:
-        state = _connection(self.state_database)
-        if state is None:
-            raise RuntimeError("stats database unavailable")
-        telemetry = _connection(self.telemetry_database)
-        return query_stats_tps(
-            state, action.profile_id.value, action.window, now=now, telemetry=telemetry,
-            resolution=action.resolution, limit=action.limit,
-        )
+        return self.history.tps_sync(action, now=now)
+
+    async def stats_summary(self, action: Any, actor: str | None = None,
+                            request_id: Any = None, *, now: str) -> dict[str, Any]:
+        return await self.history.stats_summary(action, actor, request_id, now=now)
+
+    async def stats_heatmap(self, action: Any, actor: str | None = None,
+                            request_id: Any = None, *, now: str) -> dict[str, Any]:
+        return await self.history.stats_heatmap(action, actor, request_id, now=now)
 
 
 class ServiceSeams:
@@ -1240,6 +1116,15 @@ def _build_service_seams_impl(
         profiles=profile_map,
         slot_inspector=slot_inspector,
     )
+    approved_telemetry_path = (
+        Path(telemetry_db.path) if telemetry_db is not None and getattr(telemetry_db, "path", None) is not None else None
+    )
+    history_queries = HistoryQueryService(
+        state_db,
+        telemetry_db,
+        approved_state_path=_AUDIT_STATE_DB_PATH,
+        approved_telemetry_path=approved_telemetry_path,
+    )
     return ServiceSeams(
         status=_StatusFacade(status_service),
         logs=logs,
@@ -1247,7 +1132,7 @@ def _build_service_seams_impl(
         worlds=_WorldFacade(worlds, profile_map, adapter_map),
         updates=_UpdateFacade(updates, profile_map, adapter_map),
         notifications=_NotificationFacade(notification),
-        audit=_AuditFacade(state_db),
+        audit=_AuditFacade(state_db, history_queries),
         profiles=_ProfilesFacade(profile_map),
         benchmarks=benchmark_service,
         session_store=session_store,
@@ -1256,9 +1141,20 @@ def _build_service_seams_impl(
         telemetry_sampler=telemetry_sampler,
         telemetry_db_owned=telemetry_db_owned,
         telemetry_collectors=collector,
-        stats=_StatsFacade(state_db, telemetry_db),
+        stats=_StatsFacade(state_db, telemetry_db, history_queries),
         alerts=alerts,
     )
 
 
-__all__ = ["ServiceSeams", "build_service_seams"]
+StatsCompatibilityFacade = _StatsFacade
+
+__all__ = [
+    "HistoryQueryService",
+    "PerformanceResult",
+    "PersistentRconTelemetry",
+    "PlayerCountResult",
+    "ServiceSeams",
+    "StatsCompatibilityFacade",
+    "TelemetryCommand",
+    "build_service_seams",
+]
