@@ -536,7 +536,7 @@ def test_static_verifier_accepts_complete_vm_target_root(tmp_path, capsys):
     assert VERIFY.main(["--root", str(root), "--static"]) == 0
     payload = json.loads(capsys.readouterr().out)
     assert payload["ok"] is True
-    assert payload["check_count"] == 68
+    assert payload["check_count"] == 70
     assert {item["id"] for item in payload["checks"]} >= {
         "target.symlink.srv.game-servers.minecraft-sunlit-cobblemon.libraries",
         "target.unit.minecraft-sunlit-cobblemon",
@@ -624,6 +624,33 @@ def test_static_verifier_rejects_directory_metadata_drift(tmp_path, capsys, muta
     payload = json.loads(capsys.readouterr().out)
     check = next(item for item in payload["checks"] if item["id"] == "target.directory.etc.game-control.arm")
     assert check["ok"] is False
+
+
+def test_static_verifier_allows_declared_tmpfiles_children_and_rejects_unknown(tmp_path, capsys):
+    root = _staged_root(tmp_path)
+    for relative in (
+        "run/game-control/operation.lock",
+        "run/game-control/slot.lock",
+        "run/game-control/reservation.json",
+        "run/game-slot/slot.json",
+    ):
+        path = root / relative
+        path.write_text("fixture\n", encoding="utf-8")
+    assert VERIFY.main(["--root", str(root), "--static"]) == 0
+    capsys.readouterr()
+    (root / "run/game-control/undeclared-child").write_text("unexpected\n", encoding="utf-8")
+    assert VERIFY.main(["--root", str(root), "--static"]) == 1
+    payload = json.loads(capsys.readouterr().out)
+    check = next(item for item in payload["checks"] if item["id"] == "target.directory.run.game-control")
+    assert check["ok"] is False
+
+
+def test_static_ownership_projection_ignores_host_accounts_for_staged_root(tmp_path, monkeypatch, capsys):
+    root = _staged_root(tmp_path)
+    monkeypatch.setattr(VERIFY.pwd, "getpwnam", lambda _name: SimpleNamespace(pw_uid=1234))
+    monkeypatch.setattr(VERIFY.grp, "getgrnam", lambda _name: SimpleNamespace(gr_gid=1234))
+    assert VERIFY.main(["--root", str(root), "--static"]) == 0
+    capsys.readouterr()
 
 
 def test_verifier_accepts_updated_sunlit_release_pointer(tmp_path, monkeypatch):

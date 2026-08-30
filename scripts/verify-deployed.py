@@ -364,11 +364,38 @@ def _check_target_package(checks: Checks) -> None:
         path = TARGET_ROOT / relative
         value = _file_mode(path)
         expected_spec = next(spec for spec in _DEPLOYMENT_MANIFEST.directories if spec.target.removeprefix("/") == relative)
+        if TARGET_ROOT != Path("/"):
+            expected_uid = 0 if expected_spec.staged_owner == "root" else -1
+            expected_gid = 0 if expected_spec.staged_group == "root" else -1
+        else:
+            try:
+                expected_uid = pwd.getpwnam(expected_spec.owner).pw_uid
+                expected_gid = grp.getgrnam(expected_spec.group).gr_gid
+            except KeyError:
+                expected_uid = expected_gid = -1
         try:
-            expected_uid = pwd.getpwnam(expected_spec.owner).pw_uid
-            expected_gid = grp.getgrnam(expected_spec.group).gr_gid
-        except KeyError:
-            expected_uid = expected_gid = 0 if TARGET_ROOT != Path("/") else -1
+            actual_children = {
+                child.name for child in path.iterdir()
+                if stat.S_ISDIR(child.lstat().st_mode) or stat.S_ISREG(child.lstat().st_mode)
+            }
+        except OSError:
+            actual_children = None
+        declared_children = {
+            child.target.rsplit("/", 1)[-1]
+            for child in _DEPLOYMENT_MANIFEST.directories
+            if Path(child.target).parent == Path(expected_spec.target)
+        }
+        declared_children.update(
+            child.target.rsplit("/", 1)[-1]
+            for child in _DEPLOYMENT_MANIFEST.files
+            if Path(child.target).parent == Path(expected_spec.target)
+        )
+        declared_children.update(
+            child.target.rsplit("/", 1)[-1]
+            for child in _DEPLOYMENT_MANIFEST.symlinks
+            if Path(child.target).parent == Path(expected_spec.target)
+        )
+        allowed_children = declared_children | set(expected_spec.allowed_children)
         ok = bool(
             value
             and stat.S_ISDIR(value[0].st_mode)
@@ -376,6 +403,8 @@ def _check_target_package(checks: Checks) -> None:
             and value[0].st_nlink == EXPECTED_DIRECTORY_NLINKS[expected_spec.target]
             and value[0].st_uid == expected_uid
             and value[0].st_gid == expected_gid
+            and actual_children is not None
+            and (not expected_spec.allowed_children or actual_children <= allowed_children)
         )
         checks.add(
             "target.directory." + relative.replace("/", "."),
@@ -391,12 +420,16 @@ def _check_target_package(checks: Checks) -> None:
             file_problems.append(f"missing:{spec.target}")
             continue
         info, actual_mode = value
-        try:
-            expected_uid = pwd.getpwnam(spec.owner).pw_uid
-            expected_gid = grp.getgrnam(spec.group).gr_gid
-        except KeyError:
-            file_problems.append(f"owner-unavailable:{spec.target}")
-            continue
+        if TARGET_ROOT != Path("/"):
+            expected_uid = 0 if spec.staged_owner == "root" else -1
+            expected_gid = 0 if spec.staged_group == "root" else -1
+        else:
+            try:
+                expected_uid = pwd.getpwnam(spec.owner).pw_uid
+                expected_gid = grp.getgrnam(spec.group).gr_gid
+            except KeyError:
+                file_problems.append(f"owner-unavailable:{spec.target}")
+                continue
         if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1:
             file_problems.append(f"type-or-links:{spec.target}")
         elif actual_mode != spec.mode or info.st_uid != expected_uid or info.st_gid != expected_gid:

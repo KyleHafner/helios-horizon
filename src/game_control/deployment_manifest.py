@@ -72,6 +72,8 @@ class FileSpec:
     owner: str = "root"
     group: str = "root"
     category: str = "static"
+    staged_owner: str = "root"
+    staged_group: str = "root"
 
     def __post_init__(self) -> None:
         _relative(self.source, "source")
@@ -81,6 +83,8 @@ class FileSpec:
         _text(self.group, "file group")
         if self.category not in {"static", "runtime"}:
             raise ValueError("invalid file category")
+        _text(self.staged_owner, "staged file owner")
+        _text(self.staged_group, "staged file group")
 
     def source_path(self, package_root: Path) -> Path:
         return package_root / self.source
@@ -95,12 +99,20 @@ class DirectorySpec:
     mode: int
     owner: str = "root"
     group: str = "root"
+    allowed_children: tuple[str, ...] = ()
+    staged_owner: str = "root"
+    staged_group: str = "root"
 
     def __post_init__(self) -> None:
         _target(self.target)
         _mode(self.mode)
         _text(self.owner, "directory owner")
         _text(self.group, "directory group")
+        _text(self.staged_owner, "staged directory owner")
+        _text(self.staged_group, "staged directory group")
+        _tuple(self.allowed_children, "directory allowed children")
+        if any(not isinstance(child, str) or not child or "/" in child for child in self.allowed_children):
+            raise ValueError("invalid directory allowed child")
 
     def target_path(self, root: Path = Path("/")) -> Path:
         return _under_root(root, self.target)
@@ -385,10 +397,10 @@ _FILES = (
 _DIRECTORIES = (
     ("etc/game-control", 0o755, "root", "root"), ("etc/game-control/profiles.d", 0o755, "root", "root"),
     ("etc/game-control/runner.d", 0o755, "root", "root"), ("etc/game-control/secrets.d", 0o700, "root", "root"),
-    ("etc/game-control/arm", 0o700, "root", "root"), ("etc/game-control/lazymc", 0o755, "root", "root"),
+    ("etc/game-control/arm", 0o700, "root", "root"), ("etc/game-control/jvm", 0o700, "root", "root"), ("etc/game-control/lazymc", 0o755, "root", "root"),
     ("etc/systemd/journald@horizon.conf.d", 0o700, "root", "root"), ("etc/wireguard", 0o700, "root", "root"),
     ("usr/local/share/horizon", 0o755, "root", "root"), ("usr/local/libexec", 0o755, "root", "root"),
-    ("opt/game-control/web", 0o755, "root", "root"), ("var/lib/game-control", 0o700, "root", "root"),
+    ("opt/game-control/web", 0o755, "root", "root"), ("var/lib/game-control", 0o700, "root", "root"), ("var/lib/game-control/log-checkpoints", 0o700, "root", "root"),
     ("var/lib/game-control/alerts", 0o700, "root", "root"), ("var/lib/game-control/horizon-journal", 0o700, "root", "root"),
     ("var/lib/game-control/migrations", 0o700, "root", "root"), ("var/lib/game-control-web", 0o700, "gamecontrol", "gamecontrol"),
     ("run/game-control", 0o755, "root", "root"), ("run/game-slot", 0o770, "root", "gameslot"),
@@ -408,8 +420,19 @@ _RUNTIME_SOURCES = tuple(
     "src/" + name for name in (
         "game_control/__init__.py", "game_control/adapters/__init__.py", "game_control/adapters/base.py", "game_control/adapters/crafty.py", "game_control/adapters/systemd.py", "game_control/runtime/__init__.py", "game_control/runtime/alerts.py", "game_control/runtime/protocols.py", "game_control/runtime/telemetry.py", "game_control/alert_policy.py", "game_control/api.py", "game_control/auth.py", "game_control/backup_reconcile.py", "game_control/backups.py", "game_control/benchmark_safety.py", "game_control/benchmarks.py", "game_control/capability.py", "game_control/capability_evidence.py", "game_control/controller.py", "game_control/db_telemetry.py", "game_control/driver_preflight.py", "game_control/errors.py", "game_control/gc_telemetry.py", "game_control/health.py", "game_control/history_queries.py", "game_control/idle_stop.py", "game_control/interim_maintenance_control.py", "game_control/introspection.py", "game_control/lazymc.py", "game_control/log_follower.py", "game_control/logs.py", "game_control/managed_tuning.py", "game_control/memory_drill.py", "game_control/metrics.py", "game_control/models.py", "game_control/modpack_update.py", "game_control/notifications.py", "game_control/perf.py", "game_control/phase2_collector.py", "game_control/phase2_threshold.py", "game_control/players.py", "game_control/profile.py", "game_control/profile_config.py", "game_control/protocol.py", "game_control/push.py", "game_control/rcon.py", "game_control/rcon_telemetry.py", "game_control/redaction.py", "game_control/root_state.py", "game_control/schedule.py", "game_control/schedule_config.py", "game_control/service_container.py", "game_control/service_wiring.py", "game_control/session_store.py", "game_control/sessions.py", "game_control/slot.py", "game_control/slotd_main.py", "game_control/state_db.py", "game_control/stats_queries.py", "game_control/status.py", "game_control/telemetry_db.py", "game_control/telemetry_migration.py", "game_control/telemetry_sampler.py", "game_control/tick_telemetry.py", "game_control/tps.py", "game_control/updates.py", "game_control/web_db.py", "game_control/web_main.py", "game_control/worlds.py"))
 
+_DIRECTORY_SPECS = tuple(
+    replace(
+        DirectorySpec("/" + item[0].rstrip("/"), *item[1:]),
+        allowed_children=("log-checkpoints",) if item[0] == "var/lib/game-control" else
+        ("jvm",) if item[0] == "etc/game-control" else
+        ("operation.lock", "slot.lock", "reservation.json") if item[0] == "run/game-control" else
+        ("slot.json",) if item[0] == "run/game-slot" else (),
+    )
+    for item in _DIRECTORIES
+)
+
 _MANIFEST = DeploymentManifest(
-    1, _PROFILES, _FILES, tuple(DirectorySpec("/" + item[0].rstrip("/"), *item[1:]) for item in _DIRECTORIES),
+    1, _PROFILES, _FILES, _DIRECTORY_SPECS,
     (SymlinkSpec("/srv/game-servers/minecraft-sunlit-cobblemon/libraries", "/opt/game-servers/minecraft-sunlit-cobblemon/libraries"),),
     (NamespaceSpec("profiles", "/etc/game-control/profiles.d", tuple(f"{p.id}.toml" for p in _PROFILES)), NamespaceSpec("runners", "/etc/game-control/runner.d", tuple(f"{p.id}.json" for p in _PROFILES)), NamespaceSpec("systemd", "/etc/systemd/system", tuple(f.target.removeprefix("/etc/systemd/system/") for f in _FILES if f.target.startswith("/etc/systemd/system/") and "/" not in f.target.removeprefix("/etc/systemd/system/")), ("game-control-", "game-slotd", "horizon-", "lazymc-", "bore-minecraft-fenced")), NamespaceSpec("libexec", "/usr/local/libexec", tuple(f.target.removeprefix("/usr/local/libexec/") for f in _FILES if f.target.startswith("/usr/local/libexec/")), ("game-", "horizon-"))),
     RetiredSpec(("/etc/game-control/profiles.d/minecraft.toml", "/etc/game-control/profiles.d/pz-rising.toml", "/etc/game-control/runner.d/minecraft.json", "/etc/game-control/runner.d/pz-rising.json", "/etc/systemd/system/pz-rising.service", "/etc/game-control/secrets.d/crafty-token"), ("minecraft.toml", "pz-rising.toml", "minecraft.json", "pz-rising.json", "pz-rising.service", "crafty.service")),

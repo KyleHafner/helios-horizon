@@ -1430,3 +1430,13 @@ def test_installer_drift_reports_alternate_root_directory_ownership(tmp_path: Pa
     installer.apply()
     os.chown(root / "var/lib/game-control-web", 65534, 65534)
     assert any("ownership drift" in problem for problem in installer.drift())
+
+
+def test_installer_staged_ownership_is_independent_of_host_accounts(tmp_path: Path, monkeypatch) -> None:
+    from ops.install import Installer
+
+    root = tmp_path / "root"
+    installer = Installer(root, skip_systemd_verify=True)
+    installer.apply()
+    monkeypatch.setattr(installer, "_lookup", lambda *_args, **_kwargs: 1234)
+    assert not any("ownership drift" in problem for problem in installer.drift())

@@ -20,7 +20,7 @@ def test_manifest_is_typed_frozen_and_exactly_sized() -> None:
     manifest = get_manifest()
     assert isinstance(manifest, DeploymentManifest)
     assert len(manifest.files) == 65
-    assert len(manifest.directories) == 48
+    assert len(manifest.directories) == 50
     assert len(manifest.runtime_sources) == 69
     assert len(manifest.runtime_files_for()) == 138
     assert all(isinstance(value, tuple) for value in (manifest.files, manifest.directories, manifest.runtime_sources))
