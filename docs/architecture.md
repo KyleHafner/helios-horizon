@@ -185,9 +185,13 @@ uses an update-kind reservation and a publication guard. For each bounded
 irreversible action, the publication guard acquires the exclusive operation
 lock, rechecks exact ownership and inactive state, yields for the action and
 the affected directory fsync, then exits the lock. The guard does not release
-the reservation. The outer updater drains promotion, cleanup, and the renewal
-worker before releasing that exact reservation, so a failed cleanup cannot
-release or steal a replacement reservation.
+the reservation by itself. On successful update, the outer updater invokes
+the exact locked release during the final metadata action, while the guard
+still holds the operation lock; `lease.close()` then stops and joins the
+renewal worker and observes that the lease is already released. If publication
+fails earlier, `lease.close()` drains renewal before its exact release. Locked
+identity and operation-kind checks prevent a late renewal from recreating or
+stealing a replacement reservation.
 See [`slot.py`](../src/game_control/slot.py),
 [`ops/bin/game-slot-run`](../ops/bin/game-slot-run),
 [`sunlit_update.py`](../src/game_control/sunlit_update.py), and
@@ -211,9 +215,15 @@ protects the existing backup/state, and calls the typed promotion API. Each
 irreversible state/release/version/active-link or rollback action enters the
 reservation-aware publication guard, which locks and unlocks around that one
 action and fsyncs the affected directory. The outer updater retains ownership
-through all publication and cleanup, then releases the exact reservation only
-after renewal has drained. A failed or interrupted publication leaves durable
-evidence for an owned retry; it does not silently claim success. See [`sunlit_update.py`](../src/game_control/sunlit_update.py),
+through publication. On a successful update, the final metadata publication
+guard calls the exact locked release while that guard still holds the
+operation lock; the surrounding `lease.close()` then stops and joins the
+renewal worker and observes that the lease is already released. If final
+publication does not complete, `lease.close()` instead stops and drains the
+worker before performing its exact release. In either path, locked exact
+identity and operation-kind checks prevent a late renewal from recreating or
+stealing a replacement reservation. A failed or interrupted publication leaves
+durable evidence for an owned retry; it does not silently claim success. See [`sunlit_update.py`](../src/game_control/sunlit_update.py),
 [`sunlit_stage.py`](../src/game_control/sunlit_stage.py), and
 [`sunlit_promote.py`](../src/game_control/sunlit_promote.py).
 
