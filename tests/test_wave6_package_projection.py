@@ -40,6 +40,17 @@ def test_wave6_runtime_projection_has_renamed_runtime_and_no_source_only_tools()
     assert set(FIXED_LIBEXEC_NAMES).isdisjoint(ABSENT_LIBEXEC_NAMES)
 
 
+def test_runtime_projection_covers_every_package_module() -> None:
+    manifest = get_manifest()
+    package_modules = {
+        path.relative_to(ROOT).as_posix()
+        for path in (ROOT / "src/game_control").rglob("*.py")
+        if path.name != "deployment_manifest.py"
+    }
+
+    assert set(manifest.runtime_sources) == package_modules
+
+
 def test_wave6_wheel_boundary_is_only_the_game_control_source_package() -> None:
     project = tomllib.loads((ROOT / "pyproject.toml").read_text(encoding="utf-8"))
     wheel = project["tool"]["hatch"]["build"]["targets"]["wheel"]
