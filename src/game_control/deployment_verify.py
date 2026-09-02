@@ -15,6 +15,7 @@ Exit status:
 from __future__ import annotations
 
 import argparse
+import ipaddress
 import json
 import os
 import pwd
@@ -107,6 +108,51 @@ SYSTEMD_ADAPTER_MARKERS = (
     "def observe",
     "def recent_logs",
 )
+
+
+def _valid_endpoint_host(value: object) -> bool:
+    """Validate a root-controlled deployment host without fixing one topology."""
+
+    if not isinstance(value, str) or not value or len(value) > 253:
+        return False
+    if any(char.isspace() or ord(char) < 33 for char in value):
+        return False
+    try:
+        address = ipaddress.ip_address(value)
+    except ValueError:
+        labels = value.removesuffix(".").split(".")
+        return bool(
+            len(labels) >= 2
+            and all(
+                label
+                and len(label) <= 63
+                and label[0].isalnum()
+                and label[-1].isalnum()
+                and all(char.isalnum() or char == "-" for char in label)
+                for label in labels
+            )
+        )
+    return not (address.is_unspecified or address.is_multicast)
+
+
+def _unit_environment_host(unit: str, variable: str, *, ip_only: bool = False) -> str | None:
+    try:
+        text = (UNITS / unit).read_text(encoding="utf-8")
+    except (OSError, UnicodeError):
+        return None
+    matches = re.findall(rf"^Environment={re.escape(variable)}=([^\s]+)$", text, re.MULTILINE)
+    if len(matches) != 1 or not _valid_endpoint_host(matches[0]):
+        return None
+    if ip_only:
+        try:
+            address = ipaddress.ip_address(matches[0])
+        except ValueError:
+            return None
+        if address.version != 4 or address.is_loopback:
+            return None
+    return matches[0]
+
+
 class Checks:
     def __init__(self) -> None:
         self.items: list[dict[str, Any]] = []
@@ -529,12 +575,14 @@ def _check_target_package(checks: Checks) -> None:
                     and paths.get("mutable_root") == "/srv/game-servers/minecraft-sunlit-cobblemon-state"
                 )
                 endpoint = raw.get("public_endpoint")
-                fixed_relay = endpoint == {
-                    "host": "mc.example.com",
-                    "port": 25565,
-                    "protocol": "tcp",
-                    "relay_unit": "bore-minecraft-fenced.service",
-                }
+                fixed_relay = (
+                    isinstance(endpoint, dict)
+                    and set(endpoint) == {"host", "port", "protocol", "relay_unit"}
+                    and _valid_endpoint_host(endpoint.get("host"))
+                    and endpoint.get("port") == 25565
+                    and endpoint.get("protocol") == "tcp"
+                    and endpoint.get("relay_unit") == "bore-minecraft-fenced.service"
+                )
                 ports = raw.get("ports")
                 fixed_backend = ports == [{"protocol": "tcp", "port": 25566, "required": True}]
                 ok = systemd and no_retired and split_roots and split_backup and fixed_relay and fixed_backend
@@ -694,7 +742,7 @@ def _check_target_package(checks: Checks) -> None:
             "CPUAccounting=yes",
             "MemoryAccounting=yes",
             "IOAccounting=yes",
-            "Environment=HorizonWebHost=192.0.2.10",
+            "Environment=HorizonWebHost=",
         ),
         "lazymc-minecraft.service": (
             "User=svc-lazymc",
@@ -705,7 +753,7 @@ def _check_target_package(checks: Checks) -> None:
         ),
         "bore-minecraft-fenced.service": (
             "ConditionPathExists=/etc/game-control/arm/bore-minecraft",
-            "Environment=BoreRemoteHost=192.0.2.20",
+            "Environment=BoreRemoteHost=",
             "/usr/local/bin/bore local 25565 --local-host 127.0.0.1 --to ${BoreRemoteHost} --port 25565",
             "Restart=no",
         ),
@@ -736,6 +784,12 @@ def _check_target_package(checks: Checks) -> None:
         platform_ok &= all(marker in contents for marker in markers)
         if name in {"bore-minecraft-fenced.service", "horizon-terraria-relay.service"}:
             platform_ok &= "[Install]" not in contents
+    platform_ok &= _unit_environment_host(
+        "game-control-web.service", "HorizonWebHost", ip_only=True
+    ) is not None
+    platform_ok &= _unit_environment_host(
+        "bore-minecraft-fenced.service", "BoreRemoteHost"
+    ) is not None
     checks.add(
         "target.platform_controls",
         bool(platform_ok),
@@ -826,7 +880,12 @@ def _check_listeners(
 ) -> set[tuple[str, int, str]]:
     listeners = _parse_ss()
     web = {(p, n, host) for p, n, host in listeners if p == "tcp" and n == 8444}
-    ok = any(host in {"192.0.2.10", "192.0.2.10%"} for _, _, host in web)
+    expected_web_host = _unit_environment_host(
+        "game-control-web.service", "HorizonWebHost", ip_only=True
+    )
+    ok = expected_web_host is not None and any(
+        host in {expected_web_host, expected_web_host + "%"} for _, _, host in web
+    )
     checks.add("listener.private_web", ok, "listener_missing" if not ok else "ok", count=len(web))
     for protocol, port, label in (("tcp", 25566, "sunlit-backend"), ("tcp", 7777, "terraria")):
         matching = {host for p, n, host in listeners if p == protocol and n == port}

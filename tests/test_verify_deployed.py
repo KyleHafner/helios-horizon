@@ -447,6 +447,13 @@ def test_verifier_main_emits_full_security_contract_and_46_checks(monkeypatch, t
             ("tcp", 8444, "192.0.2.10"),
         },
     )
+    monkeypatch.setattr(
+        VERIFY,
+        "_unit_environment_host",
+        lambda unit, variable, **_kwargs: (
+            "192.0.2.10" if (unit, variable) == ("game-control-web.service", "HorizonWebHost") else "192.0.2.20"
+        ),
+    )
     monkeypatch.setattr(VERIFY, "_gid", lambda _name: 0)
     monkeypatch.setattr(VERIFY, "_owner_mode", lambda *args, **kwargs: True)
     monkeypatch.setattr(VERIFY, "_load_proxy_credential", lambda: "synthetic-proxy-token")
@@ -601,6 +608,57 @@ def test_static_verifier_accepts_complete_vm_target_root(tmp_path, capsys):
         "target.unit.minecraft-sunlit-cobblemon",
         "target.platform_controls",
     }
+
+
+def test_static_verifier_accepts_root_controlled_private_deployment_overlay(tmp_path, capsys):
+    root = _staged_root(tmp_path)
+    for profile_id in VERIFY.PROFILE_IDS:
+        path = root / "etc/game-control/profiles.d" / f"{profile_id}.toml"
+        text = path.read_text(encoding="utf-8")
+        text = text.replace("mc.example.com", "mc.private.example")
+        text = text.replace("terraria.example.com", "terraria.private.example")
+        path.write_text(text, encoding="utf-8")
+
+    nftables = root / "etc/nftables.conf"
+    text = nftables.read_text(encoding="utf-8")
+    for old, new in (
+        ("192.0.2.10", "198.51.100.10"),
+        ("192.0.2.11", "198.51.100.11"),
+        ("192.0.2.12", "198.51.100.12"),
+        ("192.0.2.13", "198.51.100.13"),
+    ):
+        text = text.replace(old, new)
+    nftables.write_text(text, encoding="utf-8")
+
+    web_unit = root / "etc/systemd/system/game-control-web.service"
+    web_unit.write_text(
+        web_unit.read_text(encoding="utf-8").replace(
+            "Environment=HorizonWebHost=192.0.2.10",
+            "Environment=HorizonWebHost=198.51.100.31",
+        ),
+        encoding="utf-8",
+    )
+    relay_unit = root / "etc/systemd/system/bore-minecraft-fenced.service"
+    relay_unit.write_text(
+        relay_unit.read_text(encoding="utf-8").replace(
+            "Environment=BoreRemoteHost=192.0.2.20",
+            "Environment=BoreRemoteHost=198.51.100.20",
+        ),
+        encoding="utf-8",
+    )
+
+    assert VERIFY.main(["--root", str(root), "--static"]) == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["ok"] is True
+    assert payload["check_count"] == 70
+
+
+@pytest.mark.parametrize(
+    "value",
+    ("", "single-label", "https://example.com", "host name.example", "0.0.0.0", "ff02::1"),
+)
+def test_deployment_host_validation_rejects_unsafe_or_unbounded_values(value):
+    assert VERIFY._valid_endpoint_host(value) is False
 
 
 def test_static_verifier_rejects_undeclared_phase2_helper(tmp_path, capsys):
