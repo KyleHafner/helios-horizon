@@ -644,7 +644,7 @@ def test_schedule_management_updates_live_automation_summary(page: Page):
     page.locator("#schedule-profile").select_option("terraria-vanilla")
     with page.expect_response(lambda response: response.request.method == "POST" and urlparse(response.url).path == "/api/v1/schedules"):
         page.locator("#schedule-form").get_by_role("button", name="Add schedule", exact=True).click()
-    assert page.locator("#schedule-list [data-schedule-row]").count() == 3
+    expect(page.locator("#schedule-list [data-schedule-row]")).to_have_count(3)
     assert page.locator("#schedule-cron").input_value() == ""
     assert page.evaluate("document.activeElement === document.querySelector('#schedule-cron')")
 
