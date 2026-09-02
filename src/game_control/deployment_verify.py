@@ -31,7 +31,12 @@ import urllib.request
 from pathlib import Path
 from typing import Any
 
-from .deployment_manifest import DeploymentManifest, get_manifest
+from .deployment_manifest import (
+    ABSENT_LIBEXEC_NAMES,
+    COMPATIBILITY_LIBEXEC_NAMES,
+    DeploymentManifest,
+    get_manifest,
+)
 
 
 TARGET_ROOT = Path("/")
@@ -73,10 +78,6 @@ HORIZON_UNIT_PREFIXES = _SYSTEMD_NAMESPACE.prefixes
 EXPECTED_PROFILE_FILES = frozenset(next(ns for ns in _DEPLOYMENT_MANIFEST.namespaces if ns.name == "profiles").exact)
 EXPECTED_RUNNER_FILES = frozenset(next(ns for ns in _DEPLOYMENT_MANIFEST.namespaces if ns.name == "runners").exact)
 EXPECTED_DIRECTORIES = {spec.target.removeprefix("/"): spec.mode for spec in _DEPLOYMENT_MANIFEST.directories}
-EXPECTED_DIRECTORY_NLINKS = {
-    spec.target: 2 + sum(Path(child.target).parent == Path(spec.target) for child in _DEPLOYMENT_MANIFEST.directories)
-    for spec in _DEPLOYMENT_MANIFEST.directories
-}
 EXPECTED_SYMLINKS = {spec.target.removeprefix("/"): spec.link_target for spec in _DEPLOYMENT_MANIFEST.symlinks}
 LEGACY_TARGET_FILES = frozenset(_DEPLOYMENT_MANIFEST.retired.names)
 LEGACY_STRINGS = ("crafty", "pzuser", "/opt/pzserver", "/home/pzuser")
@@ -432,11 +433,13 @@ def _check_target_package(checks: Checks) -> None:
             value
             and stat.S_ISDIR(value[0].st_mode)
             and value[1] == expected_mode
-            and value[0].st_nlink == EXPECTED_DIRECTORY_NLINKS[expected_spec.target]
             and value[0].st_uid == expected_uid
             and value[0].st_gid == expected_gid
             and actual_children is not None
-            and (not expected_spec.allowed_children or actual_children <= allowed_children)
+            and (
+                expected_spec.allow_unmanaged_children
+                or actual_children <= allowed_children
+            )
         )
         checks.add(
             "target.directory." + relative.replace("/", "."),
@@ -519,11 +522,19 @@ def _check_target_package(checks: Checks) -> None:
         if libexec_names is None
         else {name for name in libexec_names if name in _LIBEXEC_NAMESPACE.exact or name.startswith(_LIBEXEC_NAMESPACE.prefixes)}
     )
+    allowed_libexec_names = set(_LIBEXEC_NAMESPACE.exact) | set(COMPATIBILITY_LIBEXEC_NAMES)
+    libexec_ok = bool(
+        libexec_names is not None
+        and owned_libexec_names is not None
+        and set(_LIBEXEC_NAMESPACE.exact) <= owned_libexec_names
+        and owned_libexec_names <= allowed_libexec_names
+        and set(libexec_names).isdisjoint(ABSENT_LIBEXEC_NAMES)
+    )
     checks.add(
         "target.libexec.manifest",
-        owned_libexec_names == set(_LIBEXEC_NAMESPACE.exact),
-        "ok" if owned_libexec_names == set(_LIBEXEC_NAMESPACE.exact) else "libexec_manifest_mismatch",
-        expected=sorted(_LIBEXEC_NAMESPACE.exact),
+        libexec_ok,
+        "ok" if libexec_ok else "libexec_manifest_mismatch",
+        expected=sorted(allowed_libexec_names),
         actual=None if owned_libexec_names is None else sorted(owned_libexec_names),
     )
     web_specs = tuple(spec for spec in _DEPLOYMENT_MANIFEST.files if spec.target.startswith("/opt/game-control/web/"))

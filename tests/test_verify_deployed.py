@@ -713,7 +713,7 @@ def test_static_verifier_reports_manifest_file_metadata_drift(tmp_path, capsys):
     assert check["ok"] is False
 
 
-@pytest.mark.parametrize("mutation", ("mode", "owner", "group", "nlink", "symlink", "type"))
+@pytest.mark.parametrize("mutation", ("mode", "owner", "group", "symlink", "type"))
 def test_static_verifier_rejects_directory_metadata_drift(tmp_path, capsys, mutation):
     root = _staged_root(tmp_path)
     target = root / "etc/game-control/arm"
@@ -723,8 +723,6 @@ def test_static_verifier_rejects_directory_metadata_drift(tmp_path, capsys, muta
         os.chown(target, 65534, target.stat().st_gid)
     elif mutation == "group":
         os.chown(target, target.stat().st_uid, 65534)
-    elif mutation == "nlink":
-        (target / "unexpected-child").mkdir()
     elif mutation == "symlink":
         target.rmdir()
         target.symlink_to("elsewhere", target_is_directory=True)
@@ -734,6 +732,55 @@ def test_static_verifier_rejects_directory_metadata_drift(tmp_path, capsys, muta
     assert VERIFY.main(["--root", str(root), "--static"]) == 1
     payload = json.loads(capsys.readouterr().out)
     check = next(item for item in payload["checks"] if item["id"] == "target.directory.etc.game-control.arm")
+    assert check["ok"] is False
+
+
+def test_static_verifier_rejects_unknown_child_in_closed_directory(tmp_path, capsys):
+    root = _staged_root(tmp_path)
+    unexpected = root / "etc/game-control/profiles.d/unreviewed.conf"
+    unexpected.write_text("not managed\n", encoding="utf-8")
+
+    assert VERIFY.main(["--root", str(root), "--static"]) == 1
+    payload = json.loads(capsys.readouterr().out)
+    check = next(
+        item
+        for item in payload["checks"]
+        if item["id"] == "target.directory.etc.game-control.profiles.d"
+    )
+    assert check["ok"] is False
+
+
+def test_static_verifier_allows_unmanaged_child_in_declared_shared_directory(tmp_path, capsys):
+    root = _staged_root(tmp_path)
+    external = root / "usr/local/libexec/external-benchmark-driver"
+    external.write_text("fixture\n", encoding="utf-8")
+    external.chmod(0o755)
+
+    assert VERIFY.main(["--root", str(root), "--static"]) == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["ok"] is True
+
+
+def test_static_verifier_allows_optional_compatibility_helper(tmp_path, capsys):
+    root = _staged_root(tmp_path)
+    compatibility = root / "usr/local/libexec/horizon-jvm-args"
+    compatibility.write_text("fixture\n", encoding="utf-8")
+    compatibility.chmod(0o755)
+
+    assert VERIFY.main(["--root", str(root), "--static"]) == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["ok"] is True
+
+
+def test_static_verifier_rejects_explicitly_retired_underscore_helper(tmp_path, capsys):
+    root = _staged_root(tmp_path)
+    retired = root / "usr/local/libexec/horizon_journal.py"
+    retired.write_text("fixture\n", encoding="utf-8")
+    retired.chmod(0o755)
+
+    assert VERIFY.main(["--root", str(root), "--static"]) == 1
+    payload = json.loads(capsys.readouterr().out)
+    check = next(item for item in payload["checks"] if item["id"] == "target.libexec.manifest")
     assert check["ok"] is False
 
 

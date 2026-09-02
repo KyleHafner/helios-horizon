@@ -5,6 +5,7 @@ from pathlib import Path
 
 from game_control.deployment_manifest import (
     ABSENT_LIBEXEC_NAMES,
+    COMPATIBILITY_LIBEXEC_NAMES,
     FIXED_LIBEXEC_NAMES,
     get_manifest,
 )
@@ -81,6 +82,7 @@ def test_post_wave5_helper_inventory_is_exact_and_alias_free() -> None:
     assert projected == FIXED_HELPERS
     assert not set(projected) & set(ABSENT_HELPERS)
     assert not set(projected) & PERMITTED_COMPATIBILITY_NAMES
+    assert set(COMPATIBILITY_LIBEXEC_NAMES) == PERMITTED_COMPATIBILITY_NAMES
 
 
 def test_post_wave5_systemd_and_peer_boundaries_are_frozen() -> None:

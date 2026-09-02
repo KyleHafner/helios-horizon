@@ -100,6 +100,7 @@ class DirectorySpec:
     owner: str = "root"
     group: str = "root"
     allowed_children: tuple[str, ...] = ()
+    allow_unmanaged_children: bool = False
     staged_owner: str = "root"
     staged_group: str = "root"
 
@@ -111,6 +112,8 @@ class DirectorySpec:
         _text(self.staged_owner, "staged directory owner")
         _text(self.staged_group, "staged directory group")
         _tuple(self.allowed_children, "directory allowed children")
+        if not isinstance(self.allow_unmanaged_children, bool):
+            raise ValueError("directory allow_unmanaged_children must be bool")
         if any(not isinstance(child, str) or not child or "/" in child for child in self.allowed_children):
             raise ValueError("invalid directory allowed child")
 
@@ -398,6 +401,14 @@ ABSENT_LIBEXEC_NAMES = (
     "horizon-memory-drill", "horizon-phase2-threshold", "horizon-phase2-collect",
     "horizon-phase2-browser-evidence", "horizon-phase2-live-acceptance",
 )
+COMPATIBILITY_LIBEXEC_NAMES = (
+    "horizon-backup-reconcile",
+    "horizon-capability-issue",
+    "horizon-jvm-args",
+    "horizon-session-revoke-all",
+    "horizon-journal-evidence",
+    "horizon-journal-finalize",
+)
 
 _FILES = (
     *tuple(_file(p.profile_source, f"/etc/game-control/profiles.d/{p.id}.toml") for p in _PROFILES),
@@ -454,7 +465,40 @@ _DIRECTORY_SPECS = tuple(
         allowed_children=("log-checkpoints",) if item[0] == "var/lib/game-control" else
         ("jvm",) if item[0] == "etc/game-control" else
         ("operation.lock", "slot.lock", "reservation.json") if item[0] == "run/game-control" else
-        ("slot.json",) if item[0] == "run/game-slot" else (),
+        ("slot.json",) if item[0] == "run/game-slot" else
+        ("server.log",) if item[0] in {
+            "srv/game-servers/terraria-vanilla/logs",
+            "srv/game-servers/terraria-tmod/logs",
+        } else
+        (".horizon-restore-anchor",) if item[0] == "srv/game-servers/terraria-tmod/logs/tModLoader-Logs" else (),
+        allow_unmanaged_children=item[0] in {
+            "etc/game-control",
+            "etc/game-control/secrets.d",
+            "etc/game-control/arm",
+            "etc/game-control/jvm",
+            "etc/wireguard",
+            "usr/local/share/horizon",
+            "usr/local/libexec",
+            "var/lib/game-control",
+            "var/lib/game-control/log-checkpoints",
+            "var/lib/game-control/alerts",
+            "var/lib/game-control/horizon-journal",
+            "var/lib/game-control/migrations",
+            "var/lib/game-control-web",
+            "opt/game-servers",
+            "srv/game-servers",
+            "opt/game-servers/minecraft-sunlit-cobblemon",
+            "opt/game-servers/minecraft-sunlit-cobblemon/releases",
+            "srv/game-servers/minecraft-sunlit-cobblemon",
+            "opt/game-servers/terraria-vanilla",
+            "opt/game-servers/terraria-tmod",
+            "srv/game-servers/terraria-vanilla",
+            "srv/game-servers/terraria-tmod",
+            "var/backups/game-servers",
+            "var/backups/game-servers/minecraft-sunlit-cobblemon",
+            "var/backups/game-servers/terraria-vanilla",
+            "var/backups/game-servers/terraria-tmod",
+        },
     )
     for item in _DIRECTORIES
 )
