@@ -7,6 +7,7 @@ import argparse
 import hashlib
 import importlib.util
 import os
+import re
 import secrets
 import shutil
 import stat
@@ -57,6 +58,20 @@ SUNLIT_LIBRARIES_TARGET = _DEPLOYMENT_MANIFEST.symlinks[0].link_target
 FIXED_B2_SECRET_PATH = next(secret.target for secret in _DEPLOYMENT_MANIFEST.secrets if secret.name == "b2")
 FIXED_RCON_SECRET_PATH = next(secret.target for secret in _DEPLOYMENT_MANIFEST.secrets if secret.name == "rcon")
 LEGACY_TARGETS = _DEPLOYMENT_MANIFEST.retired.paths
+
+
+def _generated_entry_point_targets(contents: str, declaration: str) -> bool:
+    try:
+        module_name, function_name = declaration.rsplit(":", 1)
+    except ValueError:
+        return False
+    if not module_name or not function_name:
+        return False
+    import_line = f"from {module_name} import {function_name}"
+    call_pattern = re.compile(
+        rf"\b(?:sys[.])?exit[(]{re.escape(function_name)}[(][)][)]"
+    )
+    return import_line in contents.splitlines() and call_pattern.search(contents) is not None
 
 
 class Installer:
@@ -644,7 +659,7 @@ class Installer:
             contents = destination.read_text(encoding="utf-8")
         except (OSError, UnicodeError) as exc:
             raise RuntimeError(f"generated entry point is unreadable: {destination}") from exc
-        if spec.module not in contents:
+        if not _generated_entry_point_targets(contents, spec.module):
             raise RuntimeError(f"generated entry point target drift: {destination}")
 
     def _create_link(self, destination: Path, target: str) -> None:

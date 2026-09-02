@@ -41,6 +41,23 @@ def test_readme_ci_badge_targets_public_repository_owner() -> None:
     assert "KyleHafner/helios-horizon" not in readme
 
 
+def test_generated_console_script_matches_pip_wrapper_not_pyproject_syntax() -> None:
+    from ops.install import _generated_entry_point_targets
+
+    pip_wrapper = """#!/opt/game-control/.venv/bin/python
+import sys
+from game_control.cli import main
+if __name__ == '__main__':
+    sys.exit(main())
+"""
+    assert _generated_entry_point_targets(pip_wrapper, "game_control.cli:main")
+    assert not _generated_entry_point_targets(pip_wrapper, "game_control.web_main:main")
+    assert not _generated_entry_point_targets(
+        pip_wrapper.replace("sys.exit(main())", "sys.exit(other())"),
+        "game_control.cli:main",
+    )
+
+
 def _profiles() -> dict[str, Profile]:
     return {
         path.stem: Profile.model_validate(tomllib.loads(path.read_text()))
