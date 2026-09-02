@@ -761,6 +761,16 @@ def test_static_verifier_allows_unmanaged_child_in_declared_shared_directory(tmp
     assert payload["ok"] is True
 
 
+def test_static_verifier_allows_unmanaged_runtime_data(tmp_path, capsys):
+    root = _staged_root(tmp_path)
+    world = root / "srv/game-servers/terraria-tmod/worlds/live.wld"
+    world.write_bytes(b"fixture")
+
+    assert VERIFY.main(["--root", str(root), "--static"]) == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["ok"] is True
+
+
 def test_static_verifier_allows_optional_compatibility_helper(tmp_path, capsys):
     root = _staged_root(tmp_path)
     compatibility = root / "usr/local/libexec/horizon-jvm-args"
