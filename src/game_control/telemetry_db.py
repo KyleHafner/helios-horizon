@@ -22,6 +22,7 @@ _STATES = ("available", "inactive", "unavailable")
 RAW_RETENTION_MS = 48 * 60 * 60 * 1000
 ROLLUP_RETENTION_MS = 365 * 24 * 60 * 60 * 1000
 ROLLUP_HOUR_MS = 60 * 60 * 1000
+COMPACTION_CADENCE_SECONDS = 60.0
 
 # The registry is deliberately finite and contains no identity-bearing labels.
 _CONTROLLED_METRICS = {
@@ -305,7 +306,14 @@ def _compact_connection(connection: sqlite3.Connection, *, now_ms: int, raw_rete
 
 
 class TelemetryDatabase:
-    """A separate, disposable database; lifecycle durability is not changed."""
+    """A separate, disposable database; lifecycle durability is not changed.
+
+    Writes run retention maintenance on the first write and after each
+    ``COMPACTION_CADENCE_SECONDS`` elapsed since successful cleanup. A quiet
+    database can therefore retain expired raw rows until the next write or an
+    explicit ``compact_hourly`` call; close persists queued writes without a
+    forced sweep.
+    """
 
     def __init__(self, connection: sqlite3.Connection, path: Path, *, retention_ms: int = RAW_RETENTION_MS,
                  queue_size: int = 32):
@@ -313,6 +321,10 @@ class TelemetryDatabase:
         self.path = path
         self.retention_ms = max(60_000, int(retention_ms))
         self._last_write_ms: int | None = None
+        self._last_committed_ts_ms: int | None = None
+        self._last_compaction_monotonic: float | None = None
+        self._last_compaction_now_ms: int | None = None
+        self._compaction_lock = threading.Lock()
         self._last_error: str | None = None
         self._queue_size = max(1, int(queue_size))
         self._pending: dict[str, tuple[Any, ...]] = {}
@@ -509,13 +521,18 @@ class TelemetryDatabase:
             if value is None or isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value):
                 raise ValueError("available telemetry requires finite numeric value")
             expected = 1
-        with self.connection:
-            series_id = self._register_series(self.connection, profile_id, metric, labels)
-            self.connection.execute("""INSERT INTO telemetry_samples(series_id, ts_ms, value, state, expected)
-                VALUES (?, ?, ?, ?, ?)
-                ON CONFLICT(series_id, ts_ms) DO UPDATE SET value=excluded.value, state=excluded.state, expected=excluded.expected""",
-                (series_id, ts_ms, value, state, expected))
-            _compact_connection(self.connection, now_ms=ts_ms, raw_retention_ms=self.retention_ms)
+        with self._compaction_lock:
+            with self.connection:
+                series_id = self._register_series(self.connection, profile_id, metric, labels)
+                self.connection.execute("""INSERT INTO telemetry_samples(series_id, ts_ms, value, state, expected)
+                    VALUES (?, ?, ?, ?, ?)
+                    ON CONFLICT(series_id, ts_ms) DO UPDATE SET value=excluded.value, state=excluded.state, expected=excluded.expected""",
+                    (series_id, ts_ms, value, state, expected))
+                compaction_now_ms = self._maybe_compact(self.connection, now_ms=ts_ms)
+            if compaction_now_ms is not None:
+                self._last_compaction_monotonic = time.monotonic()
+                self._last_compaction_now_ms = compaction_now_ms
+            self._last_committed_ts_ms = max(ts_ms, self._last_committed_ts_ms or 0)
 
     def query_samples(self, profile_id: Any, metric: str, *, since_ms: int = 0, limit: int = 1000,
                       labels: Mapping[str, str] | None = None) -> list[tuple[int, float | None, str]]:
@@ -572,8 +589,27 @@ class TelemetryDatabase:
         """
         if not isinstance(now_ms, int) or isinstance(now_ms, bool) or now_ms < 0:
             raise ValueError("invalid telemetry timestamp")
-        with self.connection:
-            return _compact_connection(self.connection, now_ms=now_ms, raw_retention_ms=self.retention_ms)
+        with self._compaction_lock:
+            with self.connection:
+                effective_now_ms = max(now_ms, self._last_compaction_now_ms or 0, self._last_committed_ts_ms or 0)
+                result = _compact_connection(self.connection, now_ms=effective_now_ms, raw_retention_ms=self.retention_ms)
+            self._last_compaction_monotonic = time.monotonic()
+            self._last_compaction_now_ms = effective_now_ms
+            return result
+
+    def _maybe_compact(self, connection: sqlite3.Connection, *, now_ms: int) -> int | None:
+        """Compact only when the monotonic cadence has elapsed.
+
+        The caller must hold ``_compaction_lock`` and must update the marker
+        only after its surrounding transaction commits successfully.
+        """
+        current = time.monotonic()
+        previous = self._last_compaction_monotonic
+        if previous is not None and current - previous < COMPACTION_CADENCE_SECONDS:
+            return None
+        effective_now_ms = max(now_ms, self._last_compaction_now_ms or 0, self._last_committed_ts_ms or 0)
+        _compact_connection(connection, now_ms=effective_now_ms, raw_retention_ms=self.retention_ms)
+        return effective_now_ms
 
     def enqueue_process_sample(self, profile_id: Any, sample: Any | None, *, ts_ms: int, state: str) -> bool:
         """Queue a sample without performing SQLite work on the caller thread.
@@ -649,20 +685,25 @@ class TelemetryDatabase:
             "disk_read_bps": getattr(sample, "disk_read_bps", None) if sample is not None else None,
             "disk_write_bps": getattr(sample, "disk_write_bps", None) if sample is not None else None,
         }
-        with self.connection:
-            rows = []
-            for metric, value in values.items():
-                series_id = self._register_series(self.connection, key, metric)
-                row_state = "inactive" if state == "inactive" else ("unavailable" if state == "unavailable" else ("available" if value is not None else "unavailable"))
-                rows.append((series_id, ts_ms, value if row_state == "available" else None, row_state, int(row_state != "inactive")))
-            self.connection.executemany(
-                """INSERT INTO telemetry_samples(series_id, ts_ms, value, state, expected)
-                   VALUES (?, ?, ?, ?, ?)
-                   ON CONFLICT(series_id, ts_ms) DO UPDATE SET
-                     value=excluded.value, state=excluded.state,
-                     expected=excluded.expected""", rows,
-            )
-            _compact_connection(self.connection, now_ms=ts_ms, raw_retention_ms=self.retention_ms)
+        with self._compaction_lock:
+            with self.connection:
+                rows = []
+                for metric, value in values.items():
+                    series_id = self._register_series(self.connection, key, metric)
+                    row_state = "inactive" if state == "inactive" else ("unavailable" if state == "unavailable" else ("available" if value is not None else "unavailable"))
+                    rows.append((series_id, ts_ms, value if row_state == "available" else None, row_state, int(row_state != "inactive")))
+                self.connection.executemany(
+                    """INSERT INTO telemetry_samples(series_id, ts_ms, value, state, expected)
+                       VALUES (?, ?, ?, ?, ?)
+                       ON CONFLICT(series_id, ts_ms) DO UPDATE SET
+                         value=excluded.value, state=excluded.state,
+                         expected=excluded.expected""", rows,
+                )
+                compaction_now_ms = self._maybe_compact(self.connection, now_ms=ts_ms)
+            if compaction_now_ms is not None:
+                self._last_compaction_monotonic = time.monotonic()
+                self._last_compaction_now_ms = compaction_now_ms
+            self._last_committed_ts_ms = max(ts_ms, self._last_committed_ts_ms or 0)
         with self._queue_lock:
             self._last_write_ms = ts_ms
             self._last_error = None
@@ -788,34 +829,44 @@ class TelemetryDatabase:
             "disk_read_bps": getattr(sample, "disk_read_bps", None) if sample is not None else None,
             "disk_write_bps": getattr(sample, "disk_write_bps", None) if sample is not None else None,
         }
-        with connection:
-            rows = []
-            for metric, value in values.items():
-                series_id = self._register_series(connection, key, metric)
-                row_state = "inactive" if state == "inactive" else ("unavailable" if state == "unavailable" else ("available" if value is not None else "unavailable"))
-                rows.append((series_id, ts_ms, value if row_state == "available" else None, row_state, int(row_state != "inactive")))
-            connection.executemany(
-                """INSERT INTO telemetry_samples(series_id, ts_ms, value, state, expected)
-                   VALUES (?, ?, ?, ?, ?)
-                   ON CONFLICT(series_id, ts_ms) DO UPDATE SET
-                     value=excluded.value, state=excluded.state,
-                     expected=excluded.expected""", rows,
-            )
-            _compact_connection(connection, now_ms=ts_ms, raw_retention_ms=self.retention_ms)
+        with self._compaction_lock:
+            with connection:
+                rows = []
+                for metric, value in values.items():
+                    series_id = self._register_series(connection, key, metric)
+                    row_state = "inactive" if state == "inactive" else ("unavailable" if state == "unavailable" else ("available" if value is not None else "unavailable"))
+                    rows.append((series_id, ts_ms, value if row_state == "available" else None, row_state, int(row_state != "inactive")))
+                connection.executemany(
+                    """INSERT INTO telemetry_samples(series_id, ts_ms, value, state, expected)
+                       VALUES (?, ?, ?, ?, ?)
+                       ON CONFLICT(series_id, ts_ms) DO UPDATE SET
+                         value=excluded.value, state=excluded.state,
+                         expected=excluded.expected""", rows,
+                )
+                compaction_now_ms = self._maybe_compact(connection, now_ms=ts_ms)
+            if compaction_now_ms is not None:
+                self._last_compaction_monotonic = time.monotonic()
+                self._last_compaction_now_ms = compaction_now_ms
+            self._last_committed_ts_ms = max(ts_ms, self._last_committed_ts_ms or 0)
 
     def _write_generic_with(self, connection: sqlite3.Connection, profile_id: Any, metric: str,
                             value: float | int | None, *, ts_ms: int, state: str,
                             labels: Mapping[str, str]) -> None:
-        with connection:
-            series_id = self._register_series(connection, profile_id, metric, labels)
-            expected = int(state != "inactive")
-            connection.execute(
-                """INSERT INTO telemetry_samples(series_id,ts_ms,value,state,expected) VALUES(?,?,?,?,?)
-                   ON CONFLICT(series_id,ts_ms) DO UPDATE SET
-                     value=excluded.value,state=excluded.state,expected=excluded.expected""",
-                (series_id, ts_ms, value if state == "available" else None, state, expected),
-            )
-            _compact_connection(connection, now_ms=ts_ms, raw_retention_ms=self.retention_ms)
+        with self._compaction_lock:
+            with connection:
+                series_id = self._register_series(connection, profile_id, metric, labels)
+                expected = int(state != "inactive")
+                connection.execute(
+                    """INSERT INTO telemetry_samples(series_id,ts_ms,value,state,expected) VALUES(?,?,?,?,?)
+                       ON CONFLICT(series_id,ts_ms) DO UPDATE SET
+                         value=excluded.value,state=excluded.state,expected=excluded.expected""",
+                    (series_id, ts_ms, value if state == "available" else None, state, expected),
+                )
+                compaction_now_ms = self._maybe_compact(connection, now_ms=ts_ms)
+            if compaction_now_ms is not None:
+                self._last_compaction_monotonic = time.monotonic()
+                self._last_compaction_now_ms = compaction_now_ms
+            self._last_committed_ts_ms = max(ts_ms, self._last_committed_ts_ms or 0)
 
     def drain(self, timeout: float | None = None) -> bool:
         """Wait for all accepted writes; intended for deterministic lifecycle close/tests."""
@@ -917,4 +968,4 @@ def _secure_file(path: Path) -> None:
     os.chmod(path, 0o600)
 
 
-__all__ = ["RAW_RETENTION_MS", "RESOURCE_METRICS", "TELEMETRY_SCHEMA_VERSION", "TelemetryDatabase"]
+__all__ = ["COMPACTION_CADENCE_SECONDS", "RAW_RETENTION_MS", "RESOURCE_METRICS", "TELEMETRY_SCHEMA_VERSION", "TelemetryDatabase"]

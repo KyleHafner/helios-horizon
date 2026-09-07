@@ -6,6 +6,7 @@ import time
 
 import pytest
 
+import game_control.telemetry_db as telemetry_db_module
 from game_control.models import AdapterKind, ProfileId
 from game_control.status import StatusService
 from game_control.telemetry_db import RAW_RETENTION_MS, ROLLUP_RETENTION_MS, RESOURCE_METRICS, TELEMETRY_SCHEMA_VERSION, TelemetryDatabase
@@ -142,6 +143,7 @@ def test_schema_v2_rejects_invalid_values_and_keeps_retention_boundary(tmp_path:
         telemetry.record_process_sample("minecraft", _sample(), ts_ms=40_000, state="available")
         assert telemetry.connection.execute("SELECT min(ts_ms) FROM resource_samples").fetchone()[0] == 40_000
         telemetry.record_process_sample("minecraft", _sample(), ts_ms=160_000, state="available")
+        telemetry.compact_hourly(now_ms=160_000)
         assert telemetry.connection.execute("SELECT min(ts_ms) FROM resource_samples").fetchone()[0] == 100_000
     finally:
         telemetry.close()
@@ -273,6 +275,141 @@ def test_hourly_compaction_is_idempotent_and_enforces_both_retentions(tmp_path: 
         telemetry.close()
 
 
+def test_write_compaction_uses_monotonic_cadence_and_force_is_transactional(tmp_path: Path, monkeypatch):
+    clock = [100.0]
+    monkeypatch.setattr(telemetry_db_module.time, "monotonic", lambda: clock[0])
+    telemetry = TelemetryDatabase.open(tmp_path / "telemetry.db", retention_ms=60_000)
+    original_compact = telemetry_db_module._compact_connection
+    calls = []
+
+    def spy(connection, *, now_ms, raw_retention_ms):
+        calls.append(now_ms)
+        return original_compact(connection, now_ms=now_ms, raw_retention_ms=raw_retention_ms)
+
+    monkeypatch.setattr(telemetry_db_module, "_compact_connection", spy)
+    try:
+        telemetry.record_sample("minecraft", "tps", 20, ts_ms=100_000)
+        assert calls == [100_000]  # first write always establishes the cadence
+        telemetry.record_sample("minecraft", "tps", 19, ts_ms=0)
+        assert calls == [100_000]  # sample timestamps cannot move the cadence back
+
+        clock[0] += 60
+        telemetry.record_sample("minecraft", "tps", 18, ts_ms=200_000)
+        assert calls == [100_000, 200_000]
+        telemetry.record_sample("minecraft", "tps", 17, ts_ms=1)
+        assert calls == [100_000, 200_000]
+        assert telemetry._last_compaction_now_ms == 200_000
+
+        marker = telemetry._last_compaction_monotonic
+
+        def failed_compact(*_args, **_kwargs):
+            calls.append("failed")
+            raise OSError("compaction failed")
+        monkeypatch.setattr(telemetry_db_module, "_compact_connection", failed_compact)
+        clock[0] += 60
+        with pytest.raises(OSError):
+            telemetry.record_sample("minecraft", "tps", 16, ts_ms=300_000)
+        assert telemetry._last_compaction_monotonic == marker
+        assert telemetry.query_samples("minecraft", "tps", since_ms=300_000) == []
+
+        monkeypatch.setattr(telemetry_db_module, "_compact_connection", spy)
+        telemetry.compact_hourly(now_ms=300_000)  # explicit maintenance ignores cadence
+        assert calls[-1] == 300_000
+    finally:
+        telemetry.close()
+
+
+def test_writer_path_shares_compaction_cadence(tmp_path: Path, monkeypatch):
+    clock = [100.0]
+    monkeypatch.setattr(telemetry_db_module.time, "monotonic", lambda: clock[0])
+    telemetry = TelemetryDatabase.open(tmp_path / "telemetry.db")
+    original = telemetry_db_module._compact_connection
+    calls = []
+
+    def spy(connection, *, now_ms, raw_retention_ms):
+        calls.append(now_ms)
+        return original(connection, now_ms=now_ms, raw_retention_ms=raw_retention_ms)
+
+    monkeypatch.setattr(telemetry_db_module, "_compact_connection", spy)
+    try:
+        assert telemetry.enqueue_sample("minecraft", "tps", 20, ts_ms=100_000)
+        assert telemetry.drain(timeout=2)
+        assert telemetry.enqueue_sample("minecraft", "players", 1, ts_ms=200_000)
+        assert telemetry.drain(timeout=2)
+        assert calls == [100_000]
+        clock[0] += 60
+        assert telemetry.enqueue_sample("minecraft", "mspt", 10, ts_ms=150_000)
+        assert telemetry.drain(timeout=2)
+        assert calls == [100_000, 200_000]
+    finally:
+        telemetry.close()
+
+
+def test_long_compaction_cadence_starts_after_commit_completion(tmp_path: Path, monkeypatch):
+    clock = [100.0]
+    monkeypatch.setattr(telemetry_db_module.time, "monotonic", lambda: clock[0])
+    telemetry = TelemetryDatabase.open(tmp_path / "telemetry.db")
+    original = telemetry_db_module._compact_connection
+    calls = []
+
+    def slow_compact(connection, *, now_ms, raw_retention_ms):
+        calls.append(now_ms)
+        result = original(connection, now_ms=now_ms, raw_retention_ms=raw_retention_ms)
+        clock[0] += 61
+        return result
+
+    monkeypatch.setattr(telemetry_db_module, "_compact_connection", slow_compact)
+    try:
+        telemetry.record_sample("minecraft", "tps", 20, ts_ms=100_000)
+        telemetry.record_sample("minecraft", "tps", 19, ts_ms=101_000)
+        assert calls == [100_000]
+    finally:
+        telemetry.close()
+
+
+@pytest.mark.parametrize("operation", ["sample", "process", "worker_sample", "worker_process", "force"])
+def test_compaction_commit_failure_does_not_advance_bookkeeping(tmp_path: Path, operation):
+    import sqlite3
+
+    telemetry = TelemetryDatabase.open(tmp_path / "telemetry.db")
+    connection = telemetry.connection
+
+    def deny_commit(action, arg1, *_args):
+        if action == sqlite3.SQLITE_TRANSACTION and arg1 == "COMMIT":
+            return sqlite3.SQLITE_DENY
+        return sqlite3.SQLITE_OK
+
+    def perform():
+        if operation == "sample":
+            telemetry.record_sample("minecraft", "tps", 20, ts_ms=100_000)
+        elif operation == "process":
+            telemetry.record_process_sample("minecraft", _sample(), ts_ms=100_000, state="available")
+        elif operation == "worker_sample":
+            telemetry._write_generic_with(connection, "minecraft", "tps", 20,
+                                          ts_ms=100_000, state="available", labels={})
+        elif operation == "worker_process":
+            telemetry._write_with(connection, "minecraft", sample=_sample(), ts_ms=100_000, state="available")
+        else:
+            telemetry.compact_hourly(now_ms=100_000)
+
+    try:
+        connection.set_authorizer(deny_commit)
+        with pytest.raises(sqlite3.DatabaseError, match="not authorized"):
+            perform()
+        assert not connection.in_transaction
+        assert telemetry._last_compaction_monotonic is None
+        assert telemetry._last_compaction_now_ms is None
+        assert telemetry._last_committed_ts_ms is None
+        assert connection.execute("SELECT count(*) FROM telemetry_samples").fetchone()[0] == 0
+        connection.set_authorizer(telemetry_db_module._deny_attach)
+        perform()
+        assert telemetry._last_compaction_monotonic is not None
+        assert telemetry._last_compaction_now_ms == 100_000
+    finally:
+        connection.set_authorizer(telemetry_db_module._deny_attach)
+        telemetry.close()
+
+
 def test_counter_compaction_uses_reset_aware_deltas_and_breaks_on_inactive_gap(tmp_path: Path):
     telemetry = TelemetryDatabase.open(tmp_path / "telemetry.db", retention_ms=60_000)
     metric = "host_network_rx_bytes_total"
@@ -334,6 +471,7 @@ def test_telemetry_upsert_whitelist_and_retention(tmp_path: Path):
             "SELECT value FROM resource_samples WHERE profile_id='minecraft' AND metric='cpu_percent'"
         ).fetchone()[0] == 20
         telemetry.record_process_sample("minecraft", _sample(), ts_ms=200_000, state="available")
+        telemetry.compact_hourly(now_ms=200_000)
         assert telemetry.connection.execute("SELECT min(ts_ms) FROM resource_samples").fetchone()[0] == 200_000
         assert set(RESOURCE_METRICS) == {row[0] for row in telemetry.connection.execute("SELECT DISTINCT metric FROM resource_samples")}
     finally:
