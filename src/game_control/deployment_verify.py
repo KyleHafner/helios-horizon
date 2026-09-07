@@ -15,6 +15,7 @@ Exit status:
 from __future__ import annotations
 
 import argparse
+import hashlib
 import ipaddress
 import json
 import os
@@ -28,6 +29,8 @@ import subprocess
 import tomllib
 import urllib.error
 import urllib.request
+import uuid
+from urllib.parse import urlsplit
 from pathlib import Path
 from typing import Any
 
@@ -46,6 +49,7 @@ PROFILES = ETC / "profiles.d"
 RUNNERS = ETC / "runner.d"
 UNITS = TARGET_ROOT / "etc/systemd/system"
 ROOT_CONFIG = ETC / "game-control.toml"
+PUBLIC_ORIGIN_CONFIG = ETC / "public-origin.conf"
 RUN = TARGET_ROOT / "run/game-control"
 SOCKET = RUN / "control.sock"
 SLOT_METADATA = TARGET_ROOT / "run/game-slot/slot.json"
@@ -55,6 +59,7 @@ WEB_SOURCE = TARGET_ROOT / "opt/game-control/src/game_control"
 DEPLOYED_PYTHON = TARGET_ROOT / "opt/game-control/.venv/bin/python"
 API_URL = os.environ.get("HORIZON_VERIFY_API_URL", "http://192.0.2.10:8444/api/v1/status")
 PERF_API_URL = os.environ.get("HORIZON_VERIFY_PERF_API_URL", "http://192.0.2.10:8444/api/v1/perf")
+AUTH_API_BASE_URL = os.environ.get("HORIZON_VERIFY_API_BASE_URL")
 PROXY_CREDENTIAL = TARGET_ROOT / "run/credentials/game-control-web.service/proxy-token"
 STATUS_P50_BUDGET_MS = 150.0
 
@@ -111,6 +116,31 @@ SYSTEMD_ADAPTER_MARKERS = (
 )
 
 
+class _NoRedirect(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, request, fp, code, msg, headers, newurl):
+        return None
+
+
+_HTTP_OPENER = urllib.request.build_opener(_NoRedirect())
+
+
+def _open_http(request: urllib.request.Request, timeout: float):
+    return _HTTP_OPENER.open(request, timeout=timeout)
+
+
+def _source_python_modules() -> tuple[str, ...]:
+    """Return package modules from the canonical manifest, in stable order."""
+    modules = []
+    for source in _DEPLOYMENT_MANIFEST.runtime_sources:
+        if not source.startswith("src/game_control/") or not source.endswith(".py"):
+            continue
+        relative = source[len("src/"):-3]
+        if relative.endswith("/__init__"):
+            relative = relative[:-len("/__init__")]
+        modules.append(relative.replace("/", "."))
+    return tuple(sorted(set(modules)))
+
+
 def _valid_endpoint_host(value: object) -> bool:
     """Validate a root-controlled deployment host without fixing one topology."""
 
@@ -134,6 +164,25 @@ def _valid_endpoint_host(value: object) -> bool:
             )
         )
     return not (address.is_unspecified or address.is_multicast)
+
+
+def _valid_public_origin(value: object) -> bool:
+    if not isinstance(value, str) or not value or value != value.strip() or any(ord(char) < 33 or char.isspace() for char in value):
+        return False
+    try:
+        parsed = urlsplit(value)
+        parsed.port
+    except (TypeError, ValueError):
+        return False
+    return bool(
+        parsed.scheme == "https"
+        and parsed.hostname
+        and parsed.username is None
+        and parsed.password is None
+        and not parsed.path
+        and not parsed.query
+        and not parsed.fragment
+    )
 
 
 def _unit_environment_host(unit: str, variable: str, *, ip_only: bool = False) -> str | None:
@@ -754,6 +803,7 @@ def _check_target_package(checks: Checks) -> None:
             "MemoryAccounting=yes",
             "IOAccounting=yes",
             "Environment=HorizonWebHost=",
+            "EnvironmentFile=/etc/game-control/public-origin.conf",
         ),
         "lazymc-minecraft.service": (
             "User=svc-lazymc",
@@ -978,6 +1028,157 @@ def _check_runtime_files(checks: Checks) -> None:
         checks.add("runtime.reservation", ok, "ok" if ok else "secure_reservation_required")
     else:
         checks.add("runtime.reservation", True, "absent")
+
+
+def _check_service_account_access(checks: Checks) -> None:
+    """Verify the account that launches Sunlit can traverse managed JVM args."""
+    if TARGET_ROOT != Path("/"):
+        return
+    try:
+        pwd.getpwnam("svc-sunlit")
+    except KeyError:
+        checks.unavailable("runtime.jvm_account_access")
+        return
+    result = _run(["runuser", "--user", "svc-sunlit", "--", "test", "-x", "/etc/game-control/jvm"])
+    ok = result is not None and result.returncode == 0
+    checks.add(
+        "runtime.jvm_account_access",
+        ok,
+        "ok" if ok else "svc_sunlit_cannot_traverse_jvm",
+    )
+
+
+def _read_public_origin_config() -> str | None:
+    fd = None
+    try:
+        fd = os.open(PUBLIC_ORIGIN_CONFIG, os.O_RDONLY | os.O_NONBLOCK | getattr(os, "O_NOFOLLOW", 0))
+        info = os.fstat(fd)
+        if not (stat.S_ISREG(info.st_mode) and info.st_nlink == 1 and info.st_uid == 0 and stat.S_IMODE(info.st_mode) == 0o600 and info.st_size <= 4096):
+            return None
+        raw = os.read(fd, 4097).decode("ascii")
+    except (OSError, UnicodeError):
+        return None
+    finally:
+        if fd is not None:
+            os.close(fd)
+    lines = [line for line in raw.splitlines() if line and not line.startswith("#")]
+    value = lines[0].partition("=")[2] if len(lines) == 1 and lines[0].startswith("HORIZON_PUBLIC_ORIGIN=") else None
+    return value if _valid_public_origin(value) else None
+
+
+def _check_public_origin_config(checks: Checks) -> None:
+    """Require the root-controlled private origin overlay used by the web unit."""
+    if TARGET_ROOT != Path("/"):
+        return
+    value = _read_public_origin_config()
+    ok = _valid_public_origin(value)
+    checks.add("target.public_origin", ok, "ok" if ok else "public_origin_config_invalid")
+
+
+def _public_origin() -> str | None:
+    """Read the validated origin overlay without exposing its contents."""
+    return _read_public_origin_config()
+
+
+def _check_installed_package_mirror(checks: Checks) -> None:
+    """Compare bytes imported by the target venv with the source projection.
+
+    Reading source files alone cannot detect a stale wheel.  The subprocess has
+    PYTHONPATH removed and imports through the target interpreter, then reports
+    only module names and hashes.
+    """
+    if TARGET_ROOT != Path("/"):
+        checks.add("package.installed_mirror", True, "staged_root_not_applicable")
+        return
+    modules = _source_python_modules()
+    if not modules:
+        checks.add("package.installed_mirror", False, "manifest_module_inventory_empty")
+        return
+    probe = (
+        "import hashlib, importlib, json\n"
+        f"mods = {modules!r}\n"
+        "out = {}\n"
+        "for name in mods:\n"
+        "    m = importlib.import_module(name)\n"
+        "    p = getattr(m, '__file__', None)\n"
+        "    if not p or not p.endswith('.py'):\n"
+        "        raise RuntimeError(name)\n"
+        "    with open(p, 'rb') as stream: out[name] = hashlib.sha256(stream.read()).hexdigest()\n"
+        "print(json.dumps(out, sort_keys=True, separators=(',', ':')))\n"
+    )
+    env = os.environ.copy()
+    env.pop("PYTHONPATH", None)
+    try:
+        result = subprocess.run(
+            [str(DEPLOYED_PYTHON), "-I", "-c", probe], stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True,
+            timeout=15, check=False, env=env,
+        )
+        imported = json.loads(result.stdout) if result.returncode == 0 else None
+        if not isinstance(imported, dict):
+            raise ValueError("probe")
+        mismatches = []
+        for module in modules:
+            relative = module.removeprefix("game_control").lstrip(".").replace(".", "/")
+            source = WEB_SOURCE / (relative + ".py" if relative else "__init__.py")
+            if not source.is_file() and relative:
+                source = WEB_SOURCE / relative / "__init__.py"
+            try:
+                expected = hashlib.sha256(source.read_bytes()).hexdigest()
+            except OSError:
+                expected = None
+            if expected is None or imported.get(module) != expected:
+                mismatches.append(module)
+        checks.add("package.installed_mirror", not mismatches, "ok" if not mismatches else "installed_source_mismatch", actual=mismatches[:10])
+    except (OSError, subprocess.SubprocessError, TypeError, ValueError, json.JSONDecodeError):
+        checks.add("package.installed_mirror", False, "installed_import_probe_unavailable")
+
+
+def _check_authenticated_origin_probe(checks: Checks) -> None:
+    """Opt-in, non-lifecycle probe for origin enforcement and stale cookies."""
+    credential = _load_proxy_credential()
+    origin = _public_origin()
+    base = AUTH_API_BASE_URL or API_URL.rsplit("/api/v1/", 1)[0]
+    if credential is None or origin is None:
+        checks.add("web.authenticated_origin_probe", False, "probe_configuration_unavailable")
+        return
+
+    def request(path: str, *, headers: dict[str, str] | None = None, body: bytes | None = None):
+        request_obj = urllib.request.Request(
+            base + path, headers={"X-Game-Control-Proxy": credential, "X-authentik-username": "verify-deployed", **(headers or {})}, data=body,
+        )
+        try:
+            return _open_http(request_obj, timeout=5)
+        except urllib.error.HTTPError as exc:
+            return exc
+
+    try:
+        with request("/api/v1/session") as response:
+            bootstrap_status = int(response.status)
+            raw_payload = response.read(65537)
+            if len(raw_payload) > 65536:
+                raise ValueError("response too large")
+            payload = json.loads(raw_payload.decode("utf-8"))
+            cookie = response.headers.get("Set-Cookie", "").split(";", 1)[0]
+        csrf = payload.get("csrf_token") if isinstance(payload, dict) else None
+        if bootstrap_status != 200 or not cookie.startswith("game_control_session=") or not isinstance(csrf, str):
+            raise ValueError("bootstrap")
+        common = {"Cookie": cookie, "X-CSRF-Token": csrf, "Origin": origin, "Content-Type": "application/json", "Idempotency-Key": str(uuid.uuid4())}
+        with request("/api/v1/profiles/minecraft-sunlit-cobblemon/start", headers=common, body=b'{"unexpected_acceptance_field":true}') as response:
+            correct_status = int(response.status)
+        wrong = dict(common, Origin="https://wrong-origin.invalid", **{"Idempotency-Key": str(uuid.uuid4())})
+        with request("/api/v1/profiles/minecraft-sunlit-cobblemon/start", headers=wrong, body=b'{"unexpected_acceptance_field":true}') as response:
+            wrong_status = int(response.status)
+        with request("/api/v1/session", headers={"Cookie": "game_control_session=invalid-acceptance-session"}) as response:
+            stale_status = int(response.status)
+            cleared = "Max-Age=0" in response.headers.get("Set-Cookie", "")
+        with request("/api/v1/session") as response:
+            fresh_status = int(response.status)
+            fresh_cookie = response.headers.get("Set-Cookie", "").split(";", 1)[0]
+        passed = correct_status == 422 and wrong_status == 403 and stale_status == 401 and cleared and fresh_status == 200 and fresh_cookie.startswith("game_control_session=")
+        checks.add("web.authenticated_origin_probe", passed, "ok" if passed else "acceptance_boundary_invalid", status={"correct_origin": correct_status, "wrong_origin": wrong_status, "stale_cookie": stale_status, "fresh_bootstrap": fresh_status})
+    except (OSError, urllib.error.URLError, UnicodeError, ValueError, TypeError, json.JSONDecodeError):
+        checks.add("web.authenticated_origin_probe", False, "probe_request_failed")
 
 
 def _load_profiles(checks: Checks) -> dict[str, dict[str, Any]]:
@@ -1360,7 +1561,7 @@ def _check_manifest(checks: Checks, manifest: Path | None) -> None:
 
 
 def _set_root(root: Path) -> None:
-    global TARGET_ROOT, ETC, PROFILES, RUNNERS, UNITS, ROOT_CONFIG, RUN, SOCKET
+    global TARGET_ROOT, ETC, PROFILES, RUNNERS, UNITS, ROOT_CONFIG, PUBLIC_ORIGIN_CONFIG, RUN, SOCKET
     global SLOT_METADATA, STATE_DB, WEB_DB, WEB_SOURCE, DEPLOYED_PYTHON, PROXY_CREDENTIAL
     TARGET_ROOT = root
     ETC = root / "etc/game-control"
@@ -1368,6 +1569,7 @@ def _set_root(root: Path) -> None:
     RUNNERS = ETC / "runner.d"
     UNITS = root / "etc/systemd/system"
     ROOT_CONFIG = ETC / "game-control.toml"
+    PUBLIC_ORIGIN_CONFIG = ETC / "public-origin.conf"
     RUN = root / "run/game-control"
     SOCKET = RUN / "control.sock"
     SLOT_METADATA = root / "run/game-slot/slot.json"
@@ -1403,6 +1605,11 @@ def main(argv: list[str] | None = None) -> int:
         default="private",
         help="validate per-relay private or production activation state",
     )
+    parser.add_argument(
+        "--authenticated-probe",
+        action="store_true",
+        help="opt in to a session-creating invalid-body origin probe (never lifecycle actions)",
+    )
     parser.add_argument("--mutation-manifest", type=Path, default=None, help=argparse.SUPPRESS)
     args = parser.parse_args(argv)
     if args.root is not None:
@@ -1420,8 +1627,13 @@ def main(argv: list[str] | None = None) -> int:
         owner = _controller_owned_profile()
         listeners = _check_listeners(checks, profiles, owner)
         _check_runtime_files(checks)
+        _check_service_account_access(checks)
+        _check_public_origin_config(checks)
+        _check_installed_package_mirror(checks)
         _check_profile_status(checks, profiles, listeners)
         _check_private_auth(checks)
+        if args.authenticated_probe:
+            _check_authenticated_origin_probe(checks)
         _check_status_perf(checks)
         _check_peer_rejection(checks)
         _check_systemd_adapter_contract(checks)

@@ -436,7 +436,7 @@ _FILES = (
 _DIRECTORIES = (
     ("etc/game-control", 0o755, "root", "root"), ("etc/game-control/profiles.d", 0o755, "root", "root"),
     ("etc/game-control/runner.d", 0o755, "root", "root"), ("etc/game-control/secrets.d", 0o700, "root", "root"),
-    ("etc/game-control/arm", 0o700, "root", "root"), ("etc/game-control/jvm", 0o700, "root", "root"), ("etc/game-control/lazymc", 0o755, "root", "root"),
+    ("etc/game-control/arm", 0o700, "root", "root"), ("etc/game-control/jvm", 0o755, "root", "root"), ("etc/game-control/lazymc", 0o755, "root", "root"),
     ("etc/systemd/journald@horizon.conf.d", 0o700, "root", "root"), ("etc/wireguard", 0o700, "root", "root"),
     ("usr/local/share/horizon", 0o755, "root", "root"), ("usr/local/libexec", 0o755, "root", "root"),
     ("opt/game-control/web", 0o755, "root", "root"), ("var/lib/game-control", 0o700, "root", "root"), ("var/lib/game-control/log-checkpoints", 0o700, "root", "root"),
@@ -508,6 +508,7 @@ _DIRECTORY_SPECS = tuple(
     )
     for item in _DIRECTORIES
 )
+_RUNTIME_SOURCES += ("src/game_control/origin_config.py",)
 
 _MANIFEST = DeploymentManifest(
     1, _PROFILES, _FILES, _DIRECTORY_SPECS,

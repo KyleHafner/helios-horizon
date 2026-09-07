@@ -1,6 +1,8 @@
+import asyncio
 import json
 import os
 from pathlib import Path
+import threading
 
 import pytest
 
@@ -10,6 +12,139 @@ from game_control.log_follower import (
     LogFollowerError,
     UnsafeLogPathError,
 )
+
+
+@pytest.mark.asyncio
+async def test_async_cursor_save_does_not_block_event_loop(tmp_path, monkeypatch):
+    path = tmp_path / "game.log"
+    checkpoint = tmp_path / "offset.json"
+    path.write_text("ready\n")
+    entered = threading.Event()
+    release = threading.Event()
+
+    follower = LogFollower(path, checkpoint)
+
+    def slow_save():
+        entered.set()
+        release.wait(2)
+
+    monkeypatch.setattr(follower, "_save", slow_save)
+    task = asyncio.create_task(follower.follow_async())
+    assert await asyncio.to_thread(entered.wait, 1)
+    await asyncio.wait_for(asyncio.sleep(0), timeout=0.2)
+    assert not task.done()
+    release.set()
+    await asyncio.wait_for(task, timeout=1)
+
+
+@pytest.mark.asyncio
+async def test_async_cursor_save_drains_in_flight_save_on_cancellation(tmp_path, monkeypatch):
+    path = tmp_path / "game.log"
+    path.write_text("ready\n")
+    entered = threading.Event()
+    release = threading.Event()
+    completed = threading.Event()
+    follower = LogFollower(path, tmp_path / "offset.json")
+
+    def slow_save():
+        entered.set()
+        release.wait(2)
+        completed.set()
+
+    monkeypatch.setattr(follower, "_save", slow_save)
+    task = asyncio.create_task(follower.follow_async())
+    assert await asyncio.to_thread(entered.wait, 1)
+    task.cancel()
+    await asyncio.sleep(0)
+    assert not task.done()
+    assert not completed.is_set()
+    release.set()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    assert completed.is_set()
+
+
+@pytest.mark.asyncio
+async def test_concurrent_follow_calls_are_serialized(tmp_path, monkeypatch):
+    path = tmp_path / "game.log"
+    path.write_text("ready\n")
+    entered = threading.Event()
+    release = threading.Event()
+    active = 0
+    max_active = 0
+    follower = LogFollower(path, tmp_path / "offset.json")
+
+    def slow_save():
+        nonlocal active, max_active
+        active += 1
+        max_active = max(max_active, active)
+        entered.set()
+        release.wait(2)
+        active -= 1
+
+    monkeypatch.setattr(follower, "_save", slow_save)
+    first = asyncio.create_task(follower.follow_async())
+    assert await asyncio.to_thread(entered.wait, 1)
+    second = asyncio.create_task(follower.follow_async())
+    await asyncio.sleep(0)
+    assert not second.done()
+    release.set()
+    first_events, second_events = await asyncio.gather(first, second)
+    assert [event.line for event in first_events] == ["ready"]
+    assert second_events == ()
+    assert max_active == 1
+
+
+@pytest.mark.asyncio
+async def test_repeated_cancellation_waits_for_cursor_save_before_retry(tmp_path, monkeypatch):
+    path = tmp_path / "game.log"
+    checkpoint = tmp_path / "offset.json"
+    path.write_text("ready\n")
+    entered = threading.Event()
+    release = threading.Event()
+    completed = threading.Event()
+    follower = LogFollower(path, checkpoint)
+    original_save = follower._save
+
+    def slow_save():
+        entered.set()
+        release.wait(2)
+        original_save()
+        completed.set()
+
+    monkeypatch.setattr(follower, "_save", slow_save)
+    task = asyncio.create_task(follower.follow_async())
+    assert await asyncio.to_thread(entered.wait, 1)
+    task.cancel()
+    await asyncio.sleep(0)
+    task.cancel()
+    await asyncio.sleep(0)
+    assert not completed.is_set()
+    release.set()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    assert completed.is_set()
+
+    retry = await follower.follow_async()
+    assert retry == ()
+    assert await LogFollower(path, checkpoint).follow_async() == ()
+
+
+@pytest.mark.asyncio
+async def test_callback_cancellation_resets_uncommitted_cursor_state(tmp_path):
+    path = tmp_path / "game.log"
+    checkpoint = tmp_path / "offset.json"
+    path.write_text("ready\n")
+    follower = LogFollower(path, checkpoint)
+
+    async def cancel(_event):
+        raise asyncio.CancelledError
+
+    with pytest.raises(asyncio.CancelledError):
+        await follower.follow_async(cancel)
+
+    events = await follower.follow_async()
+    assert [event.line for event in events] == ["ready"]
 
 
 def test_append_and_exact_once_with_persistent_offset(tmp_path: Path):

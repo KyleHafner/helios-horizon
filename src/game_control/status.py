@@ -180,7 +180,11 @@ class StatusService:
         """Return the last sampled projection without running probes."""
         cached = self._snapshot_cache
         if cached is not None:
-            return cached
+            # Lifecycle intent is root-owned and cheap to project.  Overlay it
+            # on the last sample so a slow adapter/RCON probe cannot make a
+            # newly accepted start look stopped.  Do not infer health, PID, or
+            # players here: those remain exactly as last observed (or None).
+            return self._overlay_active_jobs(cached)
         # Pure API reads must not unexpectedly probe adapters or enqueue
         # telemetry.  The slotd sampler/maintenance path is responsible for
         # establishing the first authoritative snapshot.
@@ -190,22 +194,54 @@ class StatusService:
         generation = self.generation() if callable(self.generation) else self.generation
         # A cold cached read is deliberately projection-only: do not perform
         # version-file or adapter probes while maintenance is in flight.
+        profile_keys = tuple(
+            (getattr(profile, "id"), getattr(getattr(profile, "id"), "value", getattr(profile, "id")))
+            for profile in self.profiles
+        )
+        jobs = tuple(self._safe_job_for(profile_id, key) for profile_id, key in profile_keys)
         versions = tuple(
             parse_version_text(value) if isinstance(value := getattr(profile, "installed_version", None), str) and value else None
             for profile in self.profiles
         )
         profiles = tuple(
             ProfileStatus(
-                profile_id=getattr(profile, "id"), state=ObservedState.STOPPED,
-                health=HealthState.UNKNOWN, slot_owner=None, active_job_id=None,
+                profile_id=getattr(profile, "id"),
+                state=derive_state(active_job=job, process_alive=False, conflicting_slot_owner=False),
+                health=HealthState.UNKNOWN, slot_owner=None,
+                active_job_id=job,
                 pid=None, started_at=None, uptime_seconds=None, cpu_percent=None,
                 rss_bytes=None, players_online=None,
                 installed_version=version,
                 restart_required=False, required_ports_ready=False,
             )
-            for profile, version in zip(self.profiles, versions)
+            for profile, version, (_profile_id, _key), job in zip(self.profiles, versions, profile_keys, jobs)
         )
         return StatusSnapshot(generation=int(generation), observed_at=now, profiles=profiles)
+
+    def _safe_job_for(self, profile_id: Any, key: Any) -> str | None:
+        try:
+            value = self._job_for(profile_id, key)
+        except Exception:
+            return None
+        return value if value in {"start", "stop", "failed"} else None
+
+    def _overlay_active_jobs(self, snapshot: StatusSnapshot) -> StatusSnapshot:
+        """Project accepted/running lifecycle intent without external probes."""
+        profiles: list[ProfileStatus] = []
+        changed = False
+        for status in snapshot.profiles:
+            key = getattr(status.profile_id, "value", status.profile_id)
+            job = self._safe_job_for(status.profile_id, key)
+            if job is None:
+                profiles.append(status)
+                continue
+            state = derive_state(active_job=job, process_alive=False, conflicting_slot_owner=False)
+            if status.active_job_id == job and status.state is state:
+                profiles.append(status)
+                continue
+            profiles.append(status.model_copy(update={"state": state, "active_job_id": job}))
+            changed = True
+        return snapshot if not changed else snapshot.model_copy(update={"profiles": tuple(profiles)})
 
     async def benchmark_eligibility(
         self,

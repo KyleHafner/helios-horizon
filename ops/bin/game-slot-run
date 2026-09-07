@@ -43,6 +43,10 @@ SLOT_ACQUIRE_TIMEOUT_SECONDS = 0.5
 SLOT_ACQUIRE_POLL_SECONDS = 0.01
 
 
+class ManagedJvmConfigurationError(ValueError):
+    """Safe, stable diagnostic for unavailable managed JVM configuration."""
+
+
 def _profile(value: str) -> str:
     if value not in PROFILES:
         raise ValueError("invalid profile id")
@@ -138,6 +142,12 @@ def _managed_jvm_layer(profile: str, command: list[str]) -> list[str]:
             raise ValueError("managed JVM argfile hash binding is invalid")
     except FileNotFoundError:
         return command
+    except (OSError, ValueError, json.JSONDecodeError) as exc:
+        # The argfile is optional, but once it exists every access and
+        # provenance failure is a launch failure.  Keep the diagnostic
+        # deliberately path-free: this helper runs with service credentials
+        # and must not disclose deployment details or secret-bearing names.
+        raise ManagedJvmConfigurationError("managed JVM configuration unavailable") from exc
     try:
         index = next(index for index, value in enumerate(command) if value.endswith("/unix_args.txt"))
     except StopIteration as exc:
@@ -471,7 +481,11 @@ def main(argv: list[str] | None = None) -> int:
                 pass
     except SystemExit:
         raise
-    except (KeyError, TypeError, OSError, ValueError, json.JSONDecodeError):
+    except ManagedJvmConfigurationError:
+        print("game-slot-run: launch preflight failed: managed_jvm_configuration_unavailable", file=sys.stderr)
+        return 2
+    except (KeyError, TypeError, OSError, ValueError, json.JSONDecodeError) as exc:
+        print(f"game-slot-run: launch preflight failed: {type(exc).__name__}", file=sys.stderr)
         return 2
     return 0
 

@@ -1,4 +1,5 @@
 from pathlib import Path
+import sqlite3
 from uuid import uuid4
 
 import pytest
@@ -11,6 +12,35 @@ from starlette.requests import Request
 
 from game_control.web_main import create_app
 from game_control.web_main import AdaptiveStatusCadence
+from game_control.auth import SESSION_COOKIE, SessionStore
+
+
+def test_invalid_session_cookie_is_cleared_for_trusted_bootstrap():
+    db = sqlite3.connect(":memory:", check_same_thread=False)
+    app = create_app(proxy_credential="secret", session_db=db)
+    trusted = {
+        "X-Game-Control-Proxy": "secret",
+        "X-authentik-username": "operator",
+    }
+    with TestClient(app, base_url="https://games.example.com") as client:
+        first = client.get("/api/v1/session", headers=trusted)
+        old_token = client.cookies.get(SESSION_COOKIE)
+        assert first.status_code == 200 and old_token
+        SessionStore(db).revoke(old_token)
+
+        rejected = client.get("/api/v1/session", headers=trusted)
+        assert rejected.status_code == 401
+        assert "Max-Age=0" in rejected.headers["set-cookie"]
+
+        refreshed = client.get("/api/v1/session", headers=trusted)
+        assert refreshed.status_code == 200
+        assert client.cookies.get(SESSION_COOKIE) != old_token
+
+        untrusted = client.get(
+            "/api/v1/session",
+            headers={"X-Game-Control-Proxy": "wrong", "X-authentik-username": "operator"},
+        )
+        assert untrusted.status_code == 403
 
 
 def test_successful_mutation_wakes_idle_status_publisher():

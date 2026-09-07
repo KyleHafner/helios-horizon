@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -517,7 +518,7 @@ def test_verifier_main_emits_full_security_contract_and_46_checks(monkeypatch, t
 
     assert VERIFY.main([]) == 0
     payload = json.loads(capsys.readouterr().out)
-    assert payload["check_count"] == 56
+    assert payload["check_count"] == 57
     systemd_check = next(
         item for item in payload["checks"] if item["id"] == "adapter.systemd.contract"
     )
@@ -608,6 +609,139 @@ def test_static_verifier_accepts_complete_vm_target_root(tmp_path, capsys):
         "target.unit.minecraft-sunlit-cobblemon",
         "target.platform_controls",
     }
+
+
+def test_live_verifier_checks_bytes_from_target_interpreter_against_source_mirror(tmp_path, monkeypatch):
+    import hashlib
+    source = tmp_path / "src/game_control"
+    shutil.copytree(ROOT / "src/game_control", source)
+    modules = VERIFY._source_python_modules()
+    assert len(modules) > 50
+    expected_map = {}
+    for name in modules:
+        relative = name.removeprefix("game_control").lstrip(".").replace(".", "/")
+        path = source / (relative + ".py" if relative else "__init__.py")
+        if not path.is_file() and relative:
+            path = source / relative / "__init__.py"
+        expected_map[name] = hashlib.sha256(path.read_bytes()).hexdigest()
+    interpreter = tmp_path / "python"
+    interpreter.write_text(
+        "#!/bin/sh\nprintf '%s\\n' '" + json.dumps(expected_map, separators=(",", ":")) + "'\n",
+        encoding="utf-8",
+    )
+    interpreter.chmod(0o755)
+    monkeypatch.setattr(VERIFY, "TARGET_ROOT", Path("/"))
+    monkeypatch.setattr(VERIFY, "WEB_SOURCE", source)
+    monkeypatch.setattr(VERIFY, "DEPLOYED_PYTHON", interpreter)
+    checks = VERIFY.Checks()
+    VERIFY._check_installed_package_mirror(checks)
+    assert next(item for item in checks.items if item["id"] == "package.installed_mirror")["ok"]
+
+    module = source / "deployment_verify.py"
+    original = module.read_bytes()
+    module.write_bytes(original + b"\n# deliberate acceptance mismatch\n")
+    checks = VERIFY.Checks()
+    VERIFY._check_installed_package_mirror(checks)
+    check = next(item for item in checks.items if item["id"] == "package.installed_mirror")
+    assert check["ok"] is False
+    assert check["reason"] == "installed_source_mismatch"
+
+
+def test_installed_mirror_fails_closed_for_empty_manifest_inventory(monkeypatch):
+    monkeypatch.setattr(VERIFY, "TARGET_ROOT", Path("/"))
+    monkeypatch.setattr(VERIFY, "_source_python_modules", lambda: ())
+    checks = VERIFY.Checks()
+    VERIFY._check_installed_package_mirror(checks)
+    check = next(item for item in checks.items if item["id"] == "package.installed_mirror")
+    assert check["ok"] is False
+    assert check["reason"] == "manifest_module_inventory_empty"
+
+
+def test_public_origin_reader_rejects_symlink_and_oversized_file(tmp_path, monkeypatch):
+    target = tmp_path / "origin"
+    target.write_text("HORIZON_PUBLIC_ORIGIN=https://games.example.test\n", encoding="ascii")
+    target.chmod(0o600)
+    monkeypatch.setattr(VERIFY, "PUBLIC_ORIGIN_CONFIG", target)
+    assert VERIFY._public_origin() == "https://games.example.test"
+    target.unlink()
+    target.symlink_to(tmp_path / "elsewhere")
+    (tmp_path / "elsewhere").write_text("HORIZON_PUBLIC_ORIGIN=https://games.example.test\n", encoding="ascii")
+    assert VERIFY._public_origin() is None
+    target.unlink()
+    target.write_bytes(b"HORIZON_PUBLIC_ORIGIN=https://games.example.test\n" + b"x" * 4097)
+    target.chmod(0o600)
+    assert VERIFY._public_origin() is None
+
+
+def test_http_acceptance_policy_does_not_follow_redirects():
+    assert VERIFY._NoRedirect().redirect_request(None, None, 302, "redirect", {}, "https://elsewhere.invalid") is None
+
+
+def test_authenticated_probe_rejects_oversized_bootstrap_response(tmp_path, monkeypatch):
+    origin = tmp_path / "origin"
+    origin.write_text("HORIZON_PUBLIC_ORIGIN=https://games.example.test\n", encoding="ascii")
+    origin.chmod(0o600)
+    credential = tmp_path / "token"
+    credential.write_text("synthetic\n", encoding="ascii")
+    monkeypatch.setattr(VERIFY, "PUBLIC_ORIGIN_CONFIG", origin)
+    monkeypatch.setattr(VERIFY, "PROXY_CREDENTIAL", credential)
+
+    class Response:
+        status = 200
+        headers = {}
+        def read(self, _limit=-1):
+            return b"{}" + b"x" * 65536
+        def __enter__(self):
+            return self
+        def __exit__(self, *_args):
+            return False
+
+    monkeypatch.setattr(VERIFY, "_open_http", lambda request, timeout: Response())
+    checks = VERIFY.Checks()
+    VERIFY._check_authenticated_origin_probe(checks)
+    assert next(item for item in checks.items if item["id"] == "web.authenticated_origin_probe")["ok"] is False
+
+
+def test_authenticated_origin_probe_is_explicit_and_never_sends_valid_lifecycle_body(tmp_path, monkeypatch):
+    origin_file = tmp_path / "public-origin.conf"
+    origin_file.write_text("HORIZON_PUBLIC_ORIGIN=https://games.example.test\n", encoding="ascii")
+    origin_file.chmod(0o600)
+    credential = tmp_path / "proxy-token"
+    credential.write_text("synthetic-proxy-token\n", encoding="ascii")
+    monkeypatch.setattr(VERIFY, "PUBLIC_ORIGIN_CONFIG", origin_file)
+    monkeypatch.setattr(VERIFY, "PROXY_CREDENTIAL", credential)
+    monkeypatch.setattr(VERIFY, "AUTH_API_BASE_URL", "https://private.example.test")
+
+    class Response:
+        def __init__(self, status, payload=b"{}", headers=None):
+            self.status = status
+            self.payload = payload
+            self.headers = headers or {}
+        def read(self, _limit=-1):
+            return self.payload
+        def __enter__(self):
+            return self
+        def __exit__(self, *_args):
+            return False
+
+    calls = []
+    responses = iter((
+        Response(200, b'{"csrf_token":"synthetic-csrf"}', {"Set-Cookie": "game_control_session=synthetic; Path=/"}),
+        Response(422),
+        Response(403),
+        Response(401, headers={"Set-Cookie": "game_control_session=; Max-Age=0"}),
+        Response(200, b'{"csrf_token":"fresh-csrf"}', {"Set-Cookie": "game_control_session=fresh; Path=/"}),
+    ))
+    def urlopen(request, timeout):
+        calls.append((request.full_url, request.get_method(), request.data, dict(request.headers)))
+        return next(responses)
+    monkeypatch.setattr(VERIFY, "_open_http", urlopen)
+    checks = VERIFY.Checks()
+    VERIFY._check_authenticated_origin_probe(checks)
+    assert next(item for item in checks.items if item["id"] == "web.authenticated_origin_probe")["ok"]
+    mutation_calls = calls[1:3]
+    assert all(call[2] == b'{"unexpected_acceptance_field":true}' for call in mutation_calls)
+    assert all("/start" in call[0] for call in mutation_calls)
 
 
 def test_static_verifier_accepts_root_controlled_private_deployment_overlay(tmp_path, capsys):

@@ -338,3 +338,9 @@ def test_systemd_timer_and_installer_are_wired() -> None:
         assert name in installed_names
     assert "horizon-sunlit-manifest" not in installed_names
     assert "horizon-sunlit-stage" not in installed_names
+
+
+def test_installed_updater_uses_deployed_venv_interpreter() -> None:
+    helper = (ROOT / "ops/bin/horizon-sunlit-auto-update").read_text(encoding="utf-8")
+    assert helper.splitlines()[0] == "#!/opt/game-control/.venv/bin/python"
+    assert "from game_control.sunlit_update import main" in helper

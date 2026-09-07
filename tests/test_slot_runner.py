@@ -36,6 +36,39 @@ def test_slot_acquire_retries_a_transient_inspector_lock(monkeypatch):
     assert calls == 3
 
 
+def test_inaccessible_optional_jvm_config_logs_sanitized_preflight_error(monkeypatch, capsys):
+    runner = runpy.run_path(str(RUNNER), run_name="game-slot-run")
+    original_lstat = runner["Path"].lstat
+
+    def denied(path):
+        if str(path) == "/etc/game-control/jvm/minecraft-sunlit-cobblemon.active.args":
+            raise PermissionError("private deployment detail")
+        return original_lstat(path)
+
+    monkeypatch.setattr(runner["Path"], "lstat", denied)
+    with pytest.raises(ValueError, match="managed JVM configuration unavailable"):
+        runner["_managed_jvm_layer"]("minecraft-sunlit-cobblemon", ["/usr/bin/java"])
+    assert "private deployment detail" not in capsys.readouterr().err
+
+
+def test_main_reports_sanitized_managed_jvm_preflight_failure(monkeypatch, capsys):
+    runner = runpy.run_path(str(RUNNER), run_name="game-slot-run")
+    globals_ = runner["main"].__globals__
+    monkeypatch.setitem(globals_, "_config", lambda _profile: {"argv": ["/usr/bin/java"], "cwd": "/tmp"})
+    monkeypatch.setitem(globals_, "_sunlit_runtime_contract", lambda _profile, _config: None)
+    monkeypatch.setitem(
+        globals_,
+        "_managed_jvm_layer",
+        lambda _profile, _command: (_ for _ in ()).throw(
+            globals_["ManagedJvmConfigurationError"]("private deployment detail")
+        ),
+    )
+    assert runner["main"](["minecraft-sunlit-cobblemon"]) == 2
+    diagnostic = capsys.readouterr().err
+    assert "launch preflight failed: managed_jvm_configuration_unavailable" in diagnostic
+    assert "private deployment detail" not in diagnostic
+
+
 @pytest.fixture
 def runner_env(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     run_dir = tmp_path / "run"

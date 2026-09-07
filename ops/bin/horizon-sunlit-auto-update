@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+#!/opt/game-control/.venv/bin/python
 """Fixed compatibility front door for the package Sunlit update policy."""
 
 from __future__ import annotations

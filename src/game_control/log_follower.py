@@ -84,6 +84,8 @@ class LogFollower:
         self._read_offset = 0
         self._loaded = False
         self._start_at_end = bool(start_at_end)
+        self._save_lock = asyncio.Lock()
+        self._follow_lock = asyncio.Lock()
 
     def _load(self) -> None:
         if self._loaded:
@@ -196,6 +198,32 @@ class LogFollower:
         else:
             os.close(parent_fd)
 
+    async def _save_async(self) -> None:
+        """Persist a cursor off-loop, draining cancellation before release."""
+        async with self._save_lock:
+            save_task = asyncio.create_task(asyncio.to_thread(self._save))
+            cancelled = False
+            try:
+                await asyncio.shield(save_task)
+            except asyncio.CancelledError:
+                cancelled = True
+                # A second cancellation must not release the save lock while
+                # the worker still owns the filesystem operation.
+                while not save_task.done():
+                    try:
+                        await asyncio.shield(save_task)
+                    except asyncio.CancelledError:
+                        cancelled = True
+            if cancelled:
+                # Retrieve the worker result before propagating the caller's
+                # cancellation, preserving normal save failures otherwise.
+                try:
+                    save_task.result()
+                except BaseException:
+                    pass
+                raise asyncio.CancelledError
+            save_task.result()
+
     def _open_safe(self) -> tuple[int, tuple[int, int], int]:
         try:
             before = self.path.lstat()
@@ -240,6 +268,10 @@ class LogFollower:
         raise RuntimeError("follow() cannot run inside an event loop; use follow_async()")
 
     async def follow_async(self, callback: Callback | None = None) -> tuple[LogEvent, ...]:
+        async with self._follow_lock:
+            return await self._follow_async(callback)
+
+    async def _follow_async(self, callback: Callback | None = None) -> tuple[LogEvent, ...]:
         self._load()
         fd, epoch, size = self._open_safe()
         events: list[LogEvent] = []
@@ -252,7 +284,7 @@ class LogFollower:
                 if self._start_at_end:
                     self._offset = self._read_offset = size
                     self._partial = b""
-                    self._save()
+                    await self._save_async()
                     return tuple(events)
                 self._offset, self._read_offset, self._partial = 0, 0, b""
             elif self._epoch != epoch:
@@ -264,7 +296,7 @@ class LogFollower:
                 await self._deliver(callback, marker)
                 events.append(marker)
                 self._epoch, self._offset, self._read_offset, self._partial = epoch, 0, 0, b""
-                self._save()
+                await self._save_async()
             if self._offset > size:
                 raise LogFollowerError("checkpoint offset exceeds file size")
             data = os.pread(fd, self.max_read_bytes, self._read_offset)
@@ -309,10 +341,10 @@ class LogFollower:
                 await self._deliver(callback, event)
                 events.append(event)
                 self._offset, self._partial = end, b""
-                self._save()
+                await self._save_async()
                 cursor = newline + 1
             return tuple(events)
-        except Exception:
+        except BaseException:
             # Never let an in-memory partial or read cursor skip a line after
             # a failed callback or malformed record.  Successful lines have
             # already advanced the durable offset one at a time.

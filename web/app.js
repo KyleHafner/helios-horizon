@@ -64,7 +64,16 @@ const state = {
 };
 let aggregateBackupRequest = 0;
 let reauthenticating = false;
+let sessionRefreshPromise = null;
+let sessionExpired = false;
+let sessionNoticeShown = false;
+let sessionExpiryCount = 0;
+let sessionGeneration = 0;
+let testApiResponseDelay = 0;
+const SESSION_EXPIRED_MESSAGE = "Session expired. Redirecting to sign in.";
+const SESSION_REDIRECT_KEY = "horizon-session-redirected";
 const stream = { source: null, lastEventAt: 0, lastEventId: null, retryMs: 3000, watchdog: null, pollTimer: null, reconnectTimer: null, reconnectStartedAt: null, suspended: false };
+let reconnectJitter = () => Math.random() * 1000;
 const MAX_STREAM_CURSOR = 9007199254740991n;
 const canonicalStreamCursor = (raw) => {
   if (typeof raw !== "string" || raw.length === 0 || raw.length > 16 || !/^(0|[1-9][0-9]*)$/.test(raw)) return null;
@@ -246,10 +255,47 @@ function setupShell() {
 }
 
 function notify(message) {
+  if (message === SESSION_EXPIRED_MESSAGE && sessionNoticeShown) return;
+  if (message === SESSION_EXPIRED_MESSAGE) sessionNoticeShown = true;
   announcer.textContent = message;
   const toast = byId("toast-region");
   toast.textContent = message;
   window.setTimeout(() => { if (toast.textContent === message) toast.textContent = ""; }, 5000);
+}
+
+function expireSession() {
+  if (sessionExpired) return;
+  sessionExpired = true;
+  sessionExpiryCount += 1;
+  reauthenticating = true;
+  suspendStream();
+  notify(SESSION_EXPIRED_MESSAGE);
+  let redirected = false;
+  try { redirected = sessionStorage.getItem(SESSION_REDIRECT_KEY) === "1"; sessionStorage.setItem(SESSION_REDIRECT_KEY, "1"); } catch {}
+  if (!redirected && !window.__HORIZON_TEST__?.preventNavigation) window.setTimeout(() => window.location.assign("/"), 0);
+}
+
+function refreshSession() {
+  if (sessionExpired) return Promise.reject(new Error(SESSION_EXPIRED_MESSAGE));
+  if (sessionRefreshPromise) return sessionRefreshPromise;
+  sessionRefreshPromise = fetch("/api/v1/session", {
+    credentials: "same-origin",
+    headers: { Accept: "application/json" },
+    redirect: "manual",
+  }).then(async (session) => {
+    if (session.type === "opaqueredirect" || session.status === 401) {
+      expireSession();
+      throw new Error(SESSION_EXPIRED_MESSAGE);
+    }
+    if (!session.ok) throw new Error("Session refresh failed.");
+    const body = await session.json();
+    state.csrf = body.csrf_token || state.csrf;
+    sessionGeneration += 1;
+    try { sessionStorage.removeItem(SESSION_REDIRECT_KEY); } catch {}
+    reauthenticating = false;
+    return body;
+  }).finally(() => { sessionRefreshPromise = null; });
+  return sessionRefreshPromise;
 }
 
 function stateClass(value) {
@@ -714,6 +760,8 @@ function applyStatus(snapshot, { confirmed = false } = {}) {
 }
 
 async function api(path, options = {}) {
+  if (sessionExpired) throw new Error(SESSION_EXPIRED_MESSAGE);
+  const requestSessionGeneration = sessionGeneration;
   const method = String(options.method || "GET").toUpperCase();
   const mutation = method !== "GET" && method !== "HEAD" && method !== "OPTIONS";
   let operationKey = options.idempotencyKey || null;
@@ -741,6 +789,10 @@ async function api(path, options = {}) {
   let response;
   try {
     response = await attempt();
+    if (testApiResponseDelay > 0) {
+      testApiResponseDelay -= 1;
+      await new Promise((resolve) => setTimeout(resolve, 100));
+    }
   } catch {
     if (!options.method || options.method === "GET") {
       await new Promise((resolve) => setTimeout(resolve, 1500));
@@ -755,11 +807,8 @@ async function api(path, options = {}) {
     }
   }
   if (response.type === "opaqueredirect") {
-    if (!reauthenticating) {
-      reauthenticating = true;
-      window.location.assign("/");
-    }
-    throw new Error("Session expired. Redirecting to sign in.");
+    expireSession();
+    throw new Error(SESSION_EXPIRED_MESSAGE);
   }
   let csrfFailure = false;
   if (response.status === 403) {
@@ -770,19 +819,32 @@ async function api(path, options = {}) {
     } catch {}
   }
   if ((response.status === 401 || csrfFailure) && !options._retried && path !== "/api/v1/session") {
+    if (sessionGeneration !== requestSessionGeneration) {
+      return api(path, { ...options, _retried: true });
+    }
     try {
-      const session = await fetch("/api/v1/session", { credentials: "same-origin", headers: { Accept: "application/json" }, redirect: "manual" });
-      if (session.ok) {
-        const body = await session.json();
-        state.csrf = body.csrf_token || state.csrf;
-        reauthenticating = false;
-        return api(path, { ...options, _retried: true });
-      }
-    } catch {}
+      await refreshSession();
+      return api(path, { ...options, _retried: true });
+    } catch (error) {
+      if (sessionExpired) throw new Error(SESSION_EXPIRED_MESSAGE);
+      throw error;
+    }
+  }
+  if (response.status === 401 && path === "/api/v1/session") {
+    expireSession();
+    throw new Error(SESSION_EXPIRED_MESSAGE);
+  }
+  if (response.status === 401) {
+    expireSession();
+    throw new Error(SESSION_EXPIRED_MESSAGE);
   }
   if (!response.ok) {
     let detail = "Request failed.";
-    try { detail = (await response.json())?.error?.message || detail; } catch {}
+    try {
+      const body = await response.json();
+      const typed = body?.error?.message || body?.detail;
+      if (typeof typed === "string" && typed.trim()) detail = typed.slice(0, 300);
+    } catch {}
     // A typed HTTP response is definitive. Only transport failures retain
     // the sessionStorage key for reconciliation/replay.
     if (mutation && operationStorageKey) {
@@ -802,6 +864,8 @@ async function load() {
     const session = await api("/api/v1/session");
     state.actor = session.actor;
     state.csrf = session.csrf_token || null;
+    sessionGeneration += 1;
+    try { sessionStorage.removeItem(SESSION_REDIRECT_KEY); } catch {}
     byId("session-note").textContent = state.actor ? `Signed in as ${state.actor}` : "Signed-in operator";
     const [profileList, status] = await Promise.all([api("/api/v1/profiles"), api("/api/v1/status")]);
     (Array.isArray(profileList) ? profileList : PROFILE_FALLBACK.map(([id, display_name, adapter]) => ({ id, display_name, adapter }))).forEach((profile) => {
@@ -1041,7 +1105,7 @@ async function loadActivity(kind) {
 }
 
 function connectStream() {
-  if (!pageVisible() || stream.suspended) return;
+  if (!pageVisible() || stream.suspended || sessionExpired) return;
   if (!window.EventSource) { startFallbackPolling(); return; }
   if (stream.source && stream.source.readyState !== window.EventSource.CLOSED) return;
   if (stream.source) { stream.source.close(); stream.source = null; }
@@ -1092,15 +1156,21 @@ function scheduleReconnect() {
     stream.reconnectStartedAt = performance.now();
     markPerformance("horizon-sse-reconnect-start");
   }
-  const delay = stream.retryMs + Math.random() * 1000;
+  const delay = stream.retryMs + reconnectJitter();
   stream.retryMs = Math.min(stream.retryMs * 2, 60000);
   stream.reconnectTimer = window.setTimeout(async () => {
     stream.reconnectTimer = null;
     if (!pageVisible() || stream.suspended) return;
     try {
-      const session = await api("/api/v1/session");
-      state.csrf = session.csrf_token || state.csrf;
-    } catch {}
+      await refreshSession();
+    } catch {
+      if (!sessionExpired) {
+        setConnState("reconnecting");
+        scheduleReconnect();
+      }
+      return;
+    }
+    if (sessionExpired) return;
     connectStream();
   }, delay);
 }
@@ -1130,7 +1200,7 @@ function suspendStream() {
 }
 
 async function resumeStream() {
-  if (!pageVisible()) return;
+  if (!pageVisible() || sessionExpired) return;
   const wasSuspended = stream.suspended;
   stream.suspended = false;
   if (!wasSuspended && stream.source && stream.source.readyState !== window.EventSource?.CLOSED) return;
@@ -2903,10 +2973,19 @@ document.addEventListener("visibilitychange", () => {
   resumeStream();
 });
 window.addEventListener("online", () => {
-  if (!pageVisible()) return;
+  if (!pageVisible() || sessionExpired) return;
   if (stream.suspended) resumeStream(); else connectStream();
 });
 window.__horizonOpenLogs = openLogs;
+if (window.__HORIZON_TEST__) {
+  window.__horizonTest = {
+    api,
+    scheduleReconnect,
+    sessionState: () => ({ expired: sessionExpired, refreshing: Boolean(sessionRefreshPromise), noticeShown: sessionNoticeShown, expiryCount: sessionExpiryCount, generation: sessionGeneration }),
+    setReconnectTestTiming: (delay, jitter = () => 0) => { stream.retryMs = delay; reconnectJitter = jitter; },
+    delayNextApiResponse: () => { testApiResponseDelay += 1; },
+  };
+}
 window.addEventListener("hashchange", route);
 setupShell();
 setupSessionDeck();

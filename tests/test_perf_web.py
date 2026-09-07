@@ -56,6 +56,36 @@ def test_phase_zero_web_client_uses_visibility_gated_incremental_paths():
     assert "resolution=${encodeURIComponent(resolution)}&limit=720" in app
 
 
+def test_session_expiry_is_single_flight_and_stops_reconnect_without_misclassifying_403():
+    app = (Path(__file__).resolve().parents[1] / "web" / "app.js").read_text()
+
+    assert "let sessionRefreshPromise = null;" in app
+    assert "if (sessionRefreshPromise) return sessionRefreshPromise;" in app
+    assert "const SESSION_EXPIRED_MESSAGE = \"Session expired. Redirecting to sign in.\";" in app
+    assert "let sessionNoticeShown = false;" in app
+    assert "if (message === SESSION_EXPIRED_MESSAGE && sessionNoticeShown) return;" in app
+    assert "function expireSession()" in app
+    assert "if (sessionExpired) return;" in app
+    assert "if (sessionExpired) throw new Error(SESSION_EXPIRED_MESSAGE);" in app
+    assert "suspendStream();" in app
+    assert "window.setTimeout(() => window.location.assign(\"/\"), 0);" in app
+    assert "if (response.status === 401 && path === \"/api/v1/session\")" in app
+    assert "if (response.status === 401) {\n    expireSession();" in app
+    assert "if (sessionExpired) return;\n    connectStream();" in app
+    assert "if (!sessionExpired) {\n        setConnState(\"reconnecting\");\n        scheduleReconnect();\n      }" in app
+
+    # A normal typed 403 is still handled by the response error path; only
+    # CSRF-specific 403s enter the shared refresh flow.
+    csrf_gate = app.index("if (response.status === 403)")
+    refresh_gate = app.index("if ((response.status === 401 || csrfFailure)")
+    assert csrf_gate < refresh_gate
+    assert "csrfFailure = String(detail).toLowerCase().includes(\"csrf validation failed\")" in app
+    assert "const typed = body?.error?.message || body?.detail;" in app
+    assert "if (typeof typed === \"string\" && typed.trim()) detail = typed.slice(0, 300);" in app
+    assert "if (!pageVisible() || stream.suspended || sessionExpired) return;" in app
+    assert "if (!pageVisible() || sessionExpired) return;" in app
+
+
 def test_watch_resync_is_authoritative_and_duplicate_safe():
     source = (Path(__file__).resolve().parents[1] / "src/game_control/web_main.py").read_text()
     assert 'if kind == "full_resync":' in source

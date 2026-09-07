@@ -39,6 +39,7 @@ def page(web_server):
             viewport={"width": 1280, "height": 900},
             extra_http_headers={"X-Forwarded-User": "operator@example.test"},
         )
+        context.add_init_script("window.__HORIZON_TEST__ = { preventNavigation: true }")
         page = context.new_page()
         status = {
             "generation": 1,
@@ -227,7 +228,8 @@ def page(web_server):
         page.wait_for_selector('[data-profile-id="minecraft"]', timeout=5000)
         page._dashboard_fixture = latest  # type: ignore[attr-defined]
         yield page
-        assert console_errors == []
+        if not getattr(page, "_allow_expected_http_errors", False):
+            assert console_errors == []
         assert page_errors == []
         context.close()
         browser.close()
@@ -1643,3 +1645,199 @@ def test_malformed_and_unknown_server_hashes_fall_back_to_dashboard(page: Page):
     page.goto(f"{page.url}#/servers/not-a-profile/console")
     page.wait_for_selector("#dashboard-view:not([hidden])")
     assert page.get_by_role("heading", name="Dashboard").is_visible()
+
+
+def test_session_refresh_is_single_flight_and_preserves_mutation_key(page: Page):
+    page._allow_expected_http_errors = True  # type: ignore[attr-defined]
+    counts = {"session": 0, "status": 0, "mutation": 0}
+
+    def session(route):
+        counts["session"] += 1
+        route.fulfill(json={"actor": "operator@example.test", "csrf_token": "refreshed-token", "expires_at": None})
+
+    def status(route):
+        counts["status"] += 1
+        if counts["status"] <= 5:
+            route.fulfill(status=401, json={"error": {"message": "session changed"}})
+        else:
+            route.fulfill(json=page._dashboard_fixture["status"])  # type: ignore[attr-defined]
+
+    mutation_keys = []
+
+    def mutation(route):
+        counts["mutation"] += 1
+        mutation_keys.append(route.request.headers.get("idempotency-key"))
+        if counts["mutation"] == 1:
+            route.fulfill(status=401, json={"error": {"message": "session changed"}})
+        else:
+            route.fulfill(json={"job_id": "job-refresh"})
+
+    page.route("**/api/v1/session", session)
+    page.route("**/api/v1/status", status)
+    page.route("**/api/v1/profiles/minecraft/start", mutation)
+    result = page.evaluate("""async () => {
+        const calls = await Promise.all(Array.from({length: 5}, () => window.__horizonTest.api('/api/v1/status')));
+        await window.__horizonTest.api('/api/v1/profiles/minecraft/start', {
+            method: 'POST', body: '{}'
+        });
+        return calls.length;
+    }""")
+    assert result == 5
+    assert counts["session"] == 2  # one shared refresh for the five reads, one for the mutation
+    assert counts["status"] == 10
+    assert counts["mutation"] == 2
+    assert mutation_keys[0] == mutation_keys[1]
+
+
+def test_typed_non_csrf_403_does_not_probe_or_expire_session(page: Page):
+    page._allow_expected_http_errors = True  # type: ignore[attr-defined]
+    session_probes = []
+
+    def session(route):
+        session_probes.append(route.request.url)
+        route.fulfill(json={"actor": "operator@example.test", "csrf_token": "test-token", "expires_at": None})
+
+    def forbidden(route):
+        route.fulfill(status=403, json={"error": {"message": "origin is not allowed"}})
+
+    page.route("**/api/v1/session", session)
+    page.route("**/api/v1/status", forbidden)
+    result = page.evaluate("""async () => {
+        try { await window.__horizonTest.api('/api/v1/status'); return 'unexpected-success'; }
+        catch (error) { return error.message; }
+    }""")
+    assert result == "origin is not allowed"
+    assert session_probes == []
+    assert page.evaluate("window.__horizonTest.sessionState()") == {
+        "expired": False, "refreshing": False, "noticeShown": False, "expiryCount": 0, "generation": 1
+    }
+
+
+def test_concurrent_opaque_redirects_have_one_expiry_transition(page: Page):
+    page._allow_expected_http_errors = True  # type: ignore[attr-defined]
+    redirects = 0
+
+    def redirect(route):
+        nonlocal redirects
+        redirects += 1
+        route.fulfill(status=302, headers={"Location": "/"})
+
+    page.route("**/api/v1/status", redirect)
+    result = page.evaluate("""async () => {
+        const calls = await Promise.allSettled(Array.from({length: 5}, () =>
+            window.__horizonTest.api('/api/v1/status')));
+        return calls.map(item => item.status);
+    }""")
+    assert result == ["rejected"] * 5
+    assert redirects == 5
+    assert page.evaluate("window.__horizonTest.sessionState()") == {
+        "expired": True, "refreshing": False, "noticeShown": True, "expiryCount": 1, "generation": 1
+    }
+
+
+def test_transient_session_refresh_failure_schedules_next_reconnect(page: Page):
+    page._allow_expected_http_errors = True  # type: ignore[attr-defined]
+    probes = 0
+
+    def session(route):
+        nonlocal probes
+        probes += 1
+        if probes == 1:
+            route.fulfill(status=503, json={"detail": "temporarily unavailable"})
+        else:
+            route.fulfill(json={"actor": "operator@example.test", "csrf_token": "test-token", "expires_at": None})
+
+    page.route("**/api/v1/session", session)
+    page.evaluate("window.__horizonTest.setReconnectTestTiming(1)")
+    page.evaluate("window.__horizonTest.scheduleReconnect()")
+    page.wait_for_timeout(200)
+    assert probes >= 2
+
+
+def test_late_old_generation_401_retries_without_second_session_refresh(page: Page):
+    page._allow_expected_http_errors = True  # type: ignore[attr-defined]
+    session_probes = 0
+    status_calls = 0
+
+    def session(route):
+        nonlocal session_probes
+        session_probes += 1
+        route.fulfill(json={"actor": "operator@example.test", "csrf_token": "new-token", "expires_at": None})
+    def gated_status(route):
+        nonlocal status_calls
+        status_calls += 1
+        if status_calls <= 2:
+            route.fulfill(status=401, json={"error": {"message": "refresh me"}})
+        else:
+            route.fulfill(json=page._dashboard_fixture["status"])  # type: ignore[attr-defined]
+
+    page.route("**/api/v1/session", session)
+    page.route("**/api/v1/status", gated_status)
+    page.evaluate("window.__horizonTest.delayNextApiResponse()")
+    result = page.evaluate("""async () => Promise.allSettled([
+        window.__horizonTest.api('/api/v1/status'),
+        window.__horizonTest.api('/api/v1/status'),
+    ]).then(items => items.map(item => item.status))""")
+    assert result == ["fulfilled", "fulfilled"]
+    assert session_probes == 1
+    assert status_calls >= 4
+
+
+def test_terminal_401_after_refresh_retries_once_then_expires(page: Page):
+    page._allow_expected_http_errors = True  # type: ignore[attr-defined]
+    session_probes = 0
+    status_calls = 0
+
+    def session(route):
+        nonlocal session_probes
+        session_probes += 1
+        route.fulfill(json={"actor": "operator@example.test", "csrf_token": "new-token", "expires_at": None})
+
+    def status(route):
+        nonlocal status_calls
+        status_calls += 1
+        route.fulfill(status=401, json={"error": {"message": "still unauthorized"}})
+
+    page.route("**/api/v1/session", session)
+    page.route("**/api/v1/status", status)
+    result = page.evaluate("""async () => {
+        try { await window.__horizonTest.api('/api/v1/status'); return 'unexpected-success'; }
+        catch (error) { return error.message; }
+    }""")
+    assert result == "Session expired. Redirecting to sign in."
+    assert status_calls == 2
+    assert session_probes == 1
+    assert page.evaluate("window.__horizonTest.sessionState()")['expiryCount'] == 1
+
+
+def test_api_401_with_transient_session_failure_does_not_expire_and_recovers(page: Page):
+    page._allow_expected_http_errors = True  # type: ignore[attr-defined]
+    session_probes = 0
+    status_calls = 0
+
+    def session(route):
+        nonlocal session_probes
+        session_probes += 1
+        if session_probes == 1:
+            route.fulfill(status=503, json={"detail": "temporarily unavailable"})
+        else:
+            route.fulfill(json={"actor": "operator@example.test", "csrf_token": "recovered-token", "expires_at": None})
+
+    def status(route):
+        nonlocal status_calls
+        status_calls += 1
+        if status_calls == 1:
+            route.fulfill(status=401, json={"error": {"message": "stale token"}})
+        else:
+            route.fulfill(json=page._dashboard_fixture["status"])  # type: ignore[attr-defined]
+
+    page.route("**/api/v1/session", session)
+    page.route("**/api/v1/status", status)
+    first = page.evaluate("""async () => {
+        try { await window.__horizonTest.api('/api/v1/status'); return 'unexpected-success'; }
+        catch (error) { return error.message; }
+    }""")
+    assert first == "Session refresh failed."
+    assert page.evaluate("window.__horizonTest.sessionState()")['expired'] is False
+    assert page.evaluate("window.__horizonTest.api('/api/v1/status').then(() => true)") is True
+    assert session_probes == 1

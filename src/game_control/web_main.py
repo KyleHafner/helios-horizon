@@ -39,6 +39,7 @@ from .auth import (
     set_session_cookie,
     validate_origin,
 )
+from .origin_config import load_public_origin
 from .protocol import (
     CheckUpdate,
     GetPerf,
@@ -64,7 +65,6 @@ from .redaction import Redactor
 
 CONTROL_SOCKET = Path("/run/game-control/control.sock")
 PRODUCTION_WEB_ROOT = Path("/opt/game-control/web")
-PUBLIC_ORIGIN = os.environ.get("HORIZON_PUBLIC_ORIGIN", "https://games.example.com")
 _READ_ACTIONS = (
     GetStatus,
     GetPerf,
@@ -494,7 +494,7 @@ def create_app(
     origins = (
         frozenset(allowed_origins)
         if allowed_origins is not None
-        else frozenset({PUBLIC_ORIGIN})
+        else frozenset({load_public_origin()})
     )
     async def publish_status_loop() -> None:
         last_snapshot: dict[str, Any] | None = None
@@ -671,7 +671,16 @@ def create_app(
                 raise HTTPException(403, "origin validation failed")
         else:
             if not sessions.validate_session(session, actor=actor):
-                raise HTTPException(401, "session required")
+                # A trusted proxy identity with an expired/revoked browser
+                # cookie must be able to bootstrap a fresh session.  Expire
+                # only this exact cookie; mutation failures never take this
+                # recovery path and remain fail-closed.
+                response.delete_cookie(SESSION_COOKIE, path="/")
+                raise HTTPException(
+                    401,
+                    "session required",
+                    headers={"set-cookie": response.headers["set-cookie"]},
+                )
             # StreamingResponse does not preserve injected Response headers, so
             # cookie refresh on SSE is ineffective and needlessly writes SQLite.
             if request.url.path != "/api/v1/stream" and sessions.touch(session):

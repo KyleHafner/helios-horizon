@@ -526,6 +526,38 @@ async def test_cached_snapshot_does_not_resample_the_status_pipeline():
 
 
 @pytest.mark.asyncio
+async def test_cached_snapshot_projects_starting_job_without_probe_or_fake_players():
+    entered = asyncio.Event()
+    release = asyncio.Event()
+    jobs = {"minecraft": None}
+
+    class Adapter:
+        async def observe(self, _profile):
+            entered.set()
+            await release.wait()
+            return SimpleNamespace(running=False, healthy=None, players_online=None)
+
+    profile = SimpleNamespace(id="minecraft")
+    service = StatusService([profile], adapter=Adapter(), active_jobs=jobs)
+    initial = await service.cached_snapshot()
+    jobs["minecraft"] = "start"
+
+    slow_refresh = asyncio.create_task(service.snapshot(force=True))
+    await entered.wait()
+    responsive = await asyncio.wait_for(service.cached_snapshot(), timeout=0.2)
+
+    status = responsive.profiles[0]
+    assert status.state is ObservedState.STARTING
+    assert status.active_job_id == "start"
+    assert status.health.value == "unknown"
+    assert status.players_online is None
+    assert initial.profiles[0].state is ObservedState.STOPPED
+
+    release.set()
+    await slow_refresh
+
+
+@pytest.mark.asyncio
 async def test_benchmark_eligibility_forces_fresh_projection_instead_of_cached_stopped_status(tmp_path):
     observed = {"running": False}
     calls = 0

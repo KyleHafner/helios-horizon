@@ -141,6 +141,40 @@ async def test_get_status_uses_cached_projection_unless_refresh_requested(tmp_pa
     assert status.refresh_calls == 1
 
 
+@pytest.mark.asyncio
+async def test_get_status_cached_read_stays_responsive_during_slow_start_refresh(tmp_path):
+    refresh_entered = asyncio.Event()
+    refresh_release = asyncio.Event()
+
+    class Status:
+        async def cached_snapshot(self, *_args):
+            return {"state": "starting", "health": "unknown", "players_online": None}
+
+        async def snapshot(self, *_args):
+            refresh_entered.set()
+            await refresh_release.wait()
+            return {"state": "running", "health": "healthy", "players_online": 0}
+
+    controller = Controller.for_testing(tmp_path)
+    controller.services = SimpleNamespace(status=Status())
+    refresh = asyncio.create_task(controller.execute(RpcRequest(
+        request_id=uuid4(), actor="status-publisher",
+        action=GetStatus(kind="get_status", refresh=True),
+    )))
+    await refresh_entered.wait()
+
+    response = await asyncio.wait_for(controller.execute(RpcRequest(
+        request_id=uuid4(), actor="operator",
+        action=GetStatus(kind="get_status"),
+    )), timeout=0.2)
+    assert response.ok
+    assert response.result["state"] == "starting"
+    assert response.result["players_online"] is None
+
+    refresh_release.set()
+    await refresh
+
+
 class _MemoryLock:
     def __enter__(self):
         return self

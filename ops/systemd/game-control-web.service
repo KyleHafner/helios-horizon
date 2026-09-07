@@ -10,6 +10,7 @@ User=gamecontrol
 Group=gamecontrol
 WorkingDirectory=/opt/game-control
 Environment=HorizonWebHost=192.0.2.10
+EnvironmentFile=/etc/game-control/public-origin.conf
 ExecStart=/opt/game-control/.venv/bin/uvicorn --factory game_control.web_main:create_app --host ${HorizonWebHost} --port 8444 --timeout-graceful-shutdown 5
 LoadCredential=proxy-token:/etc/game-control/secrets.d/proxy-token
 Restart=on-failure

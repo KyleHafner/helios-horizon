@@ -21,8 +21,8 @@ def test_manifest_is_typed_frozen_and_exactly_sized() -> None:
     assert isinstance(manifest, DeploymentManifest)
     assert len(manifest.files) == 48
     assert len(manifest.directories) == 50
-    assert len(manifest.runtime_sources) == 78
-    assert len(manifest.runtime_files_for()) == 130
+    assert len(manifest.runtime_sources) == 79
+    assert len(manifest.runtime_files_for()) == 131
     assert manifest.generated_entry_point.name == "horizon"
     assert manifest.generated_entry_point.target == "/opt/game-control/.venv/bin/horizon"
     assert manifest.generated_entry_point.module == "game_control.cli:main"
@@ -56,6 +56,15 @@ def test_wave5_libexec_projection_is_fixed_and_alias_free() -> None:
     }
     assert names == set(FIXED_LIBEXEC_NAMES)
     assert names.isdisjoint(ABSENT_LIBEXEC_NAMES)
+
+
+def test_jvm_directory_is_traversable_but_not_writable() -> None:
+    directory = next(
+        spec for spec in get_manifest().directories
+        if spec.target == "/etc/game-control/jvm"
+    )
+    assert directory.mode == 0o755
+    assert directory.owner == directory.group == "root"
 
 
 def test_generated_console_script_is_metadata_only_for_alternate_roots() -> None:

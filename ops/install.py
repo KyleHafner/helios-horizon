@@ -15,6 +15,7 @@ import subprocess
 import sys
 import tempfile
 from pathlib import Path
+from urllib.parse import urlsplit
 
 
 PACKAGE_ROOT = Path(__file__).resolve().parents[1]
@@ -52,6 +53,7 @@ RUNTIME_VERIFIER = PACKAGE_ROOT / "scripts/verify-deployed.py"
 RUNTIME_SUPPORT_FILES = tuple((PACKAGE_ROOT / spec.source, spec.source, spec.mode) for spec in _DEPLOYMENT_MANIFEST.runtime_support)
 RUNTIME_MANIFEST_PATH = _DEPLOYMENT_MANIFEST.runtime_manifest.target
 RUNTIME_MANIFEST_VERSION = _DEPLOYMENT_MANIFEST.runtime_manifest.version
+PUBLIC_ORIGIN_CONFIG = "/etc/game-control/public-origin.conf"
 GENERATED_ENTRY_POINT = _DEPLOYMENT_MANIFEST.generated_entry_point
 SUNLIT_LIBRARIES_LINK = _DEPLOYMENT_MANIFEST.symlinks[0].target
 SUNLIT_LIBRARIES_TARGET = _DEPLOYMENT_MANIFEST.symlinks[0].link_target
@@ -81,12 +83,14 @@ class Installer:
         *,
         skip_systemd_verify: bool = False,
         token_source: Path | None = None,
+        public_origin: str | None = None,
     ):
         self.root = root
         self.skip_systemd_verify = skip_systemd_verify
         # Kept only so older source-only callers fail closed without requiring
         # a coordinated test update. The VM package never reads this path.
         del token_source
+        self.public_origin = public_origin
 
     def target(self, path: str | Path) -> Path:
         value = Path(path)
@@ -511,6 +515,8 @@ class Installer:
                 if actual_digest != expected_digest:
                     problems.append(f"content drift {destination}")
         problems.extend(self._runtime_manifest_problems())
+        if self.root == Path("/") and not self._public_origin_valid():
+            problems.append("public origin config is absent or invalid")
         secret = self.target(FIXED_B2_SECRET_PATH)
         try:
             secret_stat = secret.lstat()
@@ -637,6 +643,59 @@ class Installer:
         self._chown(destination, "root", "root")
         os.chmod(destination, 0o600)
 
+    @staticmethod
+    def _valid_public_origin(value: str) -> bool:
+        if not value or value != value.strip() or any(ord(char) < 33 or char.isspace() for char in value):
+            return False
+        try:
+            parsed = urlsplit(value)
+            parsed.port
+        except (TypeError, ValueError):
+            return False
+        return bool(parsed.scheme == "https" and parsed.hostname and not parsed.username and not parsed.password and not parsed.path and not parsed.query and not parsed.fragment)
+
+    def _ensure_public_origin(self) -> None:
+        destination = self.target(PUBLIC_ORIGIN_CONFIG)
+        if self.public_origin is not None:
+            if not self._valid_public_origin(self.public_origin):
+                raise RuntimeError("public origin must be an explicit HTTPS origin")
+            self._ensure_directory_chain(destination.parent, "public origin parent")
+            fd, temporary = tempfile.mkstemp(prefix=f".{destination.name}.", dir=destination.parent)
+            temporary_path = Path(temporary)
+            try:
+                with os.fdopen(fd, "w", encoding="ascii") as stream:
+                    stream.write(f"HORIZON_PUBLIC_ORIGIN={self.public_origin}\n")
+                    stream.flush()
+                    os.fsync(stream.fileno())
+                os.chmod(temporary_path, 0o600)
+                self._chown(temporary_path, "root", "root")
+                os.replace(temporary_path, destination)
+            finally:
+                temporary_path.unlink(missing_ok=True)
+            return
+        if self.root != Path("/"):
+            return
+        if not self._public_origin_valid():
+            raise RuntimeError("public origin config is absent or not root-controlled and valid; pass --public-origin or install the private overlay")
+
+    def _public_origin_valid(self) -> bool:
+        destination = self.target(PUBLIC_ORIGIN_CONFIG)
+        fd = None
+        try:
+            fd = os.open(destination, os.O_RDONLY | os.O_NONBLOCK | getattr(os, "O_NOFOLLOW", 0))
+            info = os.fstat(fd)
+            if not (stat.S_ISREG(info.st_mode) and info.st_nlink == 1 and info.st_uid == 0 and stat.S_IMODE(info.st_mode) == 0o600 and info.st_size <= 4096):
+                return False
+            raw = os.read(fd, 4097).decode("ascii")
+        except (OSError, UnicodeError):
+            return False
+        finally:
+            if fd is not None:
+                os.close(fd)
+        lines = raw.splitlines()
+        origin = lines[0].partition("=")[2] if len(lines) == 1 and lines[0].startswith("HORIZON_PUBLIC_ORIGIN=") else ""
+        return self._valid_public_origin(origin)
+
     def _verify_generated_entry_point(self) -> None:
         """Verify pip created the declared console script in the live venv."""
         spec = GENERATED_ENTRY_POINT
@@ -730,6 +789,10 @@ class Installer:
     def apply(self) -> None:
         expected_files = self.expected_files()
         runtime_files = self.runtime_files()
+        if self.public_origin is not None and not self._valid_public_origin(self.public_origin):
+            raise RuntimeError("public origin must be an explicit HTTPS origin")
+        if self.root == Path("/") and self.public_origin is None and not self._public_origin_valid():
+            raise RuntimeError("public origin config is absent or invalid; pass --public-origin or install the private overlay")
         self._preflight_install(expected_files, runtime_files)
         self._accounts()
         for path, mode, user, group in self.directories():
@@ -738,6 +801,7 @@ class Installer:
         for destination in runtime_files:
             self._ensure_runtime_parent(destination.parent)
         self._ensure_generated_rcon_secret()
+        self._ensure_public_origin()
         for destination, target in self.expected_links().items():
             self._create_link(destination, target)
         for profile, user in (
@@ -799,11 +863,12 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--apply", action="store_true", help="apply the package atomically")
     parser.add_argument("--root", type=Path, default=None, help=argparse.SUPPRESS)
     parser.add_argument("--skip-systemd-verify", action="store_true", help=argparse.SUPPRESS)
+    parser.add_argument("--public-origin", help="write the root-controlled HTTPS browser origin overlay")
     args = parser.parse_args(argv)
     if args.check == args.apply:
         parser.error("choose exactly one of --check or --apply")
     root = args.root or Path(os.environ.get("GAME_CONTROL_INSTALL_ROOT", "/"))
-    installer = Installer(root, skip_systemd_verify=args.skip_systemd_verify)
+    installer = Installer(root, skip_systemd_verify=args.skip_systemd_verify, public_origin=args.public_origin)
     if args.check:
         drift = installer.drift()
         if drift:
