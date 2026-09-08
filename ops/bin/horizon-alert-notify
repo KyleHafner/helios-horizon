@@ -18,9 +18,10 @@ from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
 
-ALERTMANAGER_URL = os.environ.get(
-    "HORIZON_ALERTMANAGER_URL", "http://192.0.2.12:9093/api/v2/alerts"
-)
+# The endpoint is deployment policy, supplied by the unit EnvironmentFile.
+# There is deliberately no public/reference fallback: a missing overlay must
+# fail closed rather than silently sending alerts to a documentation address.
+ALERTMANAGER_URL = os.environ.get("HORIZON_ALERTMANAGER_URL", "")
 ALERT_LOG = Path("/var/lib/game-control/alerts/target-failures.jsonl")
 SYSTEMCTL = "/usr/bin/systemctl"
 MAX_ATTEMPTS = 3

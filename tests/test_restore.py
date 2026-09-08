@@ -520,6 +520,139 @@ def test_schema2_root_ids_are_identity_derived(tmp_path: Path):
         RestoreService(profile, backup_service=_NoopBackup(), stopped_check=lambda: True)._read_targets(manifest)
 
 
+def test_reconcile_accepts_real_single_root_writer_journal(tmp_path: Path):
+    profile = _profile(tmp_path)
+    (profile.paths.mutable_root / "world").write_text("before")
+    archive = BackupService(profile, stopped_check=lambda: True).create()
+    (profile.paths.mutable_root / "world").write_text("after")
+    service = RestoreService(profile, backup_service=_NoopBackup(), stopped_check=lambda: True)
+    result = service.restore(archive.path)
+
+    assert json.loads(result.journal.read_text())["roots"][0]["root_id"] == "root-0"
+    service.reconcile()
+    assert (profile.paths.mutable_root / "world").read_text() == "after"
+    assert not result.journal.exists()
+    assert not list(tmp_path.glob(".rollback-*"))
+
+
+def test_reconcile_rolls_back_unrecorded_multiroot_publication(tmp_path: Path):
+    import game_control.backups as backups
+
+    profile = _profile(tmp_path)
+    second = tmp_path / "install"
+    second.mkdir()
+    roots = (profile.paths.mutable_root, second)
+    profile = profile.model_copy(update={"paths": profile.paths.model_copy(update={"backup_roots": roots, "data_roots": roots})})
+    for index, root in enumerate(roots):
+        (root / "old").write_text(f"old-{index}")
+    profile.paths.backup_root.mkdir()
+    ids = tuple(backups._root_id(root) for root in roots)
+    stagings = tuple(root.parent / f".restore-{rid}-crash" for rid, root in zip(ids, roots))
+    rollbacks = tuple(root.parent / f".rollback-crash-{index}" for index, root in enumerate(roots))
+    for index, staging in enumerate(stagings):
+        staging.mkdir()
+        (staging / "new").write_text(f"new-{index}")
+    os.replace(roots[0], rollbacks[0])
+    journal = profile.paths.backup_root / ".restore-journal-crash.json"
+    backups._write_json_fsync(journal, {"phase": "publishing", "backup_id": "crash", "activated": [], "roots": [
+        {"root_id": rid, "destination": str(root), "staging": str(staging), "rollback": str(rollback), "original_exists": True}
+        for rid, root, staging, rollback in zip(ids, roots, stagings, rollbacks)
+    ]})
+    # Crash after the first publication and before its activated checkpoint.
+    os.replace(stagings[0], roots[0])
+    service = RestoreService(profile, backup_service=_NoopBackup(), stopped_check=lambda: True)
+    service.reconcile()
+    assert (roots[0] / "old").read_text() == "old-0"
+    assert (roots[1] / "old").read_text() == "old-1"
+    assert not journal.exists()
+    assert not any(path.exists() for path in (*stagings, *rollbacks))
+
+    # Recovery is idempotent: a second startup has no stale publication state.
+    service.reconcile()
+
+
+def test_real_writer_fault_after_multiroot_publication_recovers(tmp_path: Path):
+    import game_control.backups as backups
+
+    profile = _profile(tmp_path)
+    second = tmp_path / "install"
+    second.mkdir()
+    roots = (profile.paths.mutable_root, second)
+    profile = profile.model_copy(update={"paths": profile.paths.model_copy(update={"backup_roots": roots, "data_roots": roots})})
+    for index, root in enumerate(roots):
+        (root / "world").write_text(f"backup-{index}")
+    archive = BackupService(profile, stopped_check=lambda: True).create()
+    for index, root in enumerate(roots):
+        (root / "world").write_text(f"current-{index}")
+
+    child = os.fork()
+    if child == 0:
+        original_replace = backups.os.replace
+
+        def crash_after_first_publish(source, destination):
+            original_replace(source, destination)
+            if Path(source).name.startswith(".restore-") and Path(destination) == roots[0]:
+                os._exit(77)
+
+        backups.os.replace = crash_after_first_publish
+        RestoreService(profile, backup_service=_NoopBackup(), stopped_check=lambda: True).restore(archive.path)
+        os._exit(0)
+    _, status = os.waitpid(child, 0)
+    assert os.waitstatus_to_exitcode(status) == 77
+    journals = list(profile.paths.backup_root.glob(".restore-journal-*.json"))
+    assert len(journals) == 1
+    journal_record = json.loads(journals[0].read_text())
+    assert journal_record["phase"] == "publishing"
+    assert journal_record.get("activated", []) == []
+
+    RestoreService(profile, backup_service=_NoopBackup(), stopped_check=lambda: True).reconcile()
+    assert (roots[0] / "world").read_text() == "current-0"
+    assert (roots[1] / "world").read_text() == "current-1"
+    assert not journals[0].exists()
+
+
+def test_reconcile_commits_before_health_cleanup_failure(tmp_path: Path, monkeypatch):
+    import game_control.backups as backups
+
+    profile = _profile(tmp_path)
+    profile.paths.backup_root.mkdir()
+    destination = profile.paths.mutable_root
+    (destination / "new").write_text("new")
+    rollback = tmp_path / ".rollback-health"
+    rollback.mkdir()
+    (rollback / "old").write_text("old")
+    staging = tmp_path / ".restore-root-0-health"
+    staging.mkdir()
+    journal = profile.paths.backup_root / ".restore-journal-health.json"
+    backups._write_json_fsync(journal, {"phase": "activated", "backup_id": "health", "roots": [{
+        "root_id": "root-0", "destination": str(destination), "staging": str(staging),
+        "rollback": str(rollback), "original_exists": True,
+    }]})
+    real_rmtree = backups.shutil.rmtree
+    failed = {"value": True}
+
+    def fail_cleanup(path, *args, **kwargs):
+        if failed["value"] and Path(path) == rollback:
+            failed["value"] = False
+            raise OSError("injected cleanup failure")
+        return real_rmtree(path, *args, **kwargs)
+
+    monkeypatch.setattr(backups.shutil, "rmtree", fail_cleanup)
+    service = RestoreService(profile, backup_service=_NoopBackup(), stopped_check=lambda: True, health_check=lambda _path: True)
+    with pytest.raises(SafeError, match="journal"):
+        service.reconcile()
+    assert journal.exists()
+    assert json.loads(journal.read_text())["phase"] == "committed"
+
+    # A later startup must honor the commit decision even if health is no
+    # longer available; it must never restore the old generation.
+    service = RestoreService(profile, backup_service=_NoopBackup(), stopped_check=lambda: True, health_check=lambda _path: False)
+    service.reconcile()
+    assert (destination / "new").read_text() == "new"
+    assert not rollback.exists()
+    assert not journal.exists()
+
+
 def test_multiroot_health_failure_does_not_finalize_any_root(tmp_path: Path):
     import game_control.backups as backups
 

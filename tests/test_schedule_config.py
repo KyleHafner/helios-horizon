@@ -1,9 +1,10 @@
+import os
 from pathlib import Path
 import tomllib
 
 import pytest
 
-from game_control.schedule_config import ScheduleConfigError, write_schedule_config
+from game_control.schedule_config import ScheduleConfigError, load_schedule_entries, write_schedule_config
 
 
 def test_schedule_config_replacement_is_atomic_and_keeps_a_backup(tmp_path: Path):
@@ -70,3 +71,63 @@ def test_schedule_config_rejects_invalid_backup_destination(tmp_path: Path):
                 "backup_destination": "arbitrary",
             }],
         )
+
+
+def test_schedule_config_removes_commented_headers_and_preserves_multiline_text(tmp_path: Path):
+    path = tmp_path / "game-control.toml"
+    original = (
+        'description = "[[schedule]] in a normal string"\n'
+        'multiline = """text\n'
+        '[[schedule]]\n'
+        'still text"""\n'
+        '[[schedule]] # old entry\n'
+        'cron = "0 3 * * *"\n'
+        'profile = "minecraft"\n'
+        '[crafty]\nverify = false\n'
+    )
+    path.write_text(original, encoding="utf-8")
+
+    write_schedule_config(path, [])
+
+    updated = path.read_text(encoding="utf-8")
+    assert "[[schedule]] # old entry" not in updated
+    assert "[[schedule]] in a normal string" in updated
+    assert "still text\"\"\"" in updated
+    assert tomllib.loads(updated)["crafty"]["verify"] is False
+    assert "schedule" not in tomllib.loads(updated)
+
+    write_schedule_config(path, [{"cron": "1 * * * *", "profile": "pz-rising"}])
+    parsed = tomllib.loads(path.read_text(encoding="utf-8"))
+    assert parsed["schedule"][0]["profile"] == "pz-rising"
+    assert parsed["multiline"] == "text\n[[schedule]]\nstill text"
+
+
+def test_schedule_override_can_be_created_empty_and_persists(tmp_path: Path):
+    override = tmp_path / "schedules.toml"
+    config = {"schedule": [{"cron": "0 3 * * *", "profile": "minecraft"}]}
+
+    write_schedule_config(override, [])
+
+    assert override.exists()
+    assert load_schedule_entries(config, override) == []
+    assert load_schedule_entries(config, override) == []
+
+
+def test_malformed_schedule_override_fails_closed(tmp_path: Path):
+    override = tmp_path / "schedules.toml"
+    override.write_text("[[schedule]\ncron =", encoding="utf-8")
+
+    with pytest.raises(ScheduleConfigError, match="invalid schedule override"):
+        load_schedule_entries({"schedule": []}, override)
+
+
+def test_schedule_override_dangling_link_and_special_file_fail_closed(tmp_path: Path):
+    dangling = tmp_path / "dangling.toml"
+    dangling.symlink_to(tmp_path / "missing.toml")
+    with pytest.raises(ScheduleConfigError, match="schedule override is unavailable"):
+        load_schedule_entries({"schedule": []}, dangling)
+
+    special = tmp_path / "special.toml"
+    os.mkfifo(special)
+    with pytest.raises(ScheduleConfigError, match="schedule override is unavailable"):
+        load_schedule_entries({"schedule": []}, special)

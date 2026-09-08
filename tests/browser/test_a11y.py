@@ -1,46 +1,19 @@
 from __future__ import annotations
 
 import json
-import shutil
-import threading
-from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import urlparse
 
 import pytest
-from playwright.sync_api import Page, sync_playwright
+from playwright.sync_api import Page
 
+from browser_harness import browser_page
 
-ROOT = Path(__file__).resolve().parents[2]
 AXE_SOURCE = (Path(__file__).parent / "assets" / "axe.min.js").read_text(encoding="utf-8")
-
-class QuietHandler(SimpleHTTPRequestHandler):
-    def log_message(self, *_args):  # pragma: no cover - test server noise
-        pass
-
-
-@pytest.fixture(scope="session")
-def web_server():
-    handler = lambda *args, **kwargs: QuietHandler(*args, directory=str(ROOT / "web"), **kwargs)
-    server = ThreadingHTTPServer(("127.0.0.1", 0), handler)
-    thread = threading.Thread(target=server.serve_forever, daemon=True)
-    thread.start()
-    yield f"http://127.0.0.1:{server.server_port}"
-    server.shutdown()
-    thread.join(timeout=2)
-
 
 @pytest.fixture
 def page(web_server):
-    with sync_playwright() as playwright:
-        browser = playwright.chromium.launch(
-            executable_path=shutil.which("google-chrome-stable") or shutil.which("google-chrome")
-        )
-        context = browser.new_context(
-            viewport={"width": 1280, "height": 900},
-            extra_http_headers={"X-Forwarded-User": "operator@example.test"},
-        )
-        page = context.new_page()
+    with browser_page(viewport={"width": 1280, "height": 900}) as page:
         status = {
             "generation": 1,
             "observed_at": "2026-07-16T12:00:00Z",
@@ -170,8 +143,6 @@ def page(web_server):
         yield page
         assert console_errors == []
         assert page_errors == []
-        context.close()
-        browser.close()
 
 
 def scan_surface(page: Page, surface: str) -> None:

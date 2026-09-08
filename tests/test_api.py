@@ -1,5 +1,7 @@
 from pathlib import Path
 import sqlite3
+import asyncio
+from unittest.mock import patch
 from uuid import uuid4
 
 import pytest
@@ -12,6 +14,7 @@ from starlette.requests import Request
 
 from game_control.web_main import create_app
 from game_control.web_main import AdaptiveStatusCadence
+import game_control.web_main as web_main
 from game_control.auth import SESSION_COOKIE, SessionStore
 
 
@@ -114,6 +117,39 @@ def test_status_publisher_backs_off_after_repeated_rpc_failures():
         assert fourth_call.wait(1.5)
         assert calls[2] - calls[1] < 0.25
         assert calls[3] - calls[2] >= 0.3
+
+
+@pytest.mark.asyncio
+async def test_status_fallback_polls_when_watch_only_sends_heartbeats():
+    status_calls = 0
+
+    async def rpc(_actor, action):
+        nonlocal status_calls
+        if isinstance(action, GetStatus):
+            status_calls += 1
+            return RpcSuccess(
+                request_id=uuid4(),
+                result=StatusSnapshot(generation=status_calls, profiles=()),
+            )
+        raise AssertionError("unexpected RPC")
+
+    class HeartbeatWatch:
+        async def events(self, *, cursor=0, generation=0):
+            while True:
+                yield {"sequence": cursor + 1, "generation": generation,
+                       "kind": "heartbeat", "payload": {}}
+                await asyncio.sleep(0.01)
+
+    app = create_app(
+        rpc=rpc,
+        proxy_credential="secret",
+        session_db=":memory:",
+        status_cadence=AdaptiveStatusCadence(fast_interval=0.02, idle_interval=0.05),
+    )
+    with patch.object(web_main, "UnixWatchClient", HeartbeatWatch):
+        async with app.router.lifespan_context(app):
+            await asyncio.sleep(0.4)
+    assert status_calls >= 2
 
 
 def test_web_app_serves_dashboard_assets():

@@ -12,6 +12,7 @@ from game_control.controller import Controller
 from game_control.controller import _ControllerFailure
 from game_control.models import OperationName, ProfileId
 from game_control.protocol import ErrorCode, GetSchedules, SetSchedules, Start, StatusSnapshot, RpcRequest
+from pydantic import ValidationError
 from game_control.schedule import ScheduleBook, parse_schedule
 from game_control.errors import SafeError
 from game_control.slot import OperationLock, ReservationStore
@@ -327,6 +328,20 @@ def test_schedule_rejects_non_boolean_enabled():
         parse_schedule([{"cron": "* * * * *", "profile": "minecraft", "enabled": "false"}])
 
 
+def test_schedule_rejects_explicit_backup_without_destination():
+    with pytest.raises(ValueError, match="backup schedule requires a destination"):
+        parse_schedule([{"cron": "0 3 * * *", "profile": "minecraft", "operation": "backup"}])
+
+
+def test_schedule_infers_legacy_operation_from_destination():
+    switch, backup = parse_schedule([
+        {"cron": "0 3 * * *", "profile": "minecraft"},
+        {"cron": "0 4 * * *", "profile": "minecraft", "backup_destination": "local"},
+    ])
+    assert switch.operation == "switch"
+    assert backup.operation == "backup"
+
+
 def test_schedule_cron_matches_minute_and_weekday():
     book = ScheduleBook(parse_schedule([{"cron": "0 20 * * 5", "profile": "minecraft"}]))
     friday = datetime(2026, 7, 17, 20, 0, tzinfo=timezone.utc)
@@ -446,4 +461,6 @@ def test_schedule_rpc_rejects_invalid_cron_and_unknown_profile(tmp_path):
         action=SetSchedules(kind="set_schedules", entries=({"cron": "* * * * *", "profile": "pz-rising"},)),
     ))
     assert unknown_profile.error.code == ErrorCode.INVALID_REQUEST
+    with pytest.raises(ValidationError, match="backup schedules require a destination"):
+        SetSchedules(kind="set_schedules", entries=({"cron": "0 3 * * *", "profile": "minecraft", "operation": "backup"},))
     assert list(tmp_path.glob("*.bak")) == []

@@ -39,6 +39,40 @@ def test_sustained_mspt_window_emits_once_recovers_and_can_realert():
     assert again[0].generation > first[0].generation
 
 
+def test_sustained_windows_tolerate_fractional_polling_jitter():
+    evaluator = PerformanceAlertEvaluator()
+    emissions = []
+    for index in range(121):
+        emissions.extend(evaluator.observe(
+            "minecraft", profile_state="running", now=index * 10.001,
+            mspt_p95=100, rss_bytes=1_000_000_000 + index * 16 * 1024 * 1024,
+        ))
+    assert [item.signal for item in emissions] == [AlertSignal.SUSTAINED_MSPT]
+    assert AlertSignal.SUSTAINED_MSPT in evaluator.active_signals("minecraft")
+
+
+def test_memory_growth_window_tolerates_fractional_polling_jitter_without_mspt():
+    evaluator = PerformanceAlertEvaluator()
+    emissions = []
+    for index in range(121):
+        emissions.extend(evaluator.observe(
+            "minecraft", profile_state="running", now=index * 10.001,
+            rss_bytes=1_000_000_000 + index * 16 * 1024 * 1024,
+        ))
+    assert [item.signal for item in emissions] == [AlertSignal.MEMORY_GROWTH]
+
+
+def test_sustained_windows_need_enough_observations_after_a_gap_and_reset():
+    evaluator = PerformanceAlertEvaluator()
+    evaluator.observe("minecraft", profile_state="running", now=0, mspt_p95=100)
+    assert evaluator.observe("minecraft", profile_state="running", now=31, mspt_p95=100) == ()
+    for stamp in (41, 51, 61):
+        evaluator.observe("minecraft", profile_state="running", now=stamp, mspt_p95=100)
+    assert evaluator.active_signals("minecraft") == (AlertSignal.SUSTAINED_MSPT,)
+    evaluator.observe("minecraft", profile_state="stopped", now=62, mspt_p95=100)
+    assert evaluator.active_signals("minecraft") == ()
+
+
 def test_memory_growth_is_root_cause_exclusive_with_mspt():
     evaluator = PerformanceAlertEvaluator(generation_clock=lambda: 50)
     evaluator.observe("minecraft", profile_state="running", now=0, mspt_p95=60, rss_bytes=1_000_000_000)

@@ -837,6 +837,30 @@ def test_installer_check_is_read_only_and_apply_is_idempotent(tmp_path: Path) ->
     assert not (root / "etc/game-control/profiles.d/pz-rising.toml").exists()
 
 
+def test_alertmanager_overlay_is_validated_and_explicitly_provisioned(tmp_path: Path) -> None:
+    from ops.install import Installer
+
+    installer = Installer(tmp_path / "root", skip_systemd_verify=True)
+    assert installer._valid_alertmanager_url("http://127.0.0.1:9093/api/v2/alerts")
+    assert not installer._valid_alertmanager_url("http://192.0.2.12:9093/api/v2/alerts")
+    assert not installer._valid_alertmanager_url("http://alerts.example/api/v2/alerts")
+    assert not installer._valid_alertmanager_url("http://127.0.0.1:9093")
+
+    root = tmp_path / "root"
+    root.mkdir()
+    Installer(root, skip_systemd_verify=True, alertmanager_url="http://127.0.0.1:9093/api/v2/alerts")._ensure_alertmanager_config()
+    config = root / "etc/game-control/alertmanager.conf"
+    assert config.read_text(encoding="ascii") == "HORIZON_ALERTMANAGER_URL=http://127.0.0.1:9093/api/v2/alerts\n"
+    assert stat.S_IMODE(config.stat().st_mode) == 0o600
+    assert Installer(root, skip_systemd_verify=True)._alertmanager_url_valid()
+
+    # An existing valid per-host overlay is preserved when no URL is supplied.
+    config.write_text("HORIZON_ALERTMANAGER_URL=http://127.0.0.1:9094/api/v2/alerts\n", encoding="ascii")
+    config.chmod(0o600)
+    Installer(root, skip_systemd_verify=True)._ensure_alertmanager_config()
+    assert "9094" in config.read_text(encoding="ascii")
+
+
 def test_installer_applies_runtime_sources_verifier_and_safe_stale_cleanup(tmp_path: Path) -> None:
     from ops.install import Installer
 

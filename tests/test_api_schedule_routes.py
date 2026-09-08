@@ -34,3 +34,29 @@ def test_schedule_routes_construct_typed_actions_and_forbid_unknown_fields():
         json={"entries": [{"cron": "* * * * *", "profile": "minecraft", "enabled": "false"}]},
         headers=mutation_headers,
     ).status_code == 422
+
+
+def test_schedule_policy_fields_round_trip_through_set_action():
+    calls = []
+
+    async def rpc(_actor, action):
+        calls.append(action)
+        return RpcSuccess(request_id=uuid4(), result={"schedules": []})
+
+    client = TestClient(create_app(rpc=rpc, proxy_credential="secret", session_db=":memory:"), base_url="https://games.example.com")
+    session = client.get("/api/v1/session", headers=HEADERS)
+    headers = {**HEADERS, "X-CSRF-Token": session.json()["csrf_token"], "Origin": "https://games.example.com"}
+    response = client.post(
+        "/api/v1/schedules",
+        json={"entries": [{
+            "cron": "0 20 * * 5", "profile": "minecraft", "operation": "benchmark",
+            "baseline_preset": "baseline", "candidate_preset": "candidate", "campaign": "weekly",
+            "maintenance_window": True, "rollback_safe": True, "public_wake_policy": "safe",
+        }]},
+        headers=headers,
+    )
+    assert response.status_code == 200
+    entry = calls[-1].entries[0]
+    assert entry.operation == "benchmark"
+    assert entry.maintenance_window is True and entry.rollback_safe is True
+    assert entry.public_wake_policy == "safe"

@@ -801,7 +801,7 @@ async function api(path, options = {}) {
         throw new Error("Connection lost. Retrying in the background…");
       }
     } else {
-      const unknown = new Error("Outcome unknown; reconciling original operation. Retry with the same operation key.");
+      const unknown = new Error("Outcome unknown. Retry with the same operation key.");
       unknown.outcomeUnknown = true;
       throw unknown;
     }
@@ -840,22 +840,38 @@ async function api(path, options = {}) {
   }
   if (!response.ok) {
     let detail = "Request failed.";
+    let outcomeUnknown = mutation && [502, 503, 504].includes(response.status);
     try {
       const body = await response.json();
       const typed = body?.error?.message || body?.detail;
       if (typeof typed === "string" && typed.trim()) detail = typed.slice(0, 300);
+      outcomeUnknown = outcomeUnknown || body?.error?.outcome_unknown === true || (mutation && response.status === 503);
     } catch {}
-    // A typed HTTP response is definitive. Only transport failures retain
-    // the sessionStorage key for reconciliation/replay.
-    if (mutation && operationStorageKey) {
+    // A typed HTTP response is definitive unless the upstream transport may
+    // have lost a committed mutation response. Retain that key for replay.
+    if (mutation && operationStorageKey && !outcomeUnknown) {
       try { sessionStorage.removeItem(operationStorageKey); } catch {}
     }
+    if (outcomeUnknown) {
+      const unknown = new Error("Outcome unknown. Retry with the same operation key.");
+      unknown.outcomeUnknown = true;
+      throw unknown;
+    }
     throw new Error(detail);
+  }
+  let result;
+  try {
+    result = await response.json();
+  } catch (error) {
+    if (!mutation) throw error;
+    const unknown = new Error("Outcome unknown. Retry with the same operation key.");
+    unknown.outcomeUnknown = true;
+    throw unknown;
   }
   if (mutation && operationStorageKey) {
     try { sessionStorage.removeItem(operationStorageKey); } catch {}
   }
-  return response.json();
+  return result;
 }
 
 async function load() {
@@ -2433,6 +2449,22 @@ async function loadSchedules() {
   return state.schedules;
 }
 
+function schedulePayload(item) {
+  return {
+    cron: item.cron,
+    profile: item.profile,
+    enabled: item.enabled !== false,
+    ...(item.backup_destination ? { backup_destination: item.backup_destination } : {}),
+    ...(item.operation ? { operation: item.operation } : {}),
+    ...(item.baseline_preset ? { baseline_preset: item.baseline_preset } : {}),
+    ...(item.candidate_preset ? { candidate_preset: item.candidate_preset } : {}),
+    ...(item.campaign ? { campaign: item.campaign } : {}),
+    maintenance_window: item.maintenance_window === true,
+    rollback_safe: item.rollback_safe === true,
+    public_wake_policy: item.public_wake_policy || "disabled",
+  };
+}
+
 async function replaceSchedules(entries, confirmation) {
   if (!window.confirm(confirmation)) return false;
   const response = await api("/api/v1/schedules", { method: "POST", body: JSON.stringify({ entries }) });
@@ -2449,7 +2481,7 @@ async function addSchedule(event) {
   const cron = byId("schedule-cron").value.trim();
   const profile = byId("schedule-profile").value;
   if (!cron || !profile) return;
-  const entries = [...(state.detail.schedules || []).map(({ cron: value, profile: id, enabled, backup_destination }) => ({ cron: value, profile: id, enabled: enabled !== false, ...(backup_destination ? { backup_destination } : {}) })), { cron, profile, enabled: true }];
+  const entries = [...(state.detail.schedules || []).map(schedulePayload), { cron, profile, enabled: true, operation: "switch", maintenance_window: false, rollback_safe: false, public_wake_policy: "disabled" }];
   try {
     const changed = await replaceSchedules(entries, `Add schedule ${cron} for ${profileLabel(profile)}?`);
     if (changed) {
@@ -2460,7 +2492,7 @@ async function addSchedule(event) {
 }
 
 async function removeSchedule(index, item) {
-  const entries = (state.detail.schedules || []).filter((_, candidate) => candidate !== index).map(({ cron, profile, enabled, backup_destination }) => ({ cron, profile, enabled: enabled !== false, ...(backup_destination ? { backup_destination } : {}) }));
+  const entries = (state.detail.schedules || []).filter((_, candidate) => candidate !== index).map(schedulePayload);
   const nextFocusIndex = Math.min(index, entries.length - 1);
   try {
     const changed = await replaceSchedules(entries, `Remove schedule ${item.cron} for ${profileLabel(item.profile)}?`);
@@ -2473,7 +2505,7 @@ async function removeSchedule(index, item) {
 
 async function toggleSchedule(index, item, control) {
   const nextEnabled = item.enabled === false;
-  const entries = (state.detail.schedules || []).map(({ cron, profile, enabled, backup_destination }) => ({ cron, profile, enabled: enabled !== false, ...(backup_destination ? { backup_destination } : {}) }));
+  const entries = (state.detail.schedules || []).map(schedulePayload);
   entries[index].enabled = nextEnabled;
   try {
     const changed = await replaceSchedules(entries, `${nextEnabled ? "Enable" : "Disable"} schedule ${item.cron} for ${profileLabel(item.profile)}?`);

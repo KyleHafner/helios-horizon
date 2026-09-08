@@ -200,6 +200,20 @@ class ScheduleSpec(RpcModel):
     rollback_safe: bool = False
     public_wake_policy: Literal["disabled", "safe"] = "disabled"
 
+    @model_validator(mode="before")
+    @classmethod
+    def infer_operation(cls, value: Any) -> Any:
+        if isinstance(value, dict) and "operation" not in value:
+            value = dict(value)
+            value["operation"] = "backup" if value.get("backup_destination") is not None else "switch"
+        return value
+
+    @model_validator(mode="after")
+    def backup_requires_destination(self):
+        if self.operation == "backup" and self.backup_destination is None:
+            raise ValueError("backup schedules require a destination")
+        return self
+
     @field_validator("cron")
     @classmethod
     def validate_cron_text(cls, value: str) -> str:
@@ -227,6 +241,9 @@ class ScheduleView(RpcModel):
     baseline_preset: str | None = None
     candidate_preset: str | None = None
     campaign: str | None = None
+    maintenance_window: bool = False
+    rollback_safe: bool = False
+    public_wake_policy: Literal["disabled", "safe"] = "disabled"
 
 
 class ScheduleResponse(RpcModel):

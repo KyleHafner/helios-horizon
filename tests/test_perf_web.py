@@ -56,6 +56,16 @@ def test_phase_zero_web_client_uses_visibility_gated_incremental_paths():
     assert "resolution=${encodeURIComponent(resolution)}&limit=720" in app
 
 
+def test_schedule_ui_preserves_operation_and_policy_fields():
+    app = (Path(__file__).resolve().parents[1] / "web" / "app.js").read_text()
+    assert "function schedulePayload(item)" in app
+    assert "item.operation" in app
+    assert "item.maintenance_window === true" in app
+    assert "item.rollback_safe === true" in app
+    assert 'item.public_wake_policy || "disabled"' in app
+    assert 'operation: "switch"' in app
+
+
 def test_session_expiry_is_single_flight_and_stops_reconnect_without_misclassifying_403():
     app = (Path(__file__).resolve().parents[1] / "web" / "app.js").read_text()
 

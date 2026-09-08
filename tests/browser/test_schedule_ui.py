@@ -2,45 +2,17 @@ from __future__ import annotations
 
 import json
 import re
-import shutil
-import threading
-from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
-from pathlib import Path
 from urllib.parse import urlparse
 
 import pytest
-from playwright.sync_api import Page, expect, sync_playwright
+from playwright.sync_api import Page, expect
 
-
-ROOT = Path(__file__).resolve().parents[2]
-
-
-class QuietHandler(SimpleHTTPRequestHandler):
-    def log_message(self, *_args):  # pragma: no cover
-        pass
-
-
-@pytest.fixture(scope="session")
-def schedule_web_server():
-    handler = lambda *args, **kwargs: QuietHandler(*args, directory=str(ROOT / "web"), **kwargs)
-    server = ThreadingHTTPServer(("127.0.0.1", 0), handler)
-    thread = threading.Thread(target=server.serve_forever, daemon=True)
-    thread.start()
-    yield f"http://127.0.0.1:{server.server_port}"
-    server.shutdown()
-    thread.join(timeout=2)
+from browser_harness import browser_page
 
 
 @pytest.fixture
-def schedule_page(schedule_web_server):
-    with sync_playwright() as playwright:
-        browser = playwright.chromium.launch(executable_path=shutil.which("google-chrome-stable") or shutil.which("google-chrome"))
-        context = browser.new_context(
-            has_touch=True,
-            viewport={"width": 375, "height": 760},
-            extra_http_headers={"X-Forwarded-User": "operator@example.test"},
-        )
-        page = context.new_page()
+def schedule_page(web_server):
+    with browser_page(has_touch=True, viewport={"width": 375, "height": 760}) as page:
         schedules = [{"cron": "0 20 * * 5", "profile": "minecraft", "next_fire": "2026-07-17T20:00:00Z", "enabled": True}]
         status = {"generation": 1, "observed_at": "2026-07-11T12:00:00Z", "profiles": [{
             "profile_id": "minecraft", "state": "running", "health": "healthy", "slot_owner": "minecraft",
@@ -70,12 +42,10 @@ def schedule_page(schedule_web_server):
             return route.fulfill(json={"ok": True})
 
         page.route("**/api/v1/**", fulfill)
-        page.goto(f"{schedule_web_server}#/servers/minecraft/config")
+        page.goto(f"{web_server}#/servers/minecraft/config")
         page.wait_for_selector("#panel-config:not([hidden])")
         page.on("dialog", lambda dialog: dialog.accept())
         yield page
-        context.close()
-        browser.close()
 
 
 def test_schedule_list_add_and_remove_contract(schedule_page: Page):

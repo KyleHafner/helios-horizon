@@ -101,6 +101,15 @@ repository.
 - Record real topology, account choices, maintenance procedures, and observed
   evidence only in the external private overlay.
 
+## Schedule operator reference
+
+Editable schedules live in a sibling `schedules.toml` file next to the
+configured state database. The operator-facing schedule path is selected by
+the private deployment configuration. The root configuration fallback is used
+only when that sibling override is absent; an explicitly empty override
+disables the legacy fallback. The schedule file remains controller-owned and
+is replaced atomically after validation.
+
 This public reference intentionally omits monitoring inventory, migration
 evidence, production domains, credentials, live IDs, remote keys, player/world
 data, and deployment history.

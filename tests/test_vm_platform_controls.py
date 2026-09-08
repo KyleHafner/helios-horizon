@@ -76,6 +76,7 @@ def test_alert_target_allowlist_and_fixed_unit_queries(monkeypatch, tmp_path):
 
 
 def test_alert_delivery_failure_is_durable_and_bounded(monkeypatch, tmp_path):
+    monkeypatch.setattr(alerts, "ALERTMANAGER_URL", "http://127.0.0.1:9093/api/v2/alerts")
     log = tmp_path / "alerts" / "target-failures.jsonl"
     log.parent.mkdir(mode=0o700)
     sleeps = []
@@ -101,6 +102,7 @@ def test_alert_delivery_failure_is_durable_and_bounded(monkeypatch, tmp_path):
 
 
 def test_alert_post_uses_only_fixed_endpoint_and_secret_free_body(monkeypatch):
+    monkeypatch.setattr(alerts, "ALERTMANAGER_URL", "http://127.0.0.1:9093/api/v2/alerts")
     seen = []
 
     class Response:
@@ -135,6 +137,13 @@ def test_notifier_and_drill_units_have_retry_and_no_restart_coupling():
     assert "OnFailure=horizon-alert-notify@drill-%i.service" in drill
     assert "minecraft|controller|web" in drill
     assert "ExecStart=/usr/bin/false" in drill
+    assert "EnvironmentFile=/etc/game-control/alertmanager.conf" in notifier
+
+
+def test_notifier_requires_deployment_endpoint_without_reference_fallback(monkeypatch):
+    monkeypatch.delenv("HORIZON_ALERTMANAGER_URL", raising=False)
+    module = _load("horizon_alert_notify_missing_endpoint", OPS_BIN / "horizon-alert-notify")
+    assert module.ALERTMANAGER_URL == ""
 
 
 def test_journal_capture_uses_fixed_sunlit_and_peak_math(monkeypatch, tmp_path):

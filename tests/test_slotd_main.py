@@ -638,6 +638,22 @@ async def test_explicit_stale_response_generation_is_still_rejected() -> None:
 
 
 @pytest.mark.asyncio
+async def test_status_snapshot_uses_browser_status_event_name() -> None:
+    server = UnixRpcServer(object(), uid=1000, gid=2000, primary_gid=1000)
+    client = await server.watch_hub.subscribe()
+    response = RpcSuccess(
+        request_id=uuid4(),
+        result=StatusSnapshot(generation=1, observed_at="2026-01-01T00:00:00Z", profiles=()),
+    )
+
+    await server._publish_response("get_status", response)
+
+    event = await client.queue.get()
+    assert event.kind == "status"
+    assert event.full is True
+
+
+@pytest.mark.asyncio
 async def test_non_generational_response_still_writes_rpc_reply_after_watch_projection() -> None:
     request = RpcRequest(request_id=uuid4(), actor="operator", action=GetPerf(kind="get_perf"))
     response = RpcSuccess(

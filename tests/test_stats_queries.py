@@ -309,6 +309,78 @@ def test_v2_rollup_auto_resolution_preserves_extrema_beyond_raw_retention(conn, 
         telemetry.close()
 
 
+def test_v2_long_window_merges_cutoff_bucket_with_surviving_raw_and_context(conn, tmp_path):
+    telemetry = TelemetryDatabase.open(tmp_path / "telemetry.db")
+    now = datetime.fromisoformat(NOW.replace("Z", "+00:00"))
+    boundary = int((now - timedelta(hours=48)).timestamp() * 1000) // 3_600_000 * 3_600_000
+    try:
+        for metric, values in (("tps", (10, 30)), ("mspt", (20, 40)), ("cpu_percent", (25, 75)),
+                               ("rss_bytes", (100, 300)), ("gc_pause", (2, 6))):
+            telemetry.record_rollup("minecraft", metric, bucket_start_ms=boundary,
+                                    minimum=values[0], maximum=values[0], total=values[0] * 2, count=2)
+            telemetry.record_sample("minecraft", metric, values[1],
+                                    ts_ms=boundary + 30 * 60_000, state="available")
+        # Recent state changes remain visible in the context and do not erase
+        # the historical part of the cutoff bucket.
+        for state, offset in (("inactive", 45), ("unavailable", 60)):
+            for metric in ("tps", "mspt"):
+                telemetry.record_sample("minecraft", metric, None,
+                                        ts_ms=boundary + offset * 60_000, state=state)
+        result = stats_tps(conn, "minecraft", "7d", now=NOW,
+                           telemetry=telemetry.connection, resolution="auto", limit=100)
+        cutoff = next(sample for sample in result["samples"] if sample["ts"] ==
+                      datetime.fromtimestamp(boundary / 1000, timezone.utc).isoformat().replace("+00:00", "Z"))
+        assert cutoff["tps"] == pytest.approx(16.666666666666666)
+        assert cutoff["tps_min"] == 10.0 and cutoff["tps_max"] == 30.0
+        assert max(sample["ts"] for sample in result["samples"]) >= "2026-07-12T02:30:00Z"
+        assert any(sample.get("inactive_fraction", 0) > 0 for sample in result["samples"])
+        assert any(sample["state"] == "unavailable" for sample in result["samples"])
+        context = result["context"]["series"]
+        assert max(point["ts"] for point in context["cpu_percent"]) >= "2026-07-12T02:00:00Z"
+        assert max(point["ts"] for point in context["rss_bytes"]) >= "2026-07-12T02:00:00Z"
+        assert max(point["ts"] for point in context["gc_pause"]) >= "2026-07-12T02:00:00Z"
+        assert all("_metric_counts" not in repr(value) for value in (result, context))
+    finally:
+        telemetry.close()
+
+
+def test_v2_long_window_uses_real_compaction_for_partial_hour_and_raw_state(conn, tmp_path):
+    telemetry = TelemetryDatabase.open(tmp_path / "telemetry.db")
+    current = datetime.fromisoformat("2026-07-14T12:15:00+00:00")
+    cutoff = current - timedelta(hours=48)
+    try:
+        # Compaction creates native-hour rollups at 01:00 and 11:00; the
+        # 12:20 sample remains raw. The explicit hourly resolution must retain
+        # every hour without dropping late-day data.
+        for metric, value in (("tps", 10), ("mspt", 20), ("cpu_percent", 25),
+                              ("rss_bytes", 100), ("gc_pause", 2)):
+            telemetry.record_sample("minecraft", metric, value,
+                                    ts_ms=int((cutoff - timedelta(hours=11, minutes=10)).timestamp() * 1000))
+            telemetry.record_sample("minecraft", metric, value * 3,
+                                    ts_ms=int((cutoff - timedelta(hours=1, minutes=10)).timestamp() * 1000))
+            telemetry.record_sample("minecraft", metric, value * 5,
+                                    ts_ms=int((cutoff + timedelta(minutes=5)).timestamp() * 1000))
+        for state, minutes in (("inactive", 6), ("unavailable", 8)):
+            for metric in ("tps", "mspt"):
+                telemetry.record_sample("minecraft", metric, None,
+                                        ts_ms=int((cutoff + timedelta(minutes=minutes)).timestamp() * 1000), state=state)
+        telemetry.compact_hourly(now_ms=int(current.timestamp() * 1000))
+        result = stats_tps(conn, "minecraft", "30d", now=current.isoformat().replace("+00:00", "Z"),
+                           telemetry=telemetry.connection, resolution="1h", limit=100)
+        hours = {sample["ts"]: sample for sample in result["samples"]}
+        first = hours[cutoff.replace(hour=1, minute=0, second=0, microsecond=0).isoformat().replace("+00:00", "Z")]
+        late = hours[cutoff.replace(hour=11, minute=0, second=0, microsecond=0).isoformat().replace("+00:00", "Z")]
+        recent = hours[cutoff.replace(hour=12, minute=0, second=0, microsecond=0).isoformat().replace("+00:00", "Z")]
+        assert first["tps"] == pytest.approx(10.0)
+        assert late["tps"] == pytest.approx(30.0)
+        assert recent["tps"] == pytest.approx(50.0)
+        assert recent["tps_min"] == 50.0 and recent["tps_max"] == 50.0
+        assert recent["inactive_fraction"] > 0
+        assert recent["unavailable_fraction"] > 0
+    finally:
+        telemetry.close()
+
+
 def test_v2_explicit_subhour_resolution_reports_effective_hourly_rollup(conn, tmp_path):
     telemetry = TelemetryDatabase.open(tmp_path / "telemetry.db")
     now = datetime.fromisoformat(NOW.replace("Z", "+00:00"))

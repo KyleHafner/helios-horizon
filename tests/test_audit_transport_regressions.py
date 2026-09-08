@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import asyncio
 import json
+from pathlib import Path
 import sqlite3
+import subprocess
 from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 from uuid import UUID, uuid4
@@ -282,9 +284,48 @@ def test_internal_fallback_has_required_metadata():
 def test_browser_persists_idempotency_and_unknown_outcome_copy():
     source = open("web/app.js", encoding="utf-8").read()
     assert "sessionStorage.getItem(operationStorageKey)" in source
-    assert "Outcome unknown; reconciling original operation" in source
+    assert "Outcome unknown. Retry with the same operation key." in source
     assert "action not sent" not in source
     assert "sessionStorage.removeItem(operationStorageKey)" in source
+    assert "response.status === 503" in source
+    assert "outcomeUnknown = true" in source
+
+
+def test_browser_replays_same_key_after_gateway_body_is_not_json():
+    source = Path("web/app.js").resolve()
+    script = r'''
+const fs = require('fs'), vm = require('vm');
+const input = JSON.parse(fs.readFileSync(0, 'utf8'));
+const source = fs.readFileSync(input.file, 'utf8');
+const start = source.indexOf('async function api(');
+const apiSource = source.slice(start, source.indexOf('\nasync function load()', start));
+const storage = new Map(), keys = [];
+const context = {Headers, Response, state:{csrf:'synthetic'}, sessionExpired:false,
+  sessionGeneration:1, SESSION_EXPIRED_MESSAGE:'expired',
+  crypto:{randomUUID:()=> '22222222-2222-4222-8222-222222222222'},
+  sessionStorage:{getItem:k=>storage.get(k)||null,setItem:(k,v)=>storage.set(k,v),removeItem:k=>storage.delete(k)},
+  fetch:async (path, options) => {
+    keys.push(options.headers.get('Idempotency-Key'));
+    return {status: 503, ok: false, json: async()=>{throw new Error('html')}};
+  }};
+vm.createContext(context); vm.runInContext(apiSource, context);
+(async()=>{
+  const outcomes = [];
+  for (let i = 0; i < 2; i++) try {
+    outcomes.push(await context.api('/api/v1/profiles/minecraft/start', {method:'POST', body:'{}'}));
+  } catch (error) { outcomes.push({message:error.message, unknown:!!error.outcomeUnknown}); }
+  process.stdout.write(JSON.stringify({keys, outcomes, stored_keys:storage.size}));
+})();
+'''
+    result = subprocess.run(
+        ["node", "-e", script], input=json.dumps({"file": str(source)}),
+        text=True, capture_output=True, check=True,
+    )
+    observed = json.loads(result.stdout)
+    assert observed["keys"] == [observed["keys"][0], observed["keys"][0]]
+    assert observed["outcomes"][0]["unknown"] is True
+    assert observed["outcomes"][1]["unknown"] is True
+    assert observed["stored_keys"] == 1
 
 
 def test_staged_version_command_replaces_current_path():

@@ -489,6 +489,7 @@ def create_app(
     capabilities = capability_service or CapabilityService(CapabilityTokenStore(sessions.db), rpc_impl)
     mutation_wakeup = asyncio.Event()
     watch_connected = asyncio.Event()
+    last_watch_status = 0.0
     credential = proxy_credential
     assets = Path(web_root) if web_root is not None else PRODUCTION_WEB_ROOT
     origins = (
@@ -500,22 +501,27 @@ def create_app(
         last_snapshot: dict[str, Any] | None = None
         last_published = 0.0
         cadence = status_cadence or AdaptiveStatusCadence()
+        watch_status_timeout = max(cadence.fast_interval, min(15.0, cadence.idle_interval))
         forced_fast_cycles = 0
         consecutive_failures = 0
         while True:
             interval = cadence.fast_interval
             try:
                 if watch_connected.is_set():
-                    # The persistent watch owns authoritative updates while
-                    # connected.  Keep the connect-per-call path dormant so a
-                    # reconnect cannot duplicate snapshots or create polling
-                    # traffic in the browser-facing path.
+                    # A connected socket is only a transport signal.  Older
+                    # brokers (and quiet maintenance periods) can send
+                    # heartbeats without sending status snapshots, so retain
+                    # the bounded REST fallback until a recent authoritative
+                    # status frame has arrived.
                     try:
-                        await asyncio.wait_for(mutation_wakeup.wait(), timeout=15.0)
+                        await asyncio.wait_for(mutation_wakeup.wait(), timeout=watch_status_timeout)
                     except asyncio.TimeoutError:
-                        pass
-                    mutation_wakeup.clear()
-                    continue
+                        if last_watch_status and time.monotonic() - last_watch_status < watch_status_timeout:
+                            continue
+                    else:
+                        mutation_wakeup.clear()
+                        if last_watch_status and time.monotonic() - last_watch_status < watch_status_timeout:
+                            continue
                 result = await service.call("status-publisher", GetStatus(kind="get_status", refresh=True))
                 if isinstance(result, RpcSuccess):
                     consecutive_failures = 0
@@ -554,6 +560,7 @@ def create_app(
 
     async def publish_watch_loop() -> None:
         """Prefer the persistent Unix watch; the status loop remains fallback."""
+        nonlocal last_watch_status
         cursor = 0
         generation = 0
         while True:
@@ -581,8 +588,15 @@ def create_app(
                         )
                         if isinstance(result, RpcSuccess):
                             payload = result.result.model_dump(mode="json") if hasattr(result.result, "model_dump") else result.result
+                            last_watch_status = time.monotonic()
                             await stream_hub.publish("status", payload)
                         continue
+                    # Keep compatibility with a broker that predates the
+                    # snapshot event normalization in slotd_main.
+                    if kind == "get_status":
+                        kind = "status"
+                    if kind == "status":
+                        last_watch_status = time.monotonic()
                     await stream_hub.publish(kind, dict(frame["payload"]))
             except asyncio.CancelledError:
                 raise
@@ -590,6 +604,7 @@ def create_app(
                 # Connect-per-call status polling remains the bounded fallback;
                 # retrying the watch is deliberately visibility-independent.
                 watch_connected.clear()
+                last_watch_status = 0.0
                 await asyncio.sleep(1.0)
 
     @asynccontextmanager

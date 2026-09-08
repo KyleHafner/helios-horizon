@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import importlib.util
+import ipaddress
 import os
 import re
 import secrets
@@ -35,25 +36,11 @@ def _load_deployment_manifest():
 _DEPLOYMENT_MANIFEST = _load_deployment_manifest()
 _STATIC_SPECS = _DEPLOYMENT_MANIFEST.files
 ACTIVE_PROFILE_IDS = tuple(profile.id for profile in _DEPLOYMENT_MANIFEST.profiles)
-PROFILE_FILES = tuple(PACKAGE_ROOT / profile.profile_source for profile in _DEPLOYMENT_MANIFEST.profiles)
-RUNNER_FILES = tuple(PACKAGE_ROOT / profile.runner_source for profile in _DEPLOYMENT_MANIFEST.profiles)
 WEB_FILES = tuple(PACKAGE_ROOT / spec.source for spec in _STATIC_SPECS if spec.target.startswith("/opt/game-control/web/"))
-UNIT_FILES = tuple(PACKAGE_ROOT / spec.source for spec in _STATIC_SPECS if spec.target.startswith("/etc/systemd/system/") and "/" not in spec.target.removeprefix("/etc/systemd/system/" ) and not spec.target.endswith(".slice"))
-UNIT_DROPIN_FILES = tuple(PACKAGE_ROOT / spec.source for spec in _STATIC_SPECS if spec.target.startswith("/etc/systemd/system/") and "/" in spec.target.removeprefix("/etc/systemd/system/"))
-SLICE_FILES = tuple(PACKAGE_ROOT / spec.source for spec in _STATIC_SPECS if spec.target.startswith("/etc/systemd/system/") and spec.target.endswith(".slice"))
-TMPFILES = PACKAGE_ROOT / next(spec.source for spec in _STATIC_SPECS if spec.target == "/usr/lib/tmpfiles.d/game-control.conf")
-ROOT_CONFIG = PACKAGE_ROOT / next(spec.source for spec in _STATIC_SPECS if spec.target == "/etc/game-control/game-control.toml")
-LAZYMC_CONFIG = PACKAGE_ROOT / next(spec.source for spec in _STATIC_SPECS if spec.target == "/etc/game-control/lazymc/lazymc.toml")
-LAZYMC_SERVER_PROPERTIES = PACKAGE_ROOT / next(spec.source for spec in _STATIC_SPECS if spec.target == "/etc/game-control/lazymc/server.properties")
-NFTABLES_POLICY = PACKAGE_ROOT / next(spec.source for spec in _STATIC_SPECS if spec.target == "/etc/nftables.conf")
-JOURNAL_BASE = PACKAGE_ROOT / next(spec.source for spec in _STATIC_SPECS if spec.target == "/etc/systemd/journald@horizon.conf")
-JOURNAL_MEASUREMENT = PACKAGE_ROOT / next(spec.source for spec in _STATIC_SPECS if spec.target == "/usr/local/share/horizon/horizon-private-measurement.conf")
-RUNTIME_SOURCE_FILES = tuple(PACKAGE_ROOT / source for source in (*_DEPLOYMENT_MANIFEST.runtime_sources, "src/game_control/deployment_manifest.py"))
-RUNTIME_VERIFIER = PACKAGE_ROOT / "scripts/verify-deployed.py"
-RUNTIME_SUPPORT_FILES = tuple((PACKAGE_ROOT / spec.source, spec.source, spec.mode) for spec in _DEPLOYMENT_MANIFEST.runtime_support)
 RUNTIME_MANIFEST_PATH = _DEPLOYMENT_MANIFEST.runtime_manifest.target
 RUNTIME_MANIFEST_VERSION = _DEPLOYMENT_MANIFEST.runtime_manifest.version
 PUBLIC_ORIGIN_CONFIG = "/etc/game-control/public-origin.conf"
+ALERTMANAGER_CONFIG = "/etc/game-control/alertmanager.conf"
 GENERATED_ENTRY_POINT = _DEPLOYMENT_MANIFEST.generated_entry_point
 SUNLIT_LIBRARIES_LINK = _DEPLOYMENT_MANIFEST.symlinks[0].target
 SUNLIT_LIBRARIES_TARGET = _DEPLOYMENT_MANIFEST.symlinks[0].link_target
@@ -84,6 +71,7 @@ class Installer:
         skip_systemd_verify: bool = False,
         token_source: Path | None = None,
         public_origin: str | None = None,
+        alertmanager_url: str | None = None,
     ):
         self.root = root
         self.skip_systemd_verify = skip_systemd_verify
@@ -91,6 +79,7 @@ class Installer:
         # a coordinated test update. The VM package never reads this path.
         del token_source
         self.public_origin = public_origin
+        self.alertmanager_url = alertmanager_url
 
     def target(self, path: str | Path) -> Path:
         value = Path(path)
@@ -517,6 +506,8 @@ class Installer:
         problems.extend(self._runtime_manifest_problems())
         if self.root == Path("/") and not self._public_origin_valid():
             problems.append("public origin config is absent or invalid")
+        if self.root == Path("/") and not self._alertmanager_url_valid():
+            problems.append("alertmanager config is absent or invalid")
         secret = self.target(FIXED_B2_SECRET_PATH)
         try:
             secret_stat = secret.lstat()
@@ -654,6 +645,70 @@ class Installer:
             return False
         return bool(parsed.scheme == "https" and parsed.hostname and not parsed.username and not parsed.password and not parsed.path and not parsed.query and not parsed.fragment)
 
+    @staticmethod
+    def _valid_alertmanager_url(value: str) -> bool:
+        if not value or value != value.strip() or any(ord(char) < 33 or ord(char) > 126 or char.isspace() or char in "'\\\"" for char in value):
+            return False
+        try:
+            parsed = urlsplit(value)
+            parsed.port
+        except (TypeError, ValueError):
+            return False
+        hostname = (parsed.hostname or "").lower().rstrip(".")
+        # Documentation/test addresses and example names must never become a
+        # live notifier endpoint.
+        try:
+            address = ipaddress.ip_address(hostname)
+        except ValueError:
+            address = None
+        if address is not None and (address.is_reserved or address in ipaddress.ip_network("192.0.2.0/24") or address in ipaddress.ip_network("198.51.100.0/24") or address in ipaddress.ip_network("203.0.113.0/24") or address in ipaddress.ip_network("2001:db8::/32")):
+            return False
+        if hostname in {"example.com", "example.net", "example.org", "example.test", "invalid"} or hostname.endswith((".example", ".example.com", ".example.net", ".example.org", ".example.test", ".invalid")):
+            return False
+        return bool(parsed.scheme in {"http", "https"} and hostname and not parsed.username and not parsed.password and parsed.path == "/api/v2/alerts" and not parsed.query and not parsed.fragment)
+
+    def _alertmanager_url_valid(self) -> bool:
+        destination = self.target(ALERTMANAGER_CONFIG)
+        fd = None
+        try:
+            fd = os.open(destination, os.O_RDONLY | os.O_NONBLOCK | getattr(os, "O_NOFOLLOW", 0))
+            info = os.fstat(fd)
+            if not (stat.S_ISREG(info.st_mode) and info.st_nlink == 1 and info.st_uid == 0 and stat.S_IMODE(info.st_mode) == 0o600 and info.st_size <= 4096):
+                return False
+            raw = os.read(fd, 4097).decode("ascii")
+        except (OSError, UnicodeError):
+            return False
+        finally:
+            if fd is not None:
+                os.close(fd)
+        lines = raw.splitlines()
+        value = lines[0].partition("=")[2] if len(lines) == 1 and lines[0].startswith("HORIZON_ALERTMANAGER_URL=") else ""
+        return self._valid_alertmanager_url(value)
+
+    def _ensure_alertmanager_config(self) -> None:
+        destination = self.target(ALERTMANAGER_CONFIG)
+        if self.alertmanager_url is not None:
+            if not self._valid_alertmanager_url(self.alertmanager_url):
+                raise RuntimeError("alertmanager URL must be an explicit API endpoint")
+            self._ensure_directory_chain(destination.parent, "alertmanager config parent")
+            fd, temporary = tempfile.mkstemp(prefix=f".{destination.name}.", dir=destination.parent)
+            temporary_path = Path(temporary)
+            try:
+                with os.fdopen(fd, "w", encoding="ascii") as stream:
+                    stream.write(f"HORIZON_ALERTMANAGER_URL={self.alertmanager_url}\n")
+                    stream.flush()
+                    os.fsync(stream.fileno())
+                os.chmod(temporary_path, 0o600)
+                self._chown(temporary_path, "root", "root")
+                os.replace(temporary_path, destination)
+            finally:
+                temporary_path.unlink(missing_ok=True)
+            return
+        if self.root != Path("/"):
+            return
+        if not self._alertmanager_url_valid():
+            raise RuntimeError("alertmanager config is absent or invalid; pass --alertmanager-url or install the private overlay")
+
     def _ensure_public_origin(self) -> None:
         destination = self.target(PUBLIC_ORIGIN_CONFIG)
         if self.public_origin is not None:
@@ -789,10 +844,14 @@ class Installer:
     def apply(self) -> None:
         expected_files = self.expected_files()
         runtime_files = self.runtime_files()
+        if self.alertmanager_url is not None and not self._valid_alertmanager_url(self.alertmanager_url):
+            raise RuntimeError("alertmanager URL must be an explicit API endpoint")
         if self.public_origin is not None and not self._valid_public_origin(self.public_origin):
             raise RuntimeError("public origin must be an explicit HTTPS origin")
         if self.root == Path("/") and self.public_origin is None and not self._public_origin_valid():
             raise RuntimeError("public origin config is absent or invalid; pass --public-origin or install the private overlay")
+        if self.root == Path("/") and self.alertmanager_url is None and not self._alertmanager_url_valid():
+            raise RuntimeError("alertmanager config is absent or invalid; pass --alertmanager-url or install the private overlay")
         self._preflight_install(expected_files, runtime_files)
         self._accounts()
         for path, mode, user, group in self.directories():
@@ -802,6 +861,7 @@ class Installer:
             self._ensure_runtime_parent(destination.parent)
         self._ensure_generated_rcon_secret()
         self._ensure_public_origin()
+        self._ensure_alertmanager_config()
         for destination, target in self.expected_links().items():
             self._create_link(destination, target)
         for profile, user in (
@@ -864,11 +924,12 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--root", type=Path, default=None, help=argparse.SUPPRESS)
     parser.add_argument("--skip-systemd-verify", action="store_true", help=argparse.SUPPRESS)
     parser.add_argument("--public-origin", help="write the root-controlled HTTPS browser origin overlay")
+    parser.add_argument("--alertmanager-url", help="write the root-controlled Alertmanager API endpoint overlay")
     args = parser.parse_args(argv)
     if args.check == args.apply:
         parser.error("choose exactly one of --check or --apply")
     root = args.root or Path(os.environ.get("GAME_CONTROL_INSTALL_ROOT", "/"))
-    installer = Installer(root, skip_systemd_verify=args.skip_systemd_verify, public_origin=args.public_origin)
+    installer = Installer(root, skip_systemd_verify=args.skip_systemd_verify, public_origin=args.public_origin, alertmanager_url=args.alertmanager_url)
     if args.check:
         drift = installer.drift()
         if drift:
