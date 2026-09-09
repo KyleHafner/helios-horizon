@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import math
 import time
 from dataclasses import dataclass
 from typing import Any, Callable
@@ -43,6 +44,8 @@ def normalize_process_cpu_percent(raw_percent: float, logical_cpu_count: int) ->
     count = logical_cpu_count
     if isinstance(count, bool) or not isinstance(count, int) or count <= 0:
         raise ValueError("logical CPU count must be a positive integer")
+    if isinstance(raw_percent, bool):
+        raise ValueError("process CPU percent must be numeric")
     value = float(raw_percent)
     if value != value or value in (float("inf"), float("-inf")) or value < 0:
         raise ValueError("process CPU percent must be finite and non-negative")
@@ -146,11 +149,68 @@ def _collect_event_loop_values(loop: Any, sequence: Any, cursor: int | None):
     return _collect_sequence_values(loop, sequence, cursor, label="event-loop")
 
 
+def _sample_phase(status: Any) -> str:
+    """Classify one sampled status endpoint without retaining profile identity."""
+    if not isinstance(status, dict) or not isinstance(status.get("profiles"), list):
+        return "unknown"
+    if status.get("initializing") is True:
+        return "transition"
+    phases: list[str] = []
+    active_count = 0
+    for profile in status["profiles"]:
+        if not isinstance(profile, dict):
+            phases.append("unknown")
+            continue
+        state = profile.get("state")
+        if state == "stopped":
+            phases.append("stopped")
+            continue
+        if state == "starting":
+            phases.append("startup")
+            continue
+        if state in {"initializing", "stopping", "switching"}:
+            phases.append("transition")
+            continue
+        if state != "running":
+            phases.append("unknown")
+            continue
+        active_count += 1
+        ports_ready = profile.get("required_ports_ready") is True
+        healthy = profile.get("health") in {"healthy", "ok", "ready"}
+        players = profile.get("players_online")
+        if isinstance(players, bool) or not isinstance(players, int) or players < 0:
+            phases.append("unknown")
+        elif not healthy or not ports_ready:
+            phases.append("startup")
+        elif players > 0:
+            phases.append("gameplay")
+        else:
+            phases.append("ready-empty")
+    if not phases:
+        return "unknown"
+    if active_count > 1:
+        return "unknown"
+    # An active owner wins over blocked/unknown profiles. This is an
+    # aggregate endpoint snapshot, not a claim that the phase was continuous.
+    for phase in ("gameplay", "ready-empty", "transition", "startup"):
+        if phase in phases:
+            return phase
+    if all(phase == "stopped" for phase in phases):
+        return "stopped"
+    return "unknown"
+
+
 def collect(config: CollectorConfig, *, opener: Callable[..., Any] = urlopen) -> dict[str, Any]:
     """Collect only GET observations; no lifecycle or mutation route is callable."""
-    if config.duration_seconds <= 0 or config.duration_seconds > 3600:
+    if (not isinstance(config.duration_seconds, (int, float))
+            or isinstance(config.duration_seconds, bool)
+            or not math.isfinite(float(config.duration_seconds))
+            or config.duration_seconds <= 0 or config.duration_seconds > 3600):
         raise ValueError("duration must be between 0 and 3600 seconds")
-    if config.interval_seconds <= 0 or config.interval_seconds > 60:
+    if (not isinstance(config.interval_seconds, (int, float))
+            or isinstance(config.interval_seconds, bool)
+            or not math.isfinite(float(config.interval_seconds))
+            or config.interval_seconds <= 0 or config.interval_seconds > 60):
         raise ValueError("interval must be between 0 and 60 seconds")
     _validate_base_url(config.base_url)
     collection_started = time.monotonic()
@@ -170,8 +230,14 @@ def collect(config: CollectorConfig, *, opener: Callable[..., Any] = urlopen) ->
     maintenance_values: list[float] = []
     maintenance_observations: list[dict[str, float | int]] = []
     maintenance_cursor: int | None = None
+    cpu_observations: list[dict[str, str | float]] = []
+    cpu_warmup_observations: list[dict[str, str | float]] = []
     processes: dict[str, Any] = {}
     process_baselines: dict[str, tuple[int, str]] = {}
+    cpu_interval_starts: dict[str, float] = {}
+    cpu_warmup_pending = False
+    phase_snapshots: list[dict[str, str | float]] = []
+    previous_sample_phase = "unknown"
     identity_requested = any(isinstance(pid, int) and pid > 0
                              for pid in (config.slotd_pid, config.web_pid))
     process_identity_valid = not identity_requested
@@ -192,6 +258,12 @@ def collect(config: CollectorConfig, *, opener: Callable[..., Any] = urlopen) ->
                 process_baselines[label] = validate_process_identity(pid, cgroup)
                 processes[label] = psutil.Process(pid)
                 processes[label].cpu_percent(None)
+                # psutil's first non-blocking reading is the delta since this
+                # priming call. Keep its real interval separate from steady
+                # observations; it is usually much shorter than the probe
+                # cadence.
+                cpu_interval_starts[label] = time.monotonic()
+                cpu_warmup_pending = True
             process_identity_valid = bool(process_baselines) and len(process_baselines) == sum(
                 1 for pid in (config.slotd_pid, config.web_pid) if isinstance(pid, int) and pid > 0)
         if logical_cpu_count is not None:
@@ -207,14 +279,44 @@ def collect(config: CollectorConfig, *, opener: Callable[..., Any] = urlopen) ->
         processes = {}
         process_identity_valid = False if identity_requested else process_identity_valid
         process_identity_error = identity_requested
+    def reset_cpu_interval(*, clear_observations: bool = False) -> None:
+        """Discard the incomplete delta and re-prime every live process."""
+        nonlocal cpu_warmup_pending, process_identity_valid, process_identity_error, previous_sample_phase
+        previous_sample_phase = "unknown"
+        if clear_observations:
+            slotd_cpu.clear()
+            web_cpu.clear()
+            cpu_observations.clear()
+            cpu_warmup_observations.clear()
+        if not processes:
+            return
+        try:
+            for label, process in processes.items():
+                process.cpu_percent(None)
+                cpu_interval_starts[label] = time.monotonic()
+            cpu_warmup_pending = True
+        except Exception:
+            process_identity_valid = False
+            process_identity_error = True
+            processes.clear()
+            slotd_cpu.clear()
+            web_cpu.clear()
+            cpu_observations.clear()
+            cpu_warmup_observations.clear()
+
     while time.monotonic() < deadline and samples < 1200:
         try:
             sample_started = time.monotonic()
             latency, status = _get_json(config, "/api/v1/status", opener)
             _, perf = _get_json(config, "/api/v1/perf", opener)
+            phase = _sample_phase(status)
+            interval_phase = (phase if not cpu_warmup_pending and previous_sample_phase == phase
+                              and phase != "unknown" else "transition")
             pending_event_loop: list[float] = []
             pending_maintenance: list[float] = []
             pending_observations: list[dict[str, float | int]] = []
+            pending_cpu_observations: list[dict[str, str | float]] = []
+            pending_cpu_warmup: list[dict[str, str | float]] = []
             pending_slotd_cpu: list[float] = []
             pending_web_cpu: list[float] = []
             pending_event_cursor = event_loop_cursor
@@ -242,12 +344,9 @@ def collect(config: CollectorConfig, *, opener: Callable[..., Any] = urlopen) ->
                          "sample_offset_ms": offset_ms}
                         for index, value in enumerate(unseen)
                     )
-            # The perf endpoint is authoritative for route timing; use its
-            # p95 values when present and keep CPU coverage explicit otherwise.
-            for value in perf.get("slotd", {}).get("cpu_percent", []):
-                pending_slotd_cpu.append(float(value))
-            for value in perf.get("web", {}).get("cpu_percent", []):
-                pending_web_cpu.append(float(value))
+            # CPU is sourced only from identity-pinned psutil processes. API
+            # CPU arrays are deliberately ignored: accepting both sources
+            # would mix incomparable intervals and inflate sample counts.
             if process_identity_error:
                 slotd_cpu.clear()
                 web_cpu.clear()
@@ -262,9 +361,22 @@ def collect(config: CollectorConfig, *, opener: Callable[..., Any] = urlopen) ->
                         if ((observed_start, observed_cgroup)
                                 != (baseline_start, baseline_cgroup)):
                             raise ValueError(f"{label} process identity changed")
-                        pending_samples = pending_slotd_cpu if label == "slotd" else pending_web_cpu
-                        pending_samples.append(normalize_process_cpu_percent(
-                            processes[label].cpu_percent(None), cpu_normalization["logicalCpuCount"]))
+                        value = normalize_process_cpu_percent(
+                            processes[label].cpu_percent(None), cpu_normalization["logicalCpuCount"])
+                        end = time.monotonic()
+                        start = cpu_interval_starts[label]
+                        observation = {
+                            "process": label, "cpu_percent": value,
+                            "start_monotonic": start, "end_monotonic": end,
+                            "duration_seconds": end - start,
+                            "phase": "unknown" if cpu_warmup_pending else interval_phase,
+                        }
+                        if end < start or observation["duration_seconds"] <= 0:
+                            raise ValueError(f"{label} CPU interval is invalid")
+                        (pending_cpu_warmup if cpu_warmup_pending else pending_cpu_observations).append(observation)
+                        if not cpu_warmup_pending:
+                            (pending_slotd_cpu if label == "slotd" else pending_web_cpu).append(value)
+                        cpu_interval_starts[label] = end
                 except Exception:
                     # A vanished or reused PID invalidates the whole process
                     # CPU series; leave it uncovered rather than using stale
@@ -272,8 +384,7 @@ def collect(config: CollectorConfig, *, opener: Callable[..., Any] = urlopen) ->
                     process_identity_valid = False
                     process_identity_error = True
                     processes.clear()
-                    slotd_cpu.clear()
-                    web_cpu.clear()
+                    reset_cpu_interval(clear_observations=True)
                     errors += 1
                     raise RuntimeError("process sample invalid")
             # One bounded subscription per run. A real browser/session
@@ -290,6 +401,15 @@ def collect(config: CollectorConfig, *, opener: Callable[..., Any] = urlopen) ->
             maintenance_values.extend(pending_maintenance)
             maintenance_cursor = pending_maintenance_cursor
             maintenance_observations.extend(pending_observations)
+            cpu_warmup_observations.extend(pending_cpu_warmup)
+            cpu_observations.extend(pending_cpu_observations)
+            if cpu_warmup_pending and pending_cpu_warmup:
+                cpu_warmup_pending = False
+            previous_sample_phase = phase
+            phase_snapshots.append({
+                "phase": phase,
+                "sample_offset_ms": (sample_started - collection_started) * 1000.0,
+            })
             slotd_cpu.extend(pending_slotd_cpu)
             web_cpu.extend(pending_web_cpu)
             if config.include_sample_timing:
@@ -304,14 +424,23 @@ def collect(config: CollectorConfig, *, opener: Callable[..., Any] = urlopen) ->
                 maintenance_contract_error = True
                 maintenance_values.clear()
             errors += 1
+            reset_cpu_interval()
         except Exception:
             errors += 1
+            # Do not let a failed status/perf/sequence contract bridge two
+            # classified phases in the next CPU interval. Re-prime psutil;
+            # the discarded delta remains uncovered rather than being labeled
+            # as steady state.
+            reset_cpu_interval()
         time.sleep(min(config.interval_seconds, max(0.0, deadline - time.monotonic())))
     result = {
         "status_ui_latency_ms": [],
         "status_rtt_proxy_ms": latencies,
         "slotd_cpu_percent": slotd_cpu,
         "web_cpu_percent": web_cpu,
+        "cpu_observations": cpu_observations,
+        "cpu_warmup_observations": cpu_warmup_observations,
+        "phase_snapshots": phase_snapshots,
         "event_loop_stall_ms": event_loop,
         "reconnects": None,
         "connection_attempts": None,

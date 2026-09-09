@@ -298,7 +298,9 @@ const fs = require('fs'), vm = require('vm');
 const input = JSON.parse(fs.readFileSync(0, 'utf8'));
 const source = fs.readFileSync(input.file, 'utf8');
 const start = source.indexOf('async function api(');
-const apiSource = source.slice(start, source.indexOf('\nasync function load()', start));
+const end = source.indexOf('\nasync function loadOnce()', start);
+if (end < start) throw new Error('API extraction boundary missing');
+const apiSource = source.slice(start, end);
 const storage = new Map(), keys = [];
 const context = {Headers, Response, state:{csrf:'synthetic'}, sessionExpired:false,
   sessionGeneration:1, SESSION_EXPIRED_MESSAGE:'expired',

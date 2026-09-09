@@ -22,6 +22,7 @@ from .rcon import (
     RconError,
     _packet,
     _read_packet,
+    _read_packet_until,
     _read_password,
 )
 
@@ -32,8 +33,9 @@ RCON_TELEMETRY_BACKOFF_INITIAL = 0.1
 RCON_TELEMETRY_BACKOFF_MAX = 2.0
 
 _PLAYER_COUNT = re.compile(r"^There are (\d{1,6}) of a max of (\d{1,6}) players online(?::.*)?$")
-_TPS = re.compile(r"(?:Mean TPS|TPS)\s*:\s*(\d{1,3}(?:\.\d{1,3})?)", re.IGNORECASE)
-_MSPT = re.compile(r"(?:Mean tick time|MSPT)\s*:\s*(\d{1,6}(?:\.\d{1,3})?)", re.IGNORECASE)
+_TPS = re.compile(r"(?:Mean TPS|TPS)\s*:\s*(\d+(?:\.\d+)?)(?![\d.eE])", re.IGNORECASE)
+_MSPT = re.compile(r"(?:Mean tick time|MSPT)\s*:\s*(\d+(?:\.\d+)?)(?![\d.eE])", re.IGNORECASE)
+_OVERALL = re.compile(r"\bOverall\s*:", re.IGNORECASE)
 
 
 class TelemetryCommand(str, Enum):
@@ -220,6 +222,15 @@ class PersistentRconTelemetry:
                     if code is TelemetryErrorCode.RESPONSE_LIMIT:
                         self._response_limit_failures += 1
                     await self._disconnect_locked()
+                    # These failures are deterministic protocol/configuration
+                    # failures. Retrying them only creates needless connection
+                    # churn; the next scheduled sample can probe again.
+                    if code in {
+                        TelemetryErrorCode.AUTHENTICATION,
+                        TelemetryErrorCode.INVALID_RESPONSE,
+                        TelemetryErrorCode.RESPONSE_LIMIT,
+                    }:
+                        break
                     if attempt + 1 < self.max_attempts:
                         self._reconnects += 1
                         delay = RCON_TELEMETRY_BACKOFF_INITIAL * (2**attempt)
@@ -243,7 +254,13 @@ class PersistentRconTelemetry:
             auth_id = self._next_id()
             writer.write(_packet(auth_id, RCON_SERVERDATA_AUTH, password))
             await asyncio.wait_for(writer.drain(), self.timeout)
-            response_id, response_type, _ = await asyncio.wait_for(_read_packet(reader), self.timeout)
+            deadline = asyncio.get_running_loop().time() + self.timeout
+            response_id, response_type, payload = await _read_packet_until(reader, deadline)
+            # Some RCON implementations emit an empty response-value frame
+            # before the authentication response. Consume that framing packet
+            # so it cannot poison the first persistent command.
+            if response_id in {-1, auth_id} and response_type == RCON_SERVERDATA_RESPONSE_VALUE and not payload:
+                response_id, response_type, _ = await _read_packet_until(reader, deadline)
             if response_type != RCON_SERVERDATA_AUTH_RESPONSE or response_id != auth_id:
                 raise RconError("RCON telemetry authentication failed")
             self._reader, self._writer = reader, writer
@@ -301,7 +318,7 @@ async def _close_writer(writer: Any) -> None:
 
 
 def _wire_command(command: TelemetryCommand) -> str:
-    return "list" if command is TelemetryCommand.PLAYER_COUNT else "tps"
+    return "list" if command is TelemetryCommand.PLAYER_COUNT else "forge tps"
 
 
 def _sanitize_result(command: TelemetryCommand, raw: str) -> TelemetryResult:
@@ -314,21 +331,39 @@ def _sanitize_result(command: TelemetryCommand, raw: str) -> TelemetryResult:
             raise RconError("RCON telemetry response was invalid")
         return PlayerCountResult(online, maximum)
     if command is TelemetryCommand.PERFORMANCE:
-        tps_match, mspt_match = _TPS.search(raw), _MSPT.search(raw)
+        scoped = _performance_scope(raw)
+        tps_match, mspt_match = _TPS.search(scoped), _MSPT.search(scoped)
         if tps_match is None or mspt_match is None:
             raise RconError("RCON telemetry response was invalid")
         tps, mspt = float(tps_match.group(1)), float(mspt_match.group(1))
         if not 0 <= tps <= 1000 or not 0 <= mspt <= 1_000_000:
             raise RconError("RCON telemetry response was invalid")
         return PerformanceResult(tps=tps, mspt=mspt)
+    scoped = _performance_scope(raw)
     pattern = _TPS if command is TelemetryCommand.TPS else _MSPT
-    match = pattern.search(raw)
+    match = pattern.search(scoped)
     if match is None:
         raise RconError("RCON telemetry response was invalid")
     value = float(match.group(1))
     if not math.isfinite(value) or value < 0 or (command is TelemetryCommand.TPS and value > 1000) or value > 1_000_000:
         raise RconError("RCON telemetry response was invalid")
     return PerformanceResult(tps=value if command is TelemetryCommand.TPS else None, mspt=value if command is TelemetryCommand.MSPT else None)
+
+
+def _performance_scope(raw: str) -> str:
+    """Select Forge's aggregate section, refusing ambiguous dimensions."""
+    markers = list(_OVERALL.finditer(raw))
+    if len(markers) > 1:
+        raise RconError("RCON telemetry response was invalid")
+    overall = markers[0] if markers else None
+    if overall is not None:
+        scoped = raw[overall.end():]
+        if len(_TPS.findall(scoped)) > 1 or len(_MSPT.findall(scoped)) > 1:
+            raise RconError("RCON telemetry response was invalid")
+        return scoped
+    if len(_TPS.findall(raw)) <= 1 and len(_MSPT.findall(raw)) <= 1 and (_TPS.search(raw) or _MSPT.search(raw)):
+        return raw
+    raise RconError("RCON telemetry response was invalid")
 
 
 def _error_code(error: Exception | None) -> TelemetryErrorCode:

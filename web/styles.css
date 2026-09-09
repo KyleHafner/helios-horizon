@@ -180,11 +180,11 @@ h3 { font-size: 1rem; font-weight: 650; line-height: 1.2; }
 .active-manage { width: fit-content; min-height: 34px; color: var(--ink); font-size: .78rem; font-weight: 650; }
 .active-manage[hidden] { display: none; }
 .session-runway { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); margin: var(--sp-2) 0 0; padding: 0; list-style: none; }
-.session-runway li { position: relative; display: grid; grid-template-columns: 18px minmax(0, 1fr); gap: 1px var(--sp-2); min-width: 0; color: var(--muted); }
+.session-runway li { position: relative; display: grid; grid-template-columns: minmax(0, 1fr); grid-template-rows: 17px auto auto; gap: 5px; min-width: 0; color: var(--muted); }
 .session-runway li::after { position: absolute; z-index: 0; top: 8px; left: 18px; width: calc(100% - 18px); height: 1px; background: var(--line); content: ""; }
 .session-runway li:last-child::after { display: none; }
-.runway-mark { z-index: 1; grid-row: 1 / span 2; width: 17px; height: 17px; border: 1px solid var(--line); background: var(--panel); }
-.session-runway strong { overflow: hidden; color: var(--ink); font: 700 .68rem/1.2 ui-monospace, SFMono-Regular, Menlo, monospace; letter-spacing: .06em; text-overflow: ellipsis; text-transform: uppercase; white-space: nowrap; }
+.runway-mark { z-index: 1; grid-row: 1; width: 17px; height: 17px; border: 1px solid var(--line); background: var(--panel); }
+.session-runway strong { min-width: 0; overflow: visible; color: var(--ink); font: 700 .68rem/1.2 ui-monospace, SFMono-Regular, Menlo, monospace; letter-spacing: .06em; text-transform: uppercase; white-space: normal; }
 .session-runway small { color: var(--muted); font-size: .72rem; }
 .session-runway li[data-state="complete"] .runway-mark { border-color: var(--accent-deep); background: var(--accent); box-shadow: inset 0 0 0 4px var(--panel); }
 .session-runway li[data-state="complete"]::after { background: var(--accent-deep); }
@@ -356,7 +356,7 @@ dd { margin: 4px 0 0; font-weight: 700; }
 .rail-stat strong { font-size: 1.1rem; }
 .rail-stat p { margin: 0; color: var(--muted); font-size: .76rem; line-height: 1.5; }
 .rail-stat svg { width: 100%; height: 32px; overflow: visible; }
-.metric-chart svg { width: 100%; height: 110px; overflow: visible; }
+.metric-chart svg { width: 100%; height: auto; overflow: visible; }
 .rail-stat polyline, .metric-chart polyline { fill: none; stroke: #9fb0b8; stroke-linecap: round; stroke-linejoin: round; stroke-width: 2; }
 .metric-chart .chart-axis { stroke: var(--line); stroke-width: 1; }
 .metric-chart text { fill: var(--muted); font-size: 9px; }
@@ -366,6 +366,12 @@ dd { margin: 4px 0 0; font-weight: 700; }
 .metric-chart strong { color: var(--ink); font: 700 1.15rem ui-monospace, monospace; }
 .metric-chart p, .detail-footer { margin: 0; color: var(--muted); font-size: .76rem; }
 .metric-chart p { line-height: 1.5; }
+.metric-chart .metric-capacity { min-height: 1.2em; }
+.metric-chart svg { min-width: 0; }
+.metric-chart .chart-dot { fill: var(--accent); }
+.capacity-track { width: 100%; height: 5px; margin: 8px 0; border: 0; background: var(--raised); overflow: hidden; }
+.capacity-track > i { display: block; width: 0; height: 100%; background: var(--accent); }
+.metrics-run-note { margin: 0 0 var(--sp-4); color: var(--muted); font-size: .8rem; }
 .stats-panel { display: grid; gap: var(--sp-6); }
 .stats-heading, .stats-block-heading { display: flex; align-items: end; justify-content: space-between; gap: var(--sp-4); }
 .stats-heading h2 { margin-top: 6px; }
@@ -536,9 +542,10 @@ dd { margin: 4px 0 0; font-weight: 700; }
   .session-primary-actions { display: grid; grid-template-columns: 1fr auto; }
   .session-primary { min-width: 0; }
   .session-runway { grid-template-columns: 1fr; gap: var(--sp-2); }
-  .session-runway li { grid-template-columns: 18px minmax(0, 1fr) auto; align-items: center; }
+  .session-runway li { grid-template-columns: 18px minmax(0, 1fr); grid-template-rows: auto auto; column-gap: var(--sp-2); align-items: start; }
+  .session-runway .runway-mark { grid-row: 1 / span 2; }
   .session-runway li::after { top: 17px; left: 8px; width: 1px; height: calc(100% + var(--sp-2)); }
-  .session-runway small { grid-column: 3; grid-row: 1; }
+  .session-runway small { grid-column: 2 / -1; grid-row: 2; overflow-wrap: anywhere; }
   .session-facts { display: grid; align-items: start; gap: var(--sp-4); }
   .slot-metrics { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); justify-content: start; gap: var(--sp-3); }
   .session-shortcuts { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); }

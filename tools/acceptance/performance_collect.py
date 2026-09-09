@@ -9,6 +9,7 @@ ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT / "src"))
 sys.path.insert(0, str(ROOT))
 from tools.acceptance.performance_probe import MAX_BODY, CollectorConfig, collect  # noqa: E402
+from tools.acceptance.cpu_phase_report import summarize_cpu_phases  # noqa: E402
 from tools.acceptance.performance_thresholds import evaluate_thresholds, samples_from_mapping  # noqa: E402
 
 
@@ -187,8 +188,21 @@ def main() -> int:
         inputs.update(mapped)
     else:
         browser_checks = {}
+    collector_metadata = inputs.get("collector", {})
+    cpu_normalization = collector_metadata.get("cpuNormalization") if isinstance(collector_metadata, dict) else None
+    cpu_phase_input = {
+        "cpu_observations": inputs.get("cpu_observations", []),
+        "cpu_warmup_observations": inputs.get("cpu_warmup_observations", []),
+        "process_identity": collector_metadata.get("processIdentity") if isinstance(collector_metadata, dict) else None,
+    }
+    if cpu_normalization is not None:
+        # The reporter validates this allowlisted metadata independently; no
+        # process IDs, cgroups, or raw telemetry enter the additive summary.
+        cpu_phase_input["cpu_normalization"] = cpu_normalization
+    cpu_phase_summary = summarize_cpu_phases(cpu_phase_input)
     report = evaluate_thresholds(samples_from_mapping(inputs))
     report["browserChecks"] = browser_checks
+    report["cpuPhaseSummary"] = cpu_phase_summary
     report["inputs"] = inputs
     report["evidenceHashes"] = {
         "collectorInputs": hashlib.sha256(json.dumps(inputs, sort_keys=True).encode()).hexdigest(),

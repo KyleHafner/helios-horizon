@@ -50,11 +50,13 @@ const state = {
   logs: new Map(),
   cpuSamples: new Map(),
   metricSamples: new Map(),
+  metricHistory: new Map(),
+  metricCapacity: new Map(),
   schedules: null,
   incidents: { items: [], loaded: false },
   benchmarks: new Map(),
   session: { profileId: null, latestBackup: null, backupState: "loading", operation: null },
-  detail: { id: null, tab: "console", backups: [], statsTimer: null, statsRequest: 0, statsAbort: null, benchmarkTimer: null, benchmarkCursor: null, benchmarkRuns: [], statsBaseLoaded: false, commandCatalogKey: null },
+  detail: { id: null, tab: "console", backups: [], statsTimer: null, statsRequest: 0, statsAbort: null, metricTimer: null, metricRequest: 0, metricAbort: null, benchmarkTimer: null, benchmarkCursor: null, benchmarkRuns: [], statsBaseLoaded: false, commandCatalogKey: null, configRequest: 0 },
   statsCache: new Map(),
   configRestartRequired: new Map(),
   lastGeneration: 0,
@@ -69,9 +71,15 @@ let sessionExpired = false;
 let sessionNoticeShown = false;
 let sessionExpiryCount = 0;
 let sessionGeneration = 0;
+let loadRetryTimer = null;
+let loadPromise = null;
+let loadFailureNotice = null;
 let testApiResponseDelay = 0;
 const SESSION_EXPIRED_MESSAGE = "Session expired. Redirecting to sign in.";
 const SESSION_REDIRECT_KEY = "horizon-session-redirected";
+const SESSION_BOOTSTRAP_DELAYS = [0, 250, 1000];
+const SESSION_BOOTSTRAP_TIMEOUT_MS = 4000;
+const SESSION_BOOTSTRAP_DEADLINE_MS = 7000;
 const stream = { source: null, lastEventAt: 0, lastEventId: null, retryMs: 3000, watchdog: null, pollTimer: null, reconnectTimer: null, reconnectStartedAt: null, suspended: false };
 let reconnectJitter = () => Math.random() * 1000;
 const MAX_STREAM_CURSOR = 9007199254740991n;
@@ -79,6 +87,13 @@ const canonicalStreamCursor = (raw) => {
   if (typeof raw !== "string" || raw.length === 0 || raw.length > 16 || !/^(0|[1-9][0-9]*)$/.test(raw)) return null;
   try { const value = BigInt(raw); return value <= MAX_STREAM_CURSOR ? raw : null; } catch { return null; }
 };
+function startOperationStorageKey(profileId) {
+  return `horizon-operation:POST:/api/v1/profiles/${encodeURIComponent(profileId)}/start:{}`;
+}
+
+function retireResolvedStartKey(profileId) {
+  try { sessionStorage.removeItem(startOperationStorageKey(profileId)); } catch {}
+}
 const recordStreamCursor = (source, event) => {
   if (stream.suspended || stream.source !== source) return;
   const cursor = canonicalStreamCursor(event?.lastEventId);
@@ -275,25 +290,96 @@ function expireSession() {
   if (!redirected && !window.__HORIZON_TEST__?.preventNavigation) window.setTimeout(() => window.location.assign("/"), 0);
 }
 
+function clearLoadRetry() {
+  if (loadRetryTimer) { window.clearTimeout(loadRetryTimer); loadRetryTimer = null; }
+}
+
+function scheduleLoadRetry() {
+  if (loadRetryTimer || sessionExpired || !pageVisible()) return;
+  loadRetryTimer = window.setTimeout(() => {
+    loadRetryTimer = null;
+    if (!pageVisible()) { scheduleLoadRetry(); return; }
+    void load().finally(route);
+  }, 5000);
+}
+
+async function fetchSessionBootstrap() {
+  let lastError = null;
+  let sawAuthRejection = false;
+  let sawTransientFailure = false;
+  const deadline = Date.now() + SESSION_BOOTSTRAP_DEADLINE_MS;
+  for (let attempt = 0; attempt < SESSION_BOOTSTRAP_DELAYS.length; attempt += 1) {
+    if (SESSION_BOOTSTRAP_DELAYS[attempt]) {
+      await new Promise((resolve) => setTimeout(resolve, Math.min(SESSION_BOOTSTRAP_DELAYS[attempt], Math.max(0, deadline - Date.now()))));
+    }
+    if (Date.now() >= deadline) break;
+    const controller = new AbortController();
+    const timer = window.setTimeout(() => controller.abort(), Math.min(SESSION_BOOTSTRAP_TIMEOUT_MS, Math.max(1, deadline - Date.now())));
+    try {
+      const response = await fetch("/api/v1/session", {
+        credentials: "same-origin",
+        cache: "no-store",
+        headers: { Accept: "application/json" },
+        redirect: "manual",
+        signal: controller.signal,
+      });
+      if (response.type === "opaqueredirect") { sawAuthRejection = true; lastError = new Error("Session redirect received."); continue; }
+      if (response.ok) {
+        // Fetch's timeout does not cover response.json(): a server can send
+        // headers and then leave the body open forever. Race body parsing with
+        // the same bounded attempt deadline and abort the transport too.
+        const remaining = Math.max(1, deadline - Date.now());
+        let bodyTimer;
+        try {
+          const bodyRead = response.json();
+          const bodyTimeout = new Promise((_, reject) => {
+            bodyTimer = window.setTimeout(() => {
+              controller.abort();
+              reject(new Error("Session bootstrap response timed out."));
+            }, remaining);
+          });
+          const body = await Promise.race([bodyRead, bodyTimeout]);
+          if (!body || typeof body !== "object" || typeof body.csrf_token !== "string") throw new Error("Invalid session bootstrap.");
+          return body;
+        } finally {
+          if (bodyTimer) window.clearTimeout(bodyTimer);
+        }
+      }
+      lastError = new Error(`Session bootstrap failed (${response.status}).`);
+      if ([401, 403].includes(response.status)) sawAuthRejection = true;
+      else if ([408, 429, 502, 503, 504].includes(response.status)) sawTransientFailure = true;
+      if (![401, 403, 502, 503, 504].includes(response.status)) break;
+    } catch (error) {
+      lastError = error;
+      sawTransientFailure = true;
+    } finally {
+      window.clearTimeout(timer);
+    }
+  }
+  const failure = lastError || new Error("Session bootstrap failed.");
+  // A network/timeout or gateway result mixed with an auth response is
+  // recoverable: only an all-auth exhaustion is terminal.
+  failure.authRejected = sawAuthRejection && !sawTransientFailure;
+  throw failure;
+}
+
 function refreshSession() {
   if (sessionExpired) return Promise.reject(new Error(SESSION_EXPIRED_MESSAGE));
   if (sessionRefreshPromise) return sessionRefreshPromise;
-  sessionRefreshPromise = fetch("/api/v1/session", {
-    credentials: "same-origin",
-    headers: { Accept: "application/json" },
-    redirect: "manual",
-  }).then(async (session) => {
-    if (session.type === "opaqueredirect" || session.status === 401) {
-      expireSession();
-      throw new Error(SESSION_EXPIRED_MESSAGE);
-    }
-    if (!session.ok) throw new Error("Session refresh failed.");
-    const body = await session.json();
+  sessionRefreshPromise = fetchSessionBootstrap().then((body) => {
+    state.actor = body.actor || state.actor;
     state.csrf = body.csrf_token || state.csrf;
     sessionGeneration += 1;
-    try { sessionStorage.removeItem(SESSION_REDIRECT_KEY); } catch {}
     reauthenticating = false;
     return body;
+  }).catch((error) => {
+    // A genuine exhausted auth rejection is terminal. Gateway/network failure
+    // remains recoverable by the bounded retry and online/focus/load timer.
+    if (error?.authRejected) {
+      expireSession();
+      throw new Error(SESSION_EXPIRED_MESSAGE, { cause: error });
+    }
+    throw error;
   }).finally(() => { sessionRefreshPromise = null; });
   return sessionRefreshPromise;
 }
@@ -671,7 +757,7 @@ async function loadSessionBackup(id) {
     state.session.latestBackup = Array.isArray(page.items) ? page.items[0] || null : null;
     state.session.backupState = "loaded";
   } catch (error) {
-    if (options.signal?.aborted || error?.name === "AbortError") throw error;
+    if (error?.name === "AbortError") throw error;
     if (state.session.profileId !== id) return;
     state.session.latestBackup = null;
     state.session.backupState = "error";
@@ -718,19 +804,33 @@ function applyStatus(snapshot, { confirmed = false } = {}) {
   snapshot.profiles.forEach((item) => {
     if (!item?.profile_id) return;
     const previous = state.statuses.get(item.profile_id) || {};
+    const previousRun = metricRunKey(previous);
+    const nextRun = metricRunKey({ ...previous, ...item });
+    if (previousRun !== nextRun) {
+      state.metricHistory.delete(item.profile_id);
+      state.metricCapacity.delete(item.profile_id);
+      state.metricSamples.delete(item.profile_id);
+    }
+    const pending = state.perf.pendingMutations.get(item.profile_id);
     state.statuses.set(item.profile_id, { ...previous, ...item });
+    if (state.statusConfirmed && item.state === "running" && item.required_ports_ready) {
+      retireResolvedStartKey(item.profile_id);
+    }
     observeSessionOperation(state.statuses.get(item.profile_id));
     markPerformance("horizon-card-reflect");
-    if (state.perf.pendingMutations.has(item.profile_id)) {
+    if (pending) {
       measurePerformance("horizon-mutation-click-to-card-reflect", "horizon-mutation-click", "horizon-card-reflect");
       state.perf.pendingMutations.delete(item.profile_id);
     }
     appendCpuSample(item.profile_id, item);
     const samples = state.metricSamples.get(item.profile_id) || { cpu: [], memory: [], players: [] };
-    const sampleTime = Date.now();
-    if (Number.isFinite(Number(item.cpu_percent))) samples.cpu.push({ t: sampleTime, v: Number(item.cpu_percent) });
-    if (Number.isFinite(Number(item.rss_bytes))) samples.memory.push({ t: sampleTime, v: Number(item.rss_bytes) / 1073741824 });
-    if (Number.isFinite(Number(item.players_online))) samples.players.push({ t: sampleTime, v: Number(item.players_online) });
+    const sampleTime = Date.parse(snapshot.observed_at) || Date.now();
+    if (metricRunKey(state.statuses.get(item.profile_id))) {
+      for (const [key, raw, divisor] of [["cpu", item.cpu_percent, 1], ["memory", item.rss_bytes, 1073741824], ["players", item.players_online, 1]]) {
+        const value = metricNumber(raw);
+        if (samples[key].at(-1)?.t !== sampleTime) samples[key].push({ t: sampleTime, v: value == null ? null : value / divisor, state: value == null ? "unavailable" : "available" });
+      }
+    }
     ["cpu", "memory", "players"].forEach((key) => { samples[key] = samples[key].slice(-SAMPLE_LIMIT); });
     state.metricSamples.set(item.profile_id, samples);
     patchCard(item.profile_id);
@@ -783,8 +883,14 @@ async function api(path, options = {}) {
     headers.set("Accept", "application/json");
     if (options.body) headers.set("Content-Type", "application/json");
     if (mutation && operationKey) headers.set("Idempotency-Key", operationKey);
-    if (state.csrf && options.method && options.method !== "GET") headers.set("X-CSRF-Token", state.csrf);
+    if (state.csrf && mutation) headers.set("X-CSRF-Token", state.csrf);
     return fetch(path, { credentials: "same-origin", ...options, headers, redirect: "manual" });
+  };
+  const clearOperationKey = () => {
+    if (!mutation || !operationStorageKey || !operationKey) return;
+    try {
+      if (sessionStorage.getItem(operationStorageKey) === operationKey) sessionStorage.removeItem(operationStorageKey);
+    } catch {}
   };
   let response;
   try {
@@ -820,11 +926,11 @@ async function api(path, options = {}) {
   }
   if ((response.status === 401 || csrfFailure) && !options._retried && path !== "/api/v1/session") {
     if (sessionGeneration !== requestSessionGeneration) {
-      return api(path, { ...options, _retried: true });
+      return api(path, { ...options, idempotencyKey: operationKey, _retried: true });
     }
     try {
       await refreshSession();
-      return api(path, { ...options, _retried: true });
+      return api(path, { ...options, idempotencyKey: operationKey, _retried: true });
     } catch (error) {
       if (sessionExpired) throw new Error(SESSION_EXPIRED_MESSAGE);
       throw error;
@@ -838,6 +944,10 @@ async function api(path, options = {}) {
     expireSession();
     throw new Error(SESSION_EXPIRED_MESSAGE);
   }
+  if (!response.ok && !mutation && [502, 503, 504].includes(response.status) && !options._transientRetried) {
+    await new Promise((resolve) => setTimeout(resolve, 250));
+    return api(path, { ...options, _transientRetried: true });
+  }
   if (!response.ok) {
     let detail = "Request failed.";
     let outcomeUnknown = mutation && [502, 503, 504].includes(response.status);
@@ -850,7 +960,7 @@ async function api(path, options = {}) {
     // A typed HTTP response is definitive unless the upstream transport may
     // have lost a committed mutation response. Retain that key for replay.
     if (mutation && operationStorageKey && !outcomeUnknown) {
-      try { sessionStorage.removeItem(operationStorageKey); } catch {}
+      clearOperationKey();
     }
     if (outcomeUnknown) {
       const unknown = new Error("Outcome unknown. Retry with the same operation key.");
@@ -869,19 +979,25 @@ async function api(path, options = {}) {
     throw unknown;
   }
   if (mutation && operationStorageKey) {
-    try { sessionStorage.removeItem(operationStorageKey); } catch {}
+    clearOperationKey();
   }
   return result;
 }
 
-async function load() {
+async function loadOnce() {
+  clearLoadRetry();
+  if (sessionExpired) {
+    // The redirect latch survives navigation in sessionStorage. An explicit
+    // Retry is a trusted reauthentication opportunity, not a dead-end latch.
+    sessionExpired = false;
+    reauthenticating = true;
+    sessionNoticeShown = false;
+  }
   state.statusConfirmed = false;
   try {
-    const session = await api("/api/v1/session");
+    const session = await refreshSession();
     state.actor = session.actor;
     state.csrf = session.csrf_token || null;
-    sessionGeneration += 1;
-    try { sessionStorage.removeItem(SESSION_REDIRECT_KEY); } catch {}
     byId("session-note").textContent = state.actor ? `Signed in as ${state.actor}` : "Signed-in operator";
     const [profileList, status] = await Promise.all([api("/api/v1/profiles"), api("/api/v1/status")]);
     (Array.isArray(profileList) ? profileList : PROFILE_FALLBACK.map(([id, display_name, adapter]) => ({ id, display_name, adapter }))).forEach((profile) => {
@@ -892,24 +1008,42 @@ async function load() {
     populateNotificationProfiles();
     renderCards();
     applyStatus(status, { confirmed: true });
+    // Clear the navigation latch only after a protected request has succeeded
+    // and the signed-in view is confirmed, avoiding redirect loops on a stale
+    // bootstrap response.
+    try { sessionStorage.removeItem(SESSION_REDIRECT_KEY); } catch {}
     void loadIncidents();
     try { await loadSchedules(); } catch { renderAutomationSummary(null); }
     populateTargets();
     populateNotificationProfiles();
     connectStream();
+    state.loadFailed = false;
+    loadFailureNotice = null;
   } catch (error) {
     state.loadFailed = true;
     byId("session-note").textContent = "Status unavailable";
-    notify(error.message || "Status unavailable.");
-    PROFILE_FALLBACK.forEach(([id, display_name, adapter]) => {
-      state.profiles.set(id, { id, display_name, adapter });
-      state.statuses.set(id, { profile_id: id, state: "unknown", health: "unknown" });
-    });
-    renderCards();
-    patchActiveSlot();
-    populateTargets();
+    const message = error.message || "Status unavailable.";
+    if (message !== loadFailureNotice) { notify(message); loadFailureNotice = message; }
+    // Keep the last confirmed view intact during a gateway outage. The
+    // fallback is only useful on an initial load with no known profiles.
+    if (!state.profiles.size) {
+      PROFILE_FALLBACK.forEach(([id, display_name, adapter]) => {
+        state.profiles.set(id, { id, display_name, adapter });
+        state.statuses.set(id, { profile_id: id, state: "unknown", health: "unknown" });
+      });
+      renderCards();
+      patchActiveSlot();
+      populateTargets();
+    }
     byId("retry-load")?.removeAttribute("hidden");
+    scheduleLoadRetry();
   }
+}
+
+function load() {
+  if (loadPromise) return loadPromise;
+  loadPromise = loadOnce().finally(() => { loadPromise = null; });
+  return loadPromise;
 }
 
 function populateNotificationProfiles() {
@@ -1280,15 +1414,16 @@ async function mutate(id, operation) {
     required_ports_ready: operation === "start" ? false : previous.required_ports_ready,
   };
   const pending = { operation, previous };
+  const sessionOperation = id === sessionProfileId() ? {
+    profileId: id,
+    kind: operation,
+    result: "pending",
+    startedAt: new Date().toISOString(),
+    jobId: null,
+    message: `${titleCase(operation)} request is being sent to Horizon. This tab notice is transient; the Audit trail is durable.`,
+  } : null;
   if (id === sessionProfileId()) {
-    state.session.operation = {
-      profileId: id,
-      kind: operation,
-      result: "pending",
-      startedAt: new Date().toISOString(),
-      jobId: null,
-      message: `${titleCase(operation)} request is being sent to Horizon. This tab notice is transient; the Audit trail is durable.`,
-    };
+    state.session.operation = sessionOperation;
     patchSessionOperation();
   }
   state.perf.pendingMutations.set(id, pending);
@@ -1303,11 +1438,42 @@ async function mutate(id, operation) {
   measurePerformance("horizon-mutation-click-to-optimistic-reflect", "horizon-mutation-optimistic-click", "horizon-mutation-optimistic-reflect");
   try {
     const accepted = await api(`/api/v1/profiles/${encodeURIComponent(id)}/${operation}`, { method: "POST", body: JSON.stringify({}) });
-    if (state.session.operation?.profileId === id && state.session.operation.kind === operation && state.session.operation.result === "pending") {
-      state.session.operation.result = "accepted";
-      state.session.operation.jobId = accepted?.job_id || null;
-      const job = state.session.operation.jobId ? ` Job ${state.session.operation.jobId}.` : "";
-      state.session.operation.message = `${titleCase(operation)} accepted by Horizon.${job} Waiting for observed readiness. This tab notice is transient; the Audit trail is durable.`;
+    let current = state.statuses.get(id);
+    if (operation === "start" && accepted?.state === "running") {
+      // A completed replay may arrive before this tab has observed the
+      // current lifecycle state. Reconcile once before presenting acceptance.
+      try {
+        const observed = await api("/api/v1/status");
+        applyStatus(observed, { confirmed: true });
+        current = state.statuses.get(id);
+      } catch {}
+    }
+    if (operation === "start" && accepted?.state === "running" && current?.state === "stopped") {
+      // A retained idempotency key can replay an older successful start after
+      // that server has since been stopped. Reconcile to current status and
+      // require a fresh user action; never issue a second POST automatically.
+      if (state.perf.pendingMutations.get(id) === pending) {
+        if (state.statuses.get(id)?.state === "starting") state.statuses.set(id, current);
+        state.perf.pendingMutations.delete(id);
+        patchCard(id);
+        patchActiveSlot();
+        patchFamilyHeaders();
+        if (state.detail.id === id) patchDetail(id);
+      }
+      if (sessionOperation && state.session.operation === sessionOperation) {
+        sessionOperation.result = "resolved";
+        sessionOperation.jobId = null;
+        sessionOperation.message = `A previous Start resolved, but ${profileLabel(id)} is currently stopped. Start it again when ready. This tab notice is transient; the Audit trail is durable.`;
+        patchSessionOperation();
+      }
+      notify(`${profileLabel(id)} is currently stopped; the previous Start was already resolved.`);
+      return;
+    }
+    if (sessionOperation && state.session.operation === sessionOperation && sessionOperation.result === "pending") {
+      sessionOperation.result = "accepted";
+      sessionOperation.jobId = accepted?.job_id || null;
+      const job = sessionOperation.jobId ? ` Job ${sessionOperation.jobId}.` : "";
+      sessionOperation.message = `${titleCase(operation)} accepted by Horizon.${job} Waiting for observed readiness. This tab notice is transient; the Audit trail is durable.`;
       patchSessionOperation();
     }
     notify(`${titleCase(operation)} requested for ${profileLabel(id)}.`);
@@ -1320,9 +1486,9 @@ async function mutate(id, operation) {
       patchFamilyHeaders();
       if (state.detail.id === id) patchDetail(id);
     }
-    if (state.session.operation?.profileId === id && state.session.operation.kind === operation && ["pending", "accepted"].includes(state.session.operation.result)) {
-      state.session.operation.result = error?.outcomeUnknown ? "unknown" : "failed";
-      state.session.operation.message = error?.outcomeUnknown
+    if (sessionOperation && state.session.operation === sessionOperation && ["pending", "accepted"].includes(sessionOperation.result)) {
+      sessionOperation.result = error?.outcomeUnknown ? "unknown" : "failed";
+      sessionOperation.message = error?.outcomeUnknown
         ? `${titleCase(operation)} outcome is unknown. Horizon is reconciling the original operation; observed status will settle this notice.`
         : `${titleCase(operation)} was not accepted: ${error.message || "request failed"}`;
       patchSessionOperation();
@@ -1551,23 +1717,125 @@ function sparklinePoints(samples, width = 180, height = 90) {
   }).concat(values.length === 1 ? [`${width.toFixed(1)},${(height - 4).toFixed(1)}`] : []).join(" ");
 }
 
-function renderMetricChart(svgId, samples, { unit = "", formatValue = (value) => String(value) } = {}) {
+function metricNumber(value) { return typeof value === "number" && Number.isFinite(value) && value >= 0 ? value : null; }
+
+function renderMetricChart(svgId, samples = [], { unit = "", formatValue = (value) => String(value), capacity = null, domain = null, gapMs = 120000 } = {}) {
   const svg = byId(svgId);
   if (!svg) return;
   const plot = { x0: 30, x1: 215, y0: 8, y1: 90 };
-  const values = samples.map((sample) => Number(sample.v)).filter(Number.isFinite);
-  const max = Math.max(1, ...values);
-  const points = samples.map((sample, index) => {
-    const x = samples.length === 1 ? plot.x0 : plot.x0 + (index / (samples.length - 1)) * (plot.x1 - plot.x0);
-    const y = plot.y1 - (Math.min(max, Math.max(0, Number(sample.v) || 0)) / max) * (plot.y1 - plot.y0);
-    return `${x.toFixed(1)},${y.toFixed(1)}`;
-  }).join(" ");
-  svg.querySelector(".chart-line").setAttribute("points", points || `${plot.x0},${plot.y1} ${plot.x1},${plot.y1}`);
+  const ordered = [...new Map(samples.filter((sample) => sample && Number.isFinite(sample.t) && domain && sample.t >= domain.start && sample.t <= domain.end).map((sample) => [sample.t, { ...sample, v: metricNumber(sample.v) }])).values()].sort((a, b) => a.t - b.t);
+  const values = ordered.map((sample) => sample.v).filter(Number.isFinite);
+  const max = Number.isFinite(Number(capacity)) && Number(capacity) > 0 ? Number(capacity) : Math.max(1, ...values);
+  const start = domain?.start;
+  const end = domain?.end;
+  const span = end > start ? end - start : 1;
+  const segments = [[]];
+  ordered.forEach((sample, index) => {
+    if (index && sample.t - ordered[index - 1].t > gapMs) segments.push([]);
+    const value = sample.v;
+    if (value == null || (sample.state && sample.state !== "available")) { segments.push([]); return; }
+    const x = plot.x0 + ((sample.t - start) / span) * (plot.x1 - plot.x0);
+    const y = plot.y1 - (Math.min(max, Math.max(0, value)) / max) * (plot.y1 - plot.y0);
+    segments.at(-1).push(`${x.toFixed(1)},${y.toFixed(1)}`);
+  });
+  const first = svg.querySelector(".chart-line");
+  svg.querySelectorAll(".chart-line").forEach((line, index) => { if (index) line.remove(); });
+  svg.querySelectorAll(".chart-dot").forEach((dot) => dot.remove());
+  const lines = [];
+  segments.filter((segment) => segment.length).forEach((segment, index) => {
+    const line = index === 0 ? first : first.cloneNode(); line.setAttribute("points", segment.join(" ")); if (index > 0) first.parentNode.append(line); lines.push(line);
+    if (segment.length === 1) {
+      const dot = document.createElementNS("http://www.w3.org/2000/svg", "circle");
+      const [x, y] = segment[0].split(","); dot.setAttribute("cx", x); dot.setAttribute("cy", y); dot.setAttribute("r", "1.5"); dot.setAttribute("class", "chart-dot"); svg.append(dot);
+    }
+  });
+  if (!lines.length) first.setAttribute("points", "");
   svg.querySelector(".chart-ymax").textContent = formatValue(max) + unit;
   svg.querySelector(".chart-ymid").textContent = formatValue(max / 2) + unit;
-  const fmt = (time) => new Date(time).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
-  svg.querySelector(".chart-x0").textContent = samples.length ? fmt(samples[0].t) : "—";
-  svg.querySelector(".chart-x1").textContent = samples.length ? fmt(samples[samples.length - 1].t) : "—";
+  const crossDay = Number.isFinite(start) && new Date(start).toDateString() !== new Date(end).toDateString();
+  const fmt = (time) => new Date(time).toLocaleString([], { ...(crossDay ? { month: "short", day: "numeric" } : {}), hour: "2-digit", minute: "2-digit" });
+  svg.querySelector(".chart-x0").textContent = Number.isFinite(start) ? fmt(start) : "—";
+  svg.querySelector(".chart-x1").textContent = Number.isFinite(end) ? fmt(end) : "—";
+  svg.setAttribute("role", "img");
+  svg.setAttribute("aria-label", `${svgId.includes("memory") ? "Memory RSS" : svgId.includes("players") ? "Players" : "CPU"}: ${values.length} observations${domain ? ` since ${new Date(start).toLocaleString()}` : "; no active run"}. ${Math.max(0, lines.length - 1)} gaps. ${metricNumber(capacity) > 0 ? `Capacity ${formatValue(capacity)}${unit}.` : "Scale follows observed values; capacity unavailable."}`);
+}
+
+const METRIC_WINDOWS = [["1h", 3600000], ["6h", 21600000], ["24h", 86400000], ["7d", 604800000], ["30d", 2592000000], ["1y", 31536000000]];
+function metricWindow(startedAt) {
+  const elapsed = Math.max(0, Date.now() - (Date.parse(startedAt || "") || Date.now()));
+  return (METRIC_WINDOWS.find(([, ms]) => elapsed <= ms) || METRIC_WINDOWS.at(-1))[0];
+}
+function metricRunKey(status) {
+  const started = Date.parse(status?.started_at);
+  return ["running", "starting", "stopping"].includes(status?.state) && Number.isInteger(status?.pid) && status.pid > 0 && Number.isFinite(started) && started <= Date.now() ? `${status.pid}|${started}` : null;
+}
+const metricCapacityFlights = new Map();
+function clearMetricTimer() {
+  if (state.detail.metricTimer) window.clearInterval(state.detail.metricTimer);
+  state.detail.metricTimer = null; state.detail.metricAbort?.abort(); state.detail.metricAbort = null;
+  state.detail.metricRequest += 1;
+}
+function metricSeries(result) {
+  const raw = result?.context?.series || result?.series || {};
+  const convert = (name, divisor = 1) => (Array.isArray(raw[name]) ? raw[name] : []).map((item) => ({ t: Date.parse(item.ts || item.timestamp), v: metricNumber(item.value) == null ? null : item.value / divisor, state: item.state || "unavailable" })).filter((item) => Number.isFinite(item.t)).sort((a, b) => a.t - b.t);
+  return { cpu: convert("cpu_percent"), memory: convert("rss_bytes", 1073741824), players: [] };
+}
+async function loadMetricHistory(id) {
+  if (!pageVisible() || !id || state.detail.tab !== "metrics") return;
+  const status = state.statuses.get(id) || {}; const key = metricRunKey(status);
+  if (!key || state.detail.id !== id || state.detail.metricAbort) return;
+  const request = ++state.detail.metricRequest; state.detail.metricAbort?.abort();
+  const controller = new AbortController(); state.detail.metricAbort = controller;
+  try {
+    const windowKey = metricWindow(status.started_at);
+    const resolution = Date.now() - Date.parse(status.started_at) > 86400000 ? "1h" : "1m";
+    const options = { signal: controller.signal };
+    const hours = Math.min(8760, Math.max(1, Math.ceil((Date.now() - Date.parse(status.started_at)) / 3600000)));
+    const [history, summary] = await Promise.all([
+      api(`/api/v1/profiles/${encodeURIComponent(id)}/stats/tps?window=${windowKey}&resolution=${resolution}&limit=720`, options),
+      api(`/api/v1/profiles/${encodeURIComponent(id)}/stats/summary?hours=${hours}`, options).catch(() => null),
+    ]);
+    const current = state.statuses.get(id) || {};
+    if (controller.signal.aborted || !pageVisible() || state.detail.tab !== "metrics" || request !== state.detail.metricRequest || state.detail.id !== id || metricRunKey(current) !== key) return;
+    const series = metricSeries(history);
+    const occupancy = summary?.occupancy?.samples;
+    const previous = state.metricHistory.get(id);
+    series.players = Array.isArray(occupancy)
+      ? occupancy.map((point) => ({ t: Date.parse(point.ts), v: metricNumber(point.count) })).filter((point) => Number.isFinite(point.t)).sort((a, b) => a.t - b.t)
+      : previous?.key === key ? previous.players || [] : [];
+    state.metricHistory.set(id, { key, window: windowKey, resolution: history.resolution || resolution, fetchedAt: Date.now(), stale: false, playersStale: !Array.isArray(occupancy), ...series });
+    patchDetail(id);
+  } catch (error) { if (!controller.signal.aborted && error?.name !== "AbortError" && request === state.detail.metricRequest && state.detail.id === id && metricRunKey(state.statuses.get(id)) === key) { const previous = state.metricHistory.get(id); state.metricHistory.set(id, { ...previous, key, stale: true, attemptedAt: Date.now() }); patchDetail(id); } }
+  finally { if (state.detail.metricAbort === controller) state.detail.metricAbort = null; }
+}
+function startMetricRefresh(id) {
+  clearMetricTimer();
+  const refresh = () => { if (pageVisible() && state.detail.id === id) { void loadMetricCapacity(id); void loadMetricHistory(id); } };
+  refresh(); state.detail.metricTimer = window.setInterval(refresh, 30000);
+}
+async function loadMetricCapacity(id) {
+  const status = state.statuses.get(id); const key = metricRunKey(status);
+  if (!pageVisible() || state.detail.id !== id || !key || metricCapacityFlights.has(id)) return;
+  const cached = state.metricCapacity.get(id);
+  if (cached?.key === key && Date.now() - cached.fetchedAt < 30000) return;
+  const controller = new AbortController();
+  const timeout = window.setTimeout(() => controller.abort(), 7000);
+  const pending = {};
+  metricCapacityFlights.set(id, pending);
+  try {
+    const capacity = await api(`/api/v1/profiles/${encodeURIComponent(id)}/resource-capacity`, { signal: controller.signal });
+    if (metricRunKey(state.statuses.get(id)) !== key) return;
+    const matches = capacity?.pid === status.pid && Date.parse(capacity.started_at) === Date.parse(status.started_at);
+    state.metricCapacity.set(id, { ...(matches ? capacity : {}), key, fetchedAt: Date.now() });
+  } catch { if (metricRunKey(state.statuses.get(id)) === key) state.metricCapacity.set(id, { key, fetchedAt: Date.now() }); }
+  finally { window.clearTimeout(timeout); if (metricCapacityFlights.get(id) === pending) metricCapacityFlights.delete(id); }
+  if (pageVisible() && state.detail.id === id) patchDetail(id);
+}
+function patchCapacityTrack(id, value, maximum) {
+  const node = byId(id); const known = metricNumber(value) != null && metricNumber(maximum) > 0;
+  node.querySelector("i").style.width = known ? `${Math.min(100, value / maximum * 100)}%` : "0%";
+  if (known) { node.setAttribute("role", "meter"); node.setAttribute("aria-valuemin", "0"); node.setAttribute("aria-valuemax", String(maximum)); node.setAttribute("aria-valuenow", String(Math.min(value, maximum))); }
+  else { node.setAttribute("role", "img"); ["aria-valuemin", "aria-valuemax", "aria-valuenow"].forEach((name) => node.removeAttribute(name)); }
 }
 
 const STATS_PROFILES = new Set(["minecraft", "minecraft-sunlit-cobblemon", "terraria-vanilla", "terraria-tmod", "pz-rising"]);
@@ -2201,6 +2469,7 @@ function setDetailTab(tab) {
     if (tpsBlock) tpsBlock.hidden = !TICK_PROFILES.has(state.detail.id);
     startStatsRefresh(state.detail.id);
   }
+  startMetricRefresh(state.detail.id);
 }
 
 function patchDetail(id) {
@@ -2221,7 +2490,7 @@ function patchDetail(id) {
     "disk-io": status.disk_read_bps != null || status.disk_write_bps != null,
   };
   document.querySelectorAll("#panel-metrics [data-metric]").forEach((tile) => {
-    tile.hidden = metricAvailability[tile.dataset.metric] === false;
+    tile.hidden = ["cpu", "memory", "players"].includes(tile.dataset.metric) ? false : metricAvailability[tile.dataset.metric] === false;
   });
   const badge = byId("detail-status");
   badge.className = `status-badge ${stateClass(current)}`;
@@ -2250,22 +2519,45 @@ function patchDetail(id) {
     : running
       ? "Command input is available for this running profile."
       : "Start this server to use its console.";
-  byId("rail-cpu").textContent = status.cpu_percent == null ? "—" : `${Number(status.cpu_percent).toFixed(1)}%`;
-  byId("rail-memory").textContent = formatBytes(status.rss_bytes);
+  const runKey = metricRunKey(status);
+  const cachedCapacity = state.metricCapacity.get(id);
+  const capacity = cachedCapacity?.key === runKey ? cachedCapacity : {};
+  const cpuCapacity = metricNumber(capacity.cpu_capacity_percent);
+  const memoryCapacity = metricNumber(capacity.memory_capacity_bytes);
+  const cpuValue = runKey ? metricNumber(status.cpu_percent) : null;
+  const memoryValue = runKey ? metricNumber(status.rss_bytes) : null;
+  const cpuText = cpuValue == null ? "—" : `${cpuValue.toFixed(1)}% / ${cpuCapacity > 0 ? `${cpuCapacity.toFixed(0)}%` : "unknown"}`;
+  const memoryText = memoryValue == null ? "—" : `${(memoryValue / 1073741824).toFixed(1)} / ${memoryCapacity > 0 ? `${(memoryCapacity / 1073741824).toFixed(1)} GiB` : "capacity unknown"}`;
+  byId("rail-cpu").textContent = cpuText;
+  byId("rail-memory").textContent = memoryText;
+  patchCapacityTrack("rail-cpu-capacity", cpuValue, cpuCapacity);
+  patchCapacityTrack("rail-memory-capacity", memoryValue, memoryCapacity);
+  byId("rail-cpu-note").textContent = cpuCapacity > 0 ? "Current / available CPU · 100% per core" : "CPU capacity unavailable";
+  byId("rail-memory-note").textContent = memoryCapacity > 0 ? "Current RSS / effective memory limit" : "Memory capacity unavailable";
   byId("rail-players").textContent = status.players_online == null ? "Unavailable" : String(status.players_online);
   byId("rail-players-note").textContent = status.players_online == null ? "Player count unavailable" : "Players observed";
   byId("rail-version").textContent = formatVersion(status.installed_version);
   const configRestart = state.configRestartRequired.get(id) || [];
   byId("rail-version-note").textContent = configRestart.length ? "Config changed · restart required" : status.restart_required ? "Update available · restart required" : status.required_ports_ready ? "Ready on required ports" : "Accepted; waiting for readiness";
   const samples = state.metricSamples.get(id) || { cpu: [], memory: [], players: [] };
-  byId("rail-cpu-line").setAttribute("points", sparklinePoints(samples.cpu, 120, 32));
-  byId("rail-memory-line").setAttribute("points", sparklinePoints(samples.memory, 120, 32));
-  byId("metric-cpu-current").textContent = status.cpu_percent == null ? "Unavailable" : `${Number(status.cpu_percent).toFixed(1)}%`;
-  byId("metric-memory-current").textContent = formatBytes(status.rss_bytes);
+  const history = state.metricHistory.get(id);
+  void loadMetricCapacity(id);
+  const metricDomain = runKey ? { start: Date.parse(status.started_at), end: Date.now() } : null;
+  byId("metric-cpu-current").textContent = cpuText;
+  byId("metric-memory-current").textContent = memoryText;
   byId("metric-players-current").textContent = status.players_online == null ? "Unavailable" : String(status.players_online);
-  renderMetricChart("metric-cpu-chart", samples.cpu, { unit: "%", formatValue: (value) => value.toFixed(0) });
-  renderMetricChart("metric-memory-chart", samples.memory, { unit: " GiB", formatValue: (value) => value.toFixed(1) });
-  renderMetricChart("metric-players-chart", samples.players, { formatValue: (value) => value.toFixed(0) });
+  const chartHistory = history?.key === runKey ? history : {};
+  const sampleTail = (key) => { const past = chartHistory[key] || []; const last = past.at(-1)?.t ?? 0; return [...past, ...(samples[key] || []).filter((point) => point.t > last)]; };
+  const gapMs = chartHistory.resolution === "1h" ? 7200000 : chartHistory.resolution === "5m" ? 600000 : 120000;
+  renderMetricChart("metric-cpu-chart", sampleTail("cpu"), { unit: "%", formatValue: (value) => value.toFixed(0), capacity: cpuCapacity, domain: metricDomain, gapMs });
+  renderMetricChart("metric-memory-chart", sampleTail("memory"), { unit: " GiB", formatValue: (value) => value.toFixed(1), capacity: memoryCapacity == null ? null : memoryCapacity / 1073741824, domain: metricDomain, gapMs });
+  renderMetricChart("metric-players-chart", sampleTail("players"), { formatValue: (value) => value.toFixed(0), domain: metricDomain });
+  byId("metric-cpu-capacity").textContent = cpuCapacity > 0 ? "Current / available CPU capacity" : "Capacity unavailable · scale follows observed values";
+  byId("metric-memory-capacity").textContent = memoryCapacity > 0 ? "Current RSS / effective memory limit" : "Capacity unavailable · scale follows observed values";
+  byId("metrics-run-note").textContent = metricDomain
+    ? `Since server started ${new Date(metricDomain.start).toLocaleString()} → now. ${chartHistory.stale ? "History refresh unavailable; retaining last observations." : chartHistory.fetchedAt ? "Retained history; gaps mean no observation." : "Loading retained history…"} Player history uses the latest 500 retained observations.${chartHistory.playersStale ? " Player history refresh unavailable." : ""}`
+    : current === "stopped" ? "Server stopped · no active run. No offline time is plotted as zero." : "Current run history unavailable until a process start is confirmed.";
+  if (runKey && state.detail.tab === "metrics" && history?.key !== runKey) void loadMetricHistory(id);
   byId("metric-uptime").textContent = uptime(status.uptime_seconds);
   byId("metric-disk-free").textContent = formatBytes(status.disk_free_bytes);
   byId("metric-disk-free-note").textContent = profile.mutable_root || "Profile mutable root";
@@ -2319,6 +2611,7 @@ function updateConfigDiff() {
 }
 
 async function renderConfig(id) {
+  const requestId = ++state.detail.configRequest;
   const profile = state.profiles.get(id) || { id };
   const summary = byId("config-summary");
   summary.replaceChildren();
@@ -2344,6 +2637,7 @@ async function renderConfig(id) {
   byId("config-diff").textContent = "Loading editable settings…";
   try {
     const response = await api(`/api/v1/profiles/${encodeURIComponent(id)}/config`);
+    if (requestId !== state.detail.configRequest || state.detail.id !== id || state.detail.tab !== "config") return;
     state.detail.config = response;
     (Array.isArray(response.settings) ? response.settings : []).forEach((setting) => {
       const row = document.createElement("div");
@@ -2791,6 +3085,7 @@ function route() {
     showView("detail"); patchDetail(state.detail.id); setDetailTab(parsed.tab);
   } else {
     clearStatsTimer();
+    clearMetricTimer();
     clearBenchmarkTimer();
     state.detail.id = null;
     showView(parsed.view);
@@ -2907,6 +3202,8 @@ function refreshVisiblePanels() {
     if (!item?.paused) loadDetailLogs(id);
   } else if (state.detail.tab === "stats") {
     loadStats(id, { includeBase: !state.detail.statsBaseLoaded });
+  } else if (state.detail.tab === "metrics") {
+    loadMetricHistory(id);
   } else if (state.detail.tab === "benchmarks") {
     loadBenchmarks(id);
   }
@@ -3001,17 +3298,25 @@ document.addEventListener("visibilitychange", () => {
     return;
   }
   flushClientPerformance();
+  if (sessionExpired) { void load().finally(route); return; }
   refreshVisiblePanels();
   resumeStream();
 });
+window.addEventListener("focus", () => {
+  if (!pageVisible()) return;
+  if (sessionExpired || state.loadFailed) { void load().finally(route); return; }
+  if (stream.suspended) resumeStream();
+});
 window.addEventListener("online", () => {
-  if (!pageVisible() || sessionExpired) return;
+  if (!pageVisible()) return;
+  if (sessionExpired) { void load().finally(route); return; }
   if (stream.suspended) resumeStream(); else connectStream();
 });
 window.__horizonOpenLogs = openLogs;
 if (window.__HORIZON_TEST__) {
   window.__horizonTest = {
     api,
+    load,
     scheduleReconnect,
     sessionState: () => ({ expired: sessionExpired, refreshing: Boolean(sessionRefreshPromise), noticeShown: sessionNoticeShown, expiryCount: sessionExpiryCount, generation: sessionGeneration }),
     setReconnectTestTiming: (delay, jitter = () => 0) => { stream.retryMs = delay; reconnectJitter = jitter; },

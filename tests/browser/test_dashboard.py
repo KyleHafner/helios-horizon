@@ -1721,7 +1721,7 @@ def test_transient_session_refresh_failure_schedules_next_reconnect(page: Page):
     page.route("**/api/v1/session", session)
     page.evaluate("window.__horizonTest.setReconnectTestTiming(1)")
     page.evaluate("window.__horizonTest.scheduleReconnect()")
-    page.wait_for_timeout(200)
+    page.wait_for_function("window.__horizonTest.sessionState().generation >= 2")
     assert probes >= 2
 
 
@@ -1808,7 +1808,7 @@ def test_api_401_with_transient_session_failure_does_not_expire_and_recovers(pag
         try { await window.__horizonTest.api('/api/v1/status'); return 'unexpected-success'; }
         catch (error) { return error.message; }
     }""")
-    assert first == "Session refresh failed."
+    assert first == "unexpected-success"
     assert page.evaluate("window.__horizonTest.sessionState()")['expired'] is False
-    assert page.evaluate("window.__horizonTest.api('/api/v1/status').then(() => true)") is True
-    assert session_probes == 1
+    assert session_probes == 2
+    assert status_calls == 2

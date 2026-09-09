@@ -62,6 +62,7 @@ from .protocol import (
     MAX_RESPONSE_BYTES,
 )
 from .redaction import Redactor
+from .resource_capacity import probe as probe_resource_capacity, process_started_at, process_start_ticks
 
 CONTROL_SOCKET = Path("/run/game-control/control.sock")
 PRODUCTION_WEB_ROOT = Path("/opt/game-control/web")
@@ -80,6 +81,44 @@ _READ_ACTIONS = (
 )
 _OPERATION_TIMEOUT_SECONDS = 300.0
 SSE_RETRY_HINT = b"retry: 3000\n\n"
+
+
+class _ResourceCapacityCache:
+    """Small TTL cache with per-key single-flight probe execution."""
+
+    def __init__(self, ttl: float = 2.0) -> None:
+        self.ttl = ttl
+        self._values: dict[tuple[int, str], tuple[float, dict[str, Any]]] = {}
+        self._inflight: dict[tuple[int, str], asyncio.Task[dict[str, Any]]] = {}
+        self._lock = asyncio.Lock()
+
+    async def get(self, pid: int, started_at: Any, started_ticks: int | None = None) -> dict[str, Any]:
+        key = (pid, f"{started_at}:{started_ticks}")
+        now = time.monotonic()
+        async with self._lock:
+            cached = self._values.get(key)
+            if cached and now - cached[0] < self.ttl:
+                return dict(cached[1])
+            task = self._inflight.get(key)
+            if task is None:
+                if len(self._inflight) >= 16:
+                    return {"cpu_capacity_percent": None, "memory_capacity_bytes": None, "cpu_source": "unknown", "memory_source": "unknown"}
+                task = asyncio.create_task(asyncio.to_thread(probe_resource_capacity, pid, started_ticks))
+                self._inflight[key] = task
+                def completed(future: asyncio.Task) -> None:
+                    if self._inflight.get(key) is future:
+                        self._inflight.pop(key, None)
+                    if future.cancelled():
+                        return
+                    error = future.exception()
+                    if error is None:
+                        self._values[key] = (time.monotonic(), dict(future.result()))
+                        while len(self._values) > 32:
+                            self._values.pop(next(iter(self._values)))
+                task.add_done_callback(completed)
+        # A disconnected HTTP waiter must not cancel the shared probe or
+        # release its ownership while the filesystem worker is still running.
+        return dict(await asyncio.shield(task))
 
 
 class BoundedTimingRing:
@@ -487,6 +526,7 @@ def create_app(
     web_performance = WebPerformance()
     service = _TimedApiService(ApiService(rpc_impl), web_performance.rpc)
     capabilities = capability_service or CapabilityService(CapabilityTokenStore(sessions.db), rpc_impl)
+    resource_capacity_cache = _ResourceCapacityCache()
     mutation_wakeup = asyncio.Event()
     watch_connected = asyncio.Event()
     last_watch_status = 0.0
@@ -797,6 +837,58 @@ def create_app(
     router = __import__("fastapi").APIRouter(prefix="/api/v1")
     add_api_routes(router, service, auth_dependency, auth_dependency, on_mutation=mutation_wakeup.set)
     app.include_router(router)
+
+    @app.get("/api/v1/profiles/{profile_id}/resource-capacity")
+    async def resource_capacity(profile_id: str, request: Request, response: Response):
+        actor = await auth_dependency(request, response)
+        result = await service.call(actor, GetStatus(kind="get_status"), provenance=RpcProvenance.WEB_HUMAN)
+        if isinstance(result, RpcFailure):
+            return JSONResponse(status_code=503, content={"error": {"message": "status unavailable"}})
+        payload = result.result if isinstance(result, RpcSuccess) else result
+        profiles = payload.get("profiles") if isinstance(payload, Mapping) else getattr(payload, "profiles", None)
+        if not isinstance(profiles, (list, tuple)):
+            return JSONResponse(status_code=503, content={"error": {"message": "status unavailable"}})
+        def field(item: Any, name: str) -> Any:
+            return item.get(name) if isinstance(item, Mapping) else getattr(item, name, None)
+        status = next((item for item in profiles if str(field(item, "profile_id")) == profile_id), None)
+        if status is None:
+            raise HTTPException(404, "profile not found")
+        pid = field(status, "pid")
+        started_at = field(status, "started_at")
+        if isinstance(pid, bool) or (pid is not None and (not isinstance(pid, int) or pid <= 0)):
+            pid = None
+        if pid is None:
+            return {"cpu_capacity_percent": None, "memory_capacity_bytes": None,
+                    "cpu_source": "unknown", "memory_source": "unknown",
+                    "pid": None, "started_at": started_at}
+        if isinstance(started_at, str):
+            try:
+                started_at = datetime.fromisoformat(started_at.replace("Z", "+00:00"))
+            except ValueError:
+                started_at = None
+        expected_ticks = await asyncio.to_thread(process_start_ticks, pid)
+        process_start = await asyncio.to_thread(process_started_at, pid)
+        if process_start is None or started_at is None:
+            return {"cpu_capacity_percent": None, "memory_capacity_bytes": None,
+                    "cpu_source": "unknown", "memory_source": "unknown",
+                    "pid": pid, "started_at": started_at}
+        try:
+            if abs((process_start - started_at).total_seconds()) > 2:
+                return {"cpu_capacity_percent": None, "memory_capacity_bytes": None,
+                        "cpu_source": "unknown", "memory_source": "unknown",
+                        "pid": pid, "started_at": started_at}
+        except (TypeError, ValueError):
+            return {"cpu_capacity_percent": None, "memory_capacity_bytes": None,
+                    "cpu_source": "unknown", "memory_source": "unknown",
+                    "pid": pid, "started_at": started_at}
+        if expected_ticks is None:
+            return {"cpu_capacity_percent": None, "memory_capacity_bytes": None,
+                    "cpu_source": "unknown", "memory_source": "unknown",
+                    "pid": pid, "started_at": started_at}
+        capacity = await resource_capacity_cache.get(pid, started_at, expected_ticks)
+        if await asyncio.to_thread(process_start_ticks, pid) != expected_ticks:
+            capacity = {"cpu_capacity_percent": None, "memory_capacity_bytes": None, "cpu_source": "unknown", "memory_source": "unknown"}
+        return {**capacity, "pid": pid, "started_at": started_at}
 
     @app.get("/api/v1/stream")
     async def stream(request: Request, response: Response):

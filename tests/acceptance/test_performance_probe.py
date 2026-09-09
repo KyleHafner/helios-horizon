@@ -249,6 +249,66 @@ def test_process_cpu_is_host_capacity_normalized_once_and_rejects_invalid_count(
     assert _validated_logical_cpu_count(Psutil) == 4
 
 
+def test_cpu_api_arrays_are_ignored_and_psutil_warmup_is_separate(monkeypatch):
+    import tools.acceptance.performance_probe as module
+    import psutil
+
+    class Clock:
+        value = 0.0
+        def monotonic(self):
+            self.value += .01
+            return self.value
+    clock = Clock()
+    monkeypatch.setattr(module.time, "monotonic", clock.monotonic)
+    monkeypatch.setattr(module.time, "sleep", lambda _seconds: None)
+    monkeypatch.setattr(module, "validate_process_identity", lambda *_a, **_k: (10, "horizon.service"))
+    monkeypatch.setattr(psutil, "cpu_count", lambda logical=True: 4)
+
+    class Process:
+        def __init__(self): self.readings = iter([40.0] + [80.0] * 100)
+        def cpu_percent(self, _interval): return next(self.readings)
+    monkeypatch.setattr(psutil, "Process", lambda _pid: Process())
+
+    class Response(FakeResponse):
+        def __init__(self, path):
+            body = (b'{"profiles":[]}' if path.endswith("status") else
+                    b'{"slotd":{"cpu_percent":[999],"event_loop_lag_ms":[],"event_loop_lag_sequence":{"start":0,"end":0}}}')
+            super().__init__(body)
+    result = module.collect(
+        CollectorConfig("http://localhost", "secret", duration_seconds=1.0,
+                        interval_seconds=.01, slotd_pid=123, slotd_cgroup="horizon.service"),
+        opener=lambda request, **_kwargs: Response(request.full_url))
+    assert result["cpu_warmup_observations"]
+    assert result["cpu_observations"]
+    assert result["slotd_cpu_percent"] == [20.0] * len(result["cpu_observations"])
+    assert all(item["duration_seconds"] > 0 for item in result["cpu_warmup_observations"] + result["cpu_observations"])
+    assert all(item["end_monotonic"] >= item["start_monotonic"] for item in result["cpu_warmup_observations"] + result["cpu_observations"])
+
+
+def test_phase_snapshots_are_sampled_aggregates_without_profile_identity():
+    from tools.acceptance.performance_probe import _sample_phase
+    assert _sample_phase({"profiles": [{"state": "starting"}]}) == "startup"
+    assert _sample_phase({"initializing": True, "profiles": []}) == "transition"
+    assert _sample_phase({"profiles": [{"state": "running", "health": "healthy", "required_ports_ready": True, "players_online": 0}]}) == "ready-empty"
+    assert _sample_phase({"profiles": [{"state": "running", "health": "healthy", "required_ports_ready": True, "players_online": 2}]}) == "gameplay"
+    assert _sample_phase({"profiles": [{"state": "stopped"}]}) == "stopped"
+    assert _sample_phase({"profiles": [{"state": "blocked"}]}) == "unknown"
+    # A blocked profile cannot hide the active owner's sampled phase.
+    assert _sample_phase({"profiles": [
+        {"state": "blocked", "slot_owner": "private"},
+        {"state": "running", "health": "healthy", "required_ports_ready": True, "players_online": 0},
+    ]}) == "ready-empty"
+
+
+def test_collector_rejects_nonfinite_probe_windows():
+    import math
+    import pytest
+    for duration, interval in ((math.nan, 1), (1, math.inf), (True, 1)):
+        with pytest.raises(ValueError):
+            collect(CollectorConfig("http://localhost", "secret", duration_seconds=duration,
+                                    interval_seconds=interval), opener=lambda *_a, **_k: None)
+
+
 def _browser_v2_fixture():
     return {
         "schemaVersion": "phase2.1.browser.v2", "status_ui_latency_ms": [10, 20, 30],

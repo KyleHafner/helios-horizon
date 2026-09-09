@@ -12,6 +12,7 @@ from game_control.rcon_telemetry import (
     TelemetryCommand,
     TelemetryErrorCode,
     UnavailableResult,
+    _sanitize_result,
 )
 
 
@@ -78,6 +79,26 @@ async def test_serialized_connection_returns_typed_sanitized_results():
     assert tps == PerformanceResult(tps=19.95)
     assert "alice" not in repr(players)
     assert len(writers) == 1 and len(writers[0].writes) == 3
+    assert b"forge tps" in writers[0].writes[2]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("prelude_id", [-1, 1])
+async def test_persistent_auth_accepts_optional_empty_response_value(prelude_id):
+    channel, writers = make_channel([
+        packet(prelude_id, 0) + packet(1, 2) + packet(2, 0, "There are 0 of a max of 20 players online")
+    ])
+    assert await channel.execute(TelemetryCommand.PLAYER_COUNT) == PlayerCountResult(0, 20)
+    assert len(writers) == 1 and len(writers[0].writes) == 2
+
+
+@pytest.mark.asyncio
+async def test_persistent_auth_rejects_unrelated_or_nonempty_prelude():
+    for prelude in (packet(99, 0), packet(-1, 0, "unexpected")):
+        channel, writers = make_channel([prelude + packet(1, 2)], max_attempts=3)
+        with pytest.raises(RconError, match="authentication"):
+            await channel.execute(TelemetryCommand.PLAYER_COUNT)
+        assert len(writers) == 1 and channel.health.reconnects == 0
 
 
 @pytest.mark.asyncio
@@ -87,6 +108,18 @@ async def test_malformed_identity_bearing_list_is_redacted():
         await channel.execute(TelemetryCommand.PLAYER_COUNT)
     assert "alice" not in str(exc.value) and "bob" not in str(exc.value)
     assert channel.health.last_error is TelemetryErrorCode.INVALID_RESPONSE
+
+
+@pytest.mark.asyncio
+async def test_malformed_response_is_not_retried_or_reconnected():
+    channel, writers = make_channel(
+        [packet(1, 2) + packet(2, 0, "unsupported command")], max_attempts=3
+    )
+    with pytest.raises(RconError, match="invalid"):
+        await channel.execute(TelemetryCommand.PLAYER_COUNT)
+    assert len(writers) == 1
+    assert channel.health.reconnects == 0
+    assert channel.health.failures == 1
 
 
 @pytest.mark.asyncio
@@ -120,11 +153,12 @@ async def test_auth_failure_closes_and_awaits_writer():
 
 @pytest.mark.asyncio
 async def test_response_limit_closes_and_awaits_writer():
-    channel, writers = make_channel([packet(1, 2) + packet(2, 0, "12345")], max_response_bytes=4, max_attempts=1)
+    channel, writers = make_channel([packet(1, 2) + packet(2, 0, "12345")], max_response_bytes=4, max_attempts=3)
     with pytest.raises(RconError, match="exceeded limit"):
         await channel.execute(TelemetryCommand.PLAYER_COUNT)
     assert writers[0].closed and writers[0].waited
     assert channel.health.response_limit_failures == 1
+    assert channel.health.reconnects == 0
 
 
 @pytest.mark.asyncio
@@ -253,6 +287,57 @@ async def test_performance_command_parses_tps_and_mspt_from_one_wire_response():
     ])
     assert await channel.execute(TelemetryCommand.PERFORMANCE) == PerformanceResult(tps=19.95, mspt=12.5)
     assert len(writers[0].writes) == 2  # one auth packet, one performance command
+
+
+@pytest.mark.asyncio
+async def test_performance_parser_uses_overall_across_forge_dimensions():
+    dimensions = " ".join(
+        f"Dimension {i}: Mean tick time: 0.089 ms. Mean TPS: 20.0"
+        for i in range(6)
+    )
+    channel, _ = make_channel([
+        packet(1, 2) + packet(2, 0, dimensions + " Overall: Mean tick time: 13.0 ms. Mean TPS: 20.0")
+    ])
+    assert await channel.execute(TelemetryCommand.PERFORMANCE) == PerformanceResult(tps=20.0, mspt=13.0)
+
+
+def test_ambiguous_performance_reply_fails_closed():
+    with pytest.raises(RconError, match="invalid"):
+        from game_control.rcon_telemetry import _sanitize_result
+        _sanitize_result(TelemetryCommand.PERFORMANCE, "A TPS: 20 MSPT: 1 B TPS: 19 MSPT: 2")
+
+
+@pytest.mark.parametrize("raw", [
+    "Overall: Mean tick time: 13 ms. Mean TPS: 20 Overall: Mean tick time: 14 ms. Mean TPS: 19",
+    "Overall: Mean tick time: 13 ms. Mean TPS: 20 extra TPS: 19",
+    "Overall: Mean tick time: 10000000 ms. Mean TPS: 20",
+    "Overall: Mean tick time: 13 ms. Mean TPS: 10000",
+    "Overall: unavailable Overall: TPS: 20 MSPT: 13",
+    "Overall: TPS: 1e9 MSPT: 13",
+])
+def test_overall_parser_rejects_duplicate_extra_or_oversized_values(raw):
+    with pytest.raises(RconError, match="invalid"):
+        _sanitize_result(TelemetryCommand.PERFORMANCE, raw)
+
+
+def test_numeric_parser_does_not_truncate_long_decimal():
+    assert _sanitize_result(
+        TelemetryCommand.PERFORMANCE, "Overall: TPS: 19.12345 MSPT: 13"
+    ) == PerformanceResult(tps=19.12345, mspt=13.0)
+
+
+@pytest.mark.asyncio
+async def test_sequential_cycles_reuse_one_connection_and_send_forge_tps():
+    payload = packet(1, 2)
+    for index in range(3):
+        payload += packet(2 + index * 2, 0, "There are 0 of a max of 20 players online")
+        payload += packet(3 + index * 2, 0, "Overall: Mean tick time: 13 ms. Mean TPS: 20")
+    channel, writers = make_channel([payload])
+    for _ in range(3):
+        await channel.execute(TelemetryCommand.PLAYER_COUNT)
+        await channel.execute(TelemetryCommand.PERFORMANCE)
+    assert len(writers) == 1
+    assert sum(b"forge tps" in write for write in writers[0].writes) == 3
 
 
 @pytest.mark.asyncio
